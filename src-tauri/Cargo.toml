@@ -1,0 +1,27 @@
+[package]
+name = "personal-document-manager"
+version = "0.1.0"
+description = "Local-first personal document manager"
+authors = ["Personal Document Manager"]
+edition = "2021"
+
+[lib]
+name = "personal_document_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+open = "5"
+rusqlite = { version = "0.32", features = ["bundled-full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
