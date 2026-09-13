@@ -1,12 +1,13 @@
 import {
   AlertCircle,
   FilePlus2,
-  FileText,
   Folder,
   FolderOpen,
   FolderPlus,
   Inbox,
+  LayoutGrid,
   LibraryBig,
+  List,
   LoaderCircle,
   Pencil,
   Plus,
@@ -38,7 +39,13 @@ import {
 } from "./CollectionDialog";
 import type { CollectionAction } from "./CollectionDialog";
 import { CollectionTree } from "./CollectionTree";
+import { DocumentDetails } from "./DocumentDetails";
+import {
+  DocumentEmptyState
+} from "./DocumentEmptyState";
+import type { DocumentEmptyStateKind } from "./DocumentEmptyState";
 import { DocumentMetadataDialog } from "./DocumentMetadataDialog";
+import { DocumentGrid, DocumentList } from "./DocumentResults";
 import { ImportBatchPanel } from "./ImportBatchPanel";
 import { ImportDecisionDialog } from "./ImportDecisionDialog";
 import {
@@ -53,11 +60,6 @@ interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
 }
 
-interface StatusPresentation {
-  label: string;
-  tone: "neutral" | "success" | "warning" | "danger";
-}
-
 interface ImportRun {
   batchId: string | null;
   batch: ImportBatch | null;
@@ -65,20 +67,27 @@ interface ImportRun {
   items: ImportItemResult[];
 }
 
-function statusPresentation(document: DocumentSummary): StatusPresentation {
-  if (document.processingStatus === "failed") {
-    return { label: "处理失败，等待重试", tone: "danger" };
+type DocumentView = "list" | "grid";
+
+const DOCUMENT_VIEW_STORAGE_KEY = "personal-document-manager.document-view";
+
+function storedDocumentView(): DocumentView {
+  try {
+    return window.sessionStorage.getItem(DOCUMENT_VIEW_STORAGE_KEY) ===
+      "grid"
+      ? "grid"
+      : "list";
+  } catch {
+    return "list";
   }
-  if (document.processingStatus === "processing") {
-    return { label: "处理中", tone: "neutral" };
+}
+
+function rememberDocumentView(view: DocumentView) {
+  try {
+    window.sessionStorage.setItem(DOCUMENT_VIEW_STORAGE_KEY, view);
+  } catch {
+    // Session storage is an enhancement; the in-memory selection still works.
   }
-  if (document.indexStatus === "searchable") {
-    return { label: "可搜索", tone: "success" };
-  }
-  if (document.indexStatus === "failed") {
-    return { label: "索引失败，可重试", tone: "danger" };
-  }
-  return { label: "等待索引", tone: "warning" };
 }
 
 function mergeById<T>(
@@ -131,6 +140,12 @@ export function LibraryWorkspace({
   const [selectedCollectionId, setSelectedCollectionId] = useState<
     string | null
   >(null);
+  const [selectedTagId, setSelectedTagId] = useState<string | null>(null);
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(
+    null
+  );
+  const [documentView, setDocumentView] =
+    useState<DocumentView>(storedDocumentView);
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
   const [importRun, setImportRun] = useState<ImportRun | null>(null);
@@ -189,6 +204,8 @@ export function LibraryWorkspace({
     setTags([]);
     setError("");
     setSelectedCollectionId(null);
+    setSelectedTagId(null);
+    setSelectedDocumentId(null);
 
     void Promise.all([
       client.listDocuments(),
@@ -393,12 +410,14 @@ export function LibraryWorkspace({
     });
     setActiveDecisionItemId(null);
 
-    if (decision === "useExisting") {
-      setSelectedCollectionId(null);
-      const existingDocumentId =
-        updated.duplicateDocumentId ?? updated.documentId;
-      if (existingDocumentId) {
-        setHighlightedDocumentId(existingDocumentId);
+      if (decision === "useExisting") {
+        setSelectedCollectionId(null);
+        setSelectedTagId(null);
+        const existingDocumentId =
+          updated.duplicateDocumentId ?? updated.documentId;
+        if (existingDocumentId) {
+          setSelectedDocumentId(existingDocumentId);
+          setHighlightedDocumentId(existingDocumentId);
         window.setTimeout(() => {
           document
             .getElementById(`document-row-${existingDocumentId}`)
@@ -534,6 +553,10 @@ export function LibraryWorkspace({
         tags: document.tags.filter((tag) => tag.id !== target.id)
       }))
     );
+    if (selectedTagId === target.id) {
+      setSelectedTagId(null);
+      setSelectedDocumentId(null);
+    }
     setDeleteTagTarget(null);
   }
 
@@ -575,6 +598,12 @@ export function LibraryWorkspace({
       setDocuments((current) =>
         current.map((item) => (item.id === moved.id ? moved : item))
       );
+      if (
+        selectedCollectionId &&
+        selectedCollectionId !== moved.collectionId
+      ) {
+        setSelectedDocumentId(null);
+      }
       await refreshCollections();
     } catch (caught) {
       setError(toBackendError(caught).message);
@@ -587,19 +616,62 @@ export function LibraryWorkspace({
         (collection) => collection.id === selectedCollectionId
       ) ?? null
     : null;
+  const selectedTag = selectedTagId
+    ? tags.find((tag) => tag.id === selectedTagId) ?? null
+    : null;
   const visibleDocuments = selectedCollectionId
     ? documents.filter(
         (document) => document.collectionId === selectedCollectionId
       )
-    : documents;
+    : selectedTagId
+      ? documents.filter((document) =>
+          document.tags.some((tag) => tag.id === selectedTagId)
+        )
+      : documents;
+  const selectedDocument = selectedDocumentId
+    ? visibleDocuments.find(
+        (document) => document.id === selectedDocumentId
+      ) ?? null
+    : null;
+  const emptyStateKind: DocumentEmptyStateKind | null =
+    documents.length === 0
+      ? "library"
+      : visibleDocuments.length === 0
+        ? selectedTagId
+          ? "tag"
+          : "collection"
+        : null;
   const decisionItem =
     importRun?.items.find(
       (item) => item.itemId === activeDecisionItemId
     ) ?? null;
 
+  function selectAllDocuments() {
+    setSelectedCollectionId(null);
+    setSelectedTagId(null);
+    setSelectedDocumentId(null);
+  }
+
+  function selectCollection(collectionId: string) {
+    setSelectedCollectionId(collectionId);
+    setSelectedTagId(null);
+    setSelectedDocumentId(null);
+  }
+
+  function selectTag(tagId: string) {
+    setSelectedTagId(tagId);
+    setSelectedCollectionId(null);
+    setSelectedDocumentId(null);
+  }
+
+  function changeDocumentView(view: DocumentView) {
+    setDocumentView(view);
+    rememberDocumentView(view);
+  }
+
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar" aria-label="集合与标签">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
             <span>文</span>
@@ -613,10 +685,12 @@ export function LibraryWorkspace({
         <nav className="primary-nav" aria-label="资料库导航">
           <button
             className={`nav-item${
-              selectedCollectionId === null ? " active" : ""
+              selectedCollectionId === null && selectedTagId === null
+                ? " active"
+                : ""
             }`}
             type="button"
-            onClick={() => setSelectedCollectionId(null)}
+            onClick={selectAllDocuments}
           >
             <LibraryBig size={18} aria-hidden="true" />
             <span>全部文档</span>
@@ -645,7 +719,7 @@ export function LibraryWorkspace({
           <CollectionTree
             collections={collections}
             selectedCollectionId={selectedCollectionId}
-            onSelect={setSelectedCollectionId}
+            onSelect={selectCollection}
             onCreateChild={(collection) =>
               setCollectionAction({ type: "create", parent: collection })
             }
@@ -677,10 +751,25 @@ export function LibraryWorkspace({
           ) : (
             <ul className="tag-list">
               {tags.map((tag) => (
-                <li className="tag-row" key={tag.id}>
-                  <TagIcon size={14} aria-hidden="true" />
-                  <span title={tag.name}>{tag.name}</span>
-                  <em>{tag.documentCount}</em>
+                <li
+                  className={`tag-row${
+                    selectedTagId === tag.id ? " active" : ""
+                  }`}
+                  key={tag.id}
+                >
+                  <button
+                    className="tag-select"
+                    type="button"
+                    onClick={() => selectTag(tag.id)}
+                    aria-current={
+                      selectedTagId === tag.id ? "page" : undefined
+                    }
+                    aria-label={`按标签 ${tag.name} 筛选`}
+                  >
+                    <TagIcon size={14} aria-hidden="true" />
+                    <span title={tag.name}>{tag.name}</span>
+                    <em>{tag.documentCount}</em>
+                  </button>
                   <div className="tag-actions">
                     <button
                       className="icon-button compact"
@@ -718,7 +807,9 @@ export function LibraryWorkspace({
       <section className="workspace">
         <header className="workspace-header">
           <div className="library-heading">
-            {selectedCollection?.isInbox ? (
+            {selectedTag ? (
+              <TagIcon size={19} aria-hidden="true" />
+            ) : selectedCollection?.isInbox ? (
               <Inbox size={19} aria-hidden="true" />
             ) : selectedCollection ? (
               <Folder size={19} aria-hidden="true" />
@@ -726,7 +817,9 @@ export function LibraryWorkspace({
               <FolderOpen size={19} aria-hidden="true" />
             )}
             <div>
-              <strong>{selectedCollection?.name ?? "全部文档"}</strong>
+              <strong>
+                {selectedTag?.name ?? selectedCollection?.name ?? "全部文档"}
+              </strong>
               <span>{visibleDocuments.length} 份文档</span>
             </div>
           </div>
@@ -800,136 +893,83 @@ export function LibraryWorkspace({
           <main className="workspace-loading" aria-label="正在加载文档">
             <LoaderCircle className="spin" size={22} aria-hidden="true" />
           </main>
-        ) : documents.length === 0 ? (
-          <main className="empty-library" aria-label="空资料库">
-            <div className="empty-illustration" aria-hidden="true">
-              <FileText />
-            </div>
-            <h1>空资料库</h1>
-            <p>资料库已经准备好，可以开始添加文档。</p>
-            <button
-              className="button primary"
-              type="button"
-              onClick={() => void chooseDocuments()}
-              disabled={importing}
-            >
-              {importing ? (
-                <LoaderCircle className="spin" size={18} aria-hidden="true" />
-              ) : (
-                <FilePlus2 size={18} aria-hidden="true" />
-              )}
-              导入文档
-            </button>
-          </main>
-        ) : visibleDocuments.length === 0 ? (
-          <main className="empty-library compact" aria-label="空集合">
-            <div className="empty-illustration" aria-hidden="true">
-              <Folder />
-            </div>
-            <h1>这个集合中没有文档</h1>
-            <p>可以将文档移动到该集合，或直接导入新文档。</p>
-          </main>
         ) : (
-          <main className="document-area" aria-label="文档列表">
-            <div
-              className="document-list-header collection-aware"
-              aria-hidden="true"
-            >
-              <span>标题</span>
-              <span>类型</span>
-              <span>状态</span>
-              <span>文档日期</span>
-              <span>集合</span>
-              <span>标签</span>
-              <span aria-hidden="true" />
-            </div>
-            <div className="document-list">
-              {visibleDocuments.map((document) => {
-                const status = statusPresentation(document);
-                return (
-                  <article
-                    id={`document-row-${document.id}`}
-                    aria-current={
-                      highlightedDocumentId === document.id
-                        ? "true"
-                        : undefined
-                    }
-                    className={`document-row collection-aware${
-                      highlightedDocumentId === document.id
-                        ? " highlighted"
-                        : ""
-                    }`}
-                    key={document.id}
+          <>
+            {emptyStateKind ? (
+              <DocumentEmptyState
+                kind={emptyStateKind}
+                importing={importing}
+                onImport={() => void chooseDocuments()}
+              />
+            ) : (
+              <>
+                <div className="document-view-toolbar">
+                  <span>
+                    {documentView === "list" ? "列表视图" : "网格视图"}
+                  </span>
+                  <div
+                    className="view-switcher"
+                    role="group"
+                    aria-label="视图切换"
                   >
-                    <div className="document-title-cell">
-                      <FileText size={18} aria-hidden="true" />
-                      <div>
-                        <strong>{document.title}</strong>
-                        <span>{document.fileName}</span>
-                      </div>
-                    </div>
-                    <span className="document-type">{document.fileType}</span>
-                    <span
-                      className={`status-badge ${status.tone}`}
-                      title={document.errorMessage ?? undefined}
-                    >
-                      {status.label}
-                    </span>
-                    <span
-                      className={`document-date${
-                        document.documentDate ? "" : " unset"
-                      }`}
-                    >
-                      {document.documentDate ?? "未设置"}
-                    </span>
-                    <label className="document-collection">
-                      <span className="visually-hidden">
-                        移动 {document.title} 到集合
-                      </span>
-                      <select
-                        value={document.collectionId}
-                        onChange={(event) =>
-                          void moveDocument(document, event.target.value)
-                        }
-                        aria-label={`移动 ${document.title} 到集合`}
-                      >
-                        {collections.map((collection) => (
-                          <option key={collection.id} value={collection.id}>
-                            {collection.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <div
-                      className="document-tags"
-                      aria-label={`${document.title} 的标签`}
-                    >
-                      {document.tags.length === 0 ? (
-                        <span className="document-tag-empty">无标签</span>
-                      ) : (
-                        document.tags.map((tag) => (
-                          <span className="document-tag" key={tag.id}>
-                            {tag.name}
-                          </span>
-                        ))
-                      )}
-                    </div>
                     <button
-                      className="icon-button compact"
+                      className="view-switcher-button"
                       type="button"
-                      onClick={() => setMetadataTarget(document)}
-                      aria-label={`编辑 ${document.title} 元数据`}
-                      title="编辑元数据"
+                      onClick={() => changeDocumentView("list")}
+                      aria-pressed={documentView === "list"}
+                      aria-label="列表视图"
+                      title="列表视图"
                     >
-                      <Pencil size={14} aria-hidden="true" />
+                      <List size={16} aria-hidden="true" />
                     </button>
-                  </article>
-                );
-              })}
-            </div>
-          </main>
+                    <button
+                      className="view-switcher-button"
+                      type="button"
+                      onClick={() => changeDocumentView("grid")}
+                      aria-pressed={documentView === "grid"}
+                      aria-label="网格视图"
+                      title="网格视图"
+                    >
+                      <LayoutGrid size={16} aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+                {documentView === "list" ? (
+                  <DocumentList
+                    documents={visibleDocuments}
+                    collections={collections}
+                    selectedDocumentId={selectedDocumentId}
+                    highlightedDocumentId={highlightedDocumentId}
+                    onSelectDocument={setSelectedDocumentId}
+                    onMoveDocument={(document, targetCollectionId) =>
+                      void moveDocument(document, targetCollectionId)
+                    }
+                    onEditDocument={setMetadataTarget}
+                  />
+                ) : (
+                  <DocumentGrid
+                    documents={visibleDocuments}
+                    collections={collections}
+                    selectedDocumentId={selectedDocumentId}
+                    highlightedDocumentId={highlightedDocumentId}
+                    onSelectDocument={setSelectedDocumentId}
+                    onMoveDocument={(document, targetCollectionId) =>
+                      void moveDocument(document, targetCollectionId)
+                    }
+                    onEditDocument={setMetadataTarget}
+                  />
+                )}
+              </>
+            )}
+          </>
         )}
       </section>
+
+      <DocumentDetails
+        document={selectedDocument}
+        collections={collections}
+        onEditDocument={setMetadataTarget}
+      />
 
       {collectionAction ? (
         <CollectionActionDialog

@@ -16,7 +16,29 @@ interface AppProps {
   client?: BackendClient;
 }
 
+function useSystemTheme() {
+  useEffect(() => {
+    const root = document.documentElement;
+    const mediaQuery = window.matchMedia?.("(prefers-color-scheme: dark)");
+
+    if (!mediaQuery) {
+      root.dataset.theme = "light";
+      return;
+    }
+
+    const applyTheme = () => {
+      root.dataset.theme = mediaQuery.matches ? "dark" : "light";
+    };
+
+    applyTheme();
+    mediaQuery.addEventListener?.("change", applyTheme);
+    return () => mediaQuery.removeEventListener?.("change", applyTheme);
+  }, []);
+}
+
 export function App({ client = tauriBackendClient }: AppProps) {
+  useSystemTheme();
+
   const [loading, setLoading] = useState(true);
   const [library, setLibrary] = useState<LibrarySummary | null>(null);
   const [recentLibraries, setRecentLibraries] = useState<RecentLibrary[]>([]);

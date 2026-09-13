@@ -183,7 +183,10 @@ describe("批量导入流程", () => {
         "resolveImportItem:duplicate-item:useExisting"
       );
     });
-    const row = screen.getByText("项目说明").closest("article");
+    const row = screen
+      .getAllByText("项目说明")
+      .map((element) => element.closest("article"))
+      .find((element): element is HTMLElement => element !== null);
     if (!row) {
       throw new Error("无法找到已有文档行。");
     }
