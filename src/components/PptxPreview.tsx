@@ -18,6 +18,7 @@ import {
 } from "react";
 import type { CSSProperties } from "react";
 
+import { documentFormatIdForType } from "../backend/documentFormats";
 import { toBackendError } from "../backend/error";
 import { safeExternalUrl } from "../backend/url";
 import type {
@@ -25,6 +26,10 @@ import type {
   DocumentPreview,
   DocumentSummary
 } from "../backend/types";
+import {
+  cachePptxRender,
+  getCachedPptxRender
+} from "./previewRenderCache";
 
 type PptxDocumentPreview = Extract<DocumentPreview, { kind: "pptx" }>;
 
@@ -95,6 +100,11 @@ function sanitizePptxRoot(root: ParentNode) {
     element.remove();
   }
   for (const element of Array.from(root.querySelectorAll("*"))) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (attribute.name.toLocaleLowerCase().startsWith("on")) {
+        element.removeAttribute(attribute.name);
+      }
+    }
     element.removeAttribute("srcdoc");
     const style = element.getAttribute("style");
     if (style) {
@@ -125,7 +135,10 @@ function configureHyperlinks(
       continue;
     }
     anchor.dataset.pptxLinkConfigured = "true";
-    const rawHref = anchor.getAttribute("href")?.trim() ?? "";
+    const rawHref =
+      anchor.getAttribute("href")?.trim() ??
+      anchor.dataset.pptxSafeHref?.trim() ??
+      "";
     anchor.removeAttribute("href");
     anchor.removeAttribute("target");
     anchor.removeAttribute("rel");
@@ -137,6 +150,7 @@ function configureHyperlinks(
       continue;
     }
 
+    anchor.dataset.pptxSafeHref = externalUrl;
     anchor.classList.add("pptx-safe-link");
     anchor.setAttribute("role", "link");
     anchor.tabIndex = 0;
@@ -190,6 +204,16 @@ function slideElements(root: HTMLElement | null) {
       ".flyfish-pptx-content > .slide, .flyfish-pptx-content > .flyfish-pptx-slide-slot > .slide"
     )
   );
+}
+
+function pptxCacheHtml(host: HTMLElement) {
+  const clone = host.cloneNode(true) as HTMLElement;
+  for (const anchor of Array.from(
+    clone.querySelectorAll<HTMLAnchorElement>("a[data-pptx-link-configured]")
+  )) {
+    anchor.removeAttribute("data-pptx-link-configured");
+  }
+  return clone.innerHTML;
 }
 
 function SlideNavigationThumbnail({
@@ -323,6 +347,27 @@ export function PptxPreview({
     setRendering(true);
 
     try {
+      const formatId = documentFormatIdForType(document.fileType);
+      const cached =
+        formatId === null ? null : getCachedPptxRender(formatId, document);
+      if (cached && host) {
+        host.innerHTML = cached.html;
+        const elements = slideElements(host);
+        setRenderedSlides(
+          new Map(
+            elements.map((element, index) => [index + 1, element] as const)
+          )
+        );
+        setPageCount(Math.max(cached.slideCount, elements.length, 1));
+        setRendering(false);
+        refreshSafety(abortController);
+        return () => {
+          active = false;
+          abortController.abort();
+          host.replaceChildren();
+        };
+      }
+
       const blob = blobFromDataUrl(preview.dataUrl);
       void blobToArrayBuffer(blob)
         .then((buffer) =>
@@ -361,10 +406,21 @@ export function PptxPreview({
                 if (!active) {
                   return;
                 }
-                setPageCount((current) =>
-                  Math.max(current, viewerRef.current?.slideCount ?? current, 1)
+                const resolvedCount = Math.max(
+                  viewerRef.current?.slideCount ?? 0,
+                  slideElements(hostRef.current).length,
+                  1
                 );
+                setPageCount((current) => Math.max(current, resolvedCount));
                 setRendering(false);
+                refreshSafety(abortController);
+                const renderedHost = hostRef.current;
+                if (formatId && renderedHost) {
+                  cachePptxRender(formatId, document, {
+                    html: pptxCacheHtml(renderedHost),
+                    slideCount: resolvedCount
+                  });
+                }
                 scheduleSafetyRefresh(abortController);
               },
               onError(error) {
@@ -415,9 +471,13 @@ export function PptxPreview({
   }, [
     client,
     document.contentHash,
+    document.fileSize,
+    document.fileType,
     document.id,
+    document.lastImportedAt,
     preview,
     renderAttempt,
+    refreshSafety,
     scheduleSafetyRefresh
   ]);
 
@@ -744,11 +804,6 @@ export function PptxThumbnail({
               engineOptions: {
                 mediaProcess: false,
                 keyBoardShortCut: false
-              },
-              onThumbnail(base64Jpeg) {
-                if (base64Jpeg) {
-                  settle(`data:image/jpeg;base64,${base64Jpeg}`);
-                }
               },
               async onRenderComplete() {
                 if (!settled) {

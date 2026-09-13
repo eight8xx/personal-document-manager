@@ -36,7 +36,7 @@ use super::models::{
     IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
     RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary, TrashDocumentSummary,
 };
-use super::thumbnail;
+use super::{ooxml, thumbnail};
 
 const FORMAT_VERSION: u32 = 1;
 const INTERNAL_DIR: &str = ".pdm";
@@ -45,6 +45,7 @@ const DATABASE_FILE: &str = "library.sqlite3";
 const DOCUMENTS_DIR: &str = "documents";
 const TRASH_DIR: &str = "trash";
 const THUMBNAILS_DIR: &str = "thumbnails";
+const PPTX_THUMBNAIL_CACHE_SCHEME: &str = "first-slide-v2";
 const RECENT_FILE: &str = "recent_libraries.json";
 const MAX_RECENT_LIBRARIES: usize = 10;
 const DELETE_TOMBSTONE_PREFIX: &str = ".pdm-delete-";
@@ -3043,12 +3044,13 @@ impl LibraryService {
             .as_ref()
             .ok_or(LibraryError::NoCurrentLibrary)?;
         let thumbnail_dir = Path::new(&library.summary.path).join(THUMBNAILS_DIR);
-        let version = stored
+        let content_version = stored
             .content_hash
             .as_deref()
             .filter(|hash| !hash.is_empty())
             .map(str::to_string)
             .unwrap_or(sha256_file(&path)?);
+        let version = format!("{PPTX_THUMBNAIL_CACHE_SCHEME}-{content_version}");
         let extension = if media_type == "image/png" {
             "png"
         } else {
@@ -3110,10 +3112,11 @@ impl LibraryService {
             PreviewStrategy::DocxLayout => {
                 let bytes = fs::read(&path)?;
                 let degraded_features = inspect_docx_degradations(&bytes);
+                let sanitized = ooxml::sanitize_docx_package(&bytes)?;
                 Ok(DocumentPreview::Docx {
                     data_url: data_url(
                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        &bytes,
+                        &sanitized,
                     ),
                     text: extract_docx_text_from_bytes(&bytes)?,
                     notice: if degraded_features.is_empty() {
@@ -3129,10 +3132,11 @@ impl LibraryService {
                 let extraction = extract_pptx_text_from_bytes(&bytes)?;
                 let mut degraded_features = inspect_pptx_degradations(&bytes);
                 merge_features(&mut degraded_features, extraction.degraded_features);
+                let sanitized = ooxml::sanitize_pptx_package(&bytes)?;
                 Ok(DocumentPreview::Pptx {
                     data_url: data_url(
                         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                        &bytes,
+                        &sanitized,
                     ),
                     text: extraction.text,
                     notice: if degraded_features.is_empty() {
@@ -3256,12 +3260,13 @@ impl LibraryService {
             .as_ref()
             .ok_or(LibraryError::NoCurrentLibrary)?;
         let thumbnail_dir = Path::new(&library.summary.path).join(THUMBNAILS_DIR);
-        let version = stored
+        let content_version = stored
             .content_hash
             .as_deref()
             .filter(|hash| !hash.is_empty())
             .map(str::to_string)
             .unwrap_or(sha256_file(path)?);
+        let version = format!("{PPTX_THUMBNAIL_CACHE_SCHEME}-{content_version}");
 
         for (extension, media_type) in [("jpg", "image/jpeg"), ("png", "image/png")] {
             let cache_path =
@@ -4629,122 +4634,7 @@ fn validate_pptx_bytes(archive: &[u8]) -> LibraryResult<()> {
             "文件内容不是有效的 PPTX：缺少 OOXML 压缩包结构。".to_string(),
         ));
     }
-    ensure_zip_entries_not_encrypted(archive, "PPTX")?;
-
-    let content_types = read_zip_entry_for(archive, "[Content_Types].xml", "PPTX")?;
-    let content_type_root = xml_root_local_name(&content_types, "PPTX")?;
-    if content_type_root != "Types" {
-        return Err(LibraryError::ImportFile(
-            "PPTX 结构无效：[Content_Types].xml 根节点不是 Types。".to_string(),
-        ));
-    }
-    if !content_types_declare_presentation(&content_types)? {
-        return Err(LibraryError::ImportFile(
-            "PPTX 结构无效：未声明 PowerPoint presentation 主内容类型。".to_string(),
-        ));
-    }
-
-    let presentation = read_zip_entry_for(archive, "ppt/presentation.xml", "PPTX")?;
-    if xml_root_local_name(&presentation, "PPTX")? != "presentation" {
-        return Err(LibraryError::ImportFile(
-            "PPTX 结构无效：ppt/presentation.xml 不是演示文稿定义。".to_string(),
-        ));
-    }
-
-    let entry_names = zip_entry_names_for(archive, "PPTX")?;
-    let slide_names = entry_names
-        .into_iter()
-        .filter(|name| {
-            name.starts_with("ppt/slides/") && name.ends_with(".xml") && !name.contains("/_rels/")
-        })
-        .collect::<Vec<_>>();
-    if slide_names.is_empty() {
-        return Err(LibraryError::ImportFile(
-            "PPTX 结构无效：没有找到幻灯片内容。".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn content_types_declare_presentation(xml: &[u8]) -> LibraryResult<bool> {
-    let expected =
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
-    let mut buffer = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
-                if element.local_name().as_ref() != "Override" {
-                    buffer.clear();
-                    continue;
-                }
-                let mut part_name = None;
-                let mut content_type = None;
-                for attribute in element.attributes().with_checks(false) {
-                    let attribute = attribute.map_err(|error| {
-                        LibraryError::ImportFile(format!(
-                            "PPTX [Content_Types].xml 属性无效：{error}"
-                        ))
-                    })?;
-                    let value = attribute
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .map_err(|error| {
-                            LibraryError::ImportFile(format!(
-                                "PPTX [Content_Types].xml 属性编码无效：{error}"
-                            ))
-                        })?
-                        .into_owned();
-                    match attribute.key.local_name().as_ref() {
-                        "PartName" => part_name = Some(value),
-                        "ContentType" => content_type = Some(value),
-                        _ => {}
-                    }
-                }
-                if part_name.as_deref() == Some("/ppt/presentation.xml")
-                    && content_type.as_deref() == Some(expected)
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(Event::Eof) => return Ok(false),
-            Err(error) => {
-                return Err(LibraryError::ImportFile(format!(
-                    "无法解析 PPTX [Content_Types].xml：{error}"
-                )));
-            }
-            _ => {}
-        }
-        buffer.clear();
-    }
-}
-
-fn xml_root_local_name(xml: &[u8], format: &str) -> LibraryResult<String> {
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
-    let mut buffer = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
-                return Ok(element.local_name().as_ref().to_string());
-            }
-            Ok(Event::Eof) => {
-                return Err(LibraryError::ImportFile(format!(
-                    "{format} XML 为空或缺少根节点。"
-                )));
-            }
-            Err(error) => {
-                return Err(LibraryError::ImportFile(format!(
-                    "无法解析 {format} XML：{error}"
-                )));
-            }
-            _ => {}
-        }
-        buffer.clear();
-    }
+    ooxml::validate_pptx_package(archive).map(|_| ())
 }
 
 fn expect_prefix(path: &Path, expected: &[u8], message: &str) -> Result<(), String> {
@@ -5155,15 +5045,8 @@ fn extract_pptx_text(path: &Path) -> LibraryResult<String> {
 
 fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction> {
     let mut extraction = PptxExtraction::default();
-    let entry_names = zip_entry_names_for(archive, "PPTX")?;
-    let mut slide_names = entry_names
-        .iter()
-        .filter(|name| {
-            name.starts_with("ppt/slides/") && name.ends_with(".xml") && !name.contains("/_rels/")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    slide_names.sort_by_key(|name| pptx_slide_number(name));
+    let graph = ooxml::pptx_presentation_graph(archive)?;
+    let slide_names = graph.slide_parts;
 
     if slide_names.is_empty() {
         return Err(LibraryError::Preview(
@@ -5185,13 +5068,7 @@ fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction>
         }
     }
 
-    let mut chart_names = entry_names
-        .iter()
-        .filter(|name| name.starts_with("ppt/charts/") && name.ends_with(".xml"))
-        .cloned()
-        .collect::<Vec<_>>();
-    chart_names.sort();
-    for entry_name in chart_names {
+    for entry_name in graph.chart_parts {
         match read_zip_entry_for(archive, &entry_name, "PPTX")
             .and_then(|xml| extract_powerpoint_text(&xml, true))
         {
@@ -5270,15 +5147,6 @@ fn extract_powerpoint_text(xml: &[u8], chart_values: bool) -> LibraryResult<Stri
         .to_string())
 }
 
-fn pptx_slide_number(name: &str) -> usize {
-    name.rsplit('/')
-        .next()
-        .and_then(|file_name| file_name.strip_prefix("slide"))
-        .and_then(|value| value.strip_suffix(".xml"))
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(usize::MAX)
-}
-
 fn inspect_pptx_degradations(archive: &[u8]) -> Vec<String> {
     let Ok(entry_names) = zip_entry_names_for(archive, "PPTX") else {
         return Vec::new();
@@ -5334,40 +5202,6 @@ fn push_unique_feature(features: &mut Vec<String>, feature: String) {
 
 fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
     zip_entry_names_for(archive, "DOCX")
-}
-
-fn ensure_zip_entries_not_encrypted(archive: &[u8], format: &str) -> LibraryResult<()> {
-    let eocd = find_zip_eocd(archive).ok_or_else(|| {
-        LibraryError::ImportFile(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
-    })?;
-    let entry_count = read_u16(archive, eocd + 10)? as usize;
-    let mut cursor = read_u32(archive, eocd + 16)? as usize;
-
-    for _ in 0..entry_count {
-        if read_u32(archive, cursor)? != 0x0201_4b50 {
-            return Err(LibraryError::ImportFile(format!(
-                "{format} 文件结构无效：中央目录项损坏。"
-            )));
-        }
-        let flags = read_u16(archive, cursor + 8)?;
-        if flags & 0x0001 != 0 {
-            return Err(LibraryError::ImportFile(format!(
-                "{format} 已加密，无法导入。"
-            )));
-        }
-        let name_length = read_u16(archive, cursor + 28)? as usize;
-        let extra_length = read_u16(archive, cursor + 30)? as usize;
-        let comment_length = read_u16(archive, cursor + 32)? as usize;
-        cursor = cursor
-            .checked_add(46)
-            .and_then(|value| value.checked_add(name_length))
-            .and_then(|value| value.checked_add(extra_length))
-            .and_then(|value| value.checked_add(comment_length))
-            .ok_or_else(|| {
-                LibraryError::ImportFile(format!("{format} 文件结构无效：目录项长度溢出。"))
-            })?;
-    }
-    Ok(())
 }
 
 fn zip_entry_names_for(archive: &[u8], format: &str) -> LibraryResult<Vec<String>> {

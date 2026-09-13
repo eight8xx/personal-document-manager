@@ -4,6 +4,7 @@ import {
   documentFormatCapabilities,
   documentFormatForPath,
   documentFormatForType,
+  documentFormatIdForType,
   importableDocumentExtensions,
   importableDocumentTypes,
   unsupportedDocumentMessage
@@ -46,6 +47,8 @@ describe("文档格式能力表", () => {
     }
 
     expect(documentFormatForType("MARKDOWN")?.id).toBe("markdown");
+    expect(documentFormatForType("pptx")?.id).toBe("pptx");
+    expect(documentFormatIdForType("PPTX")).toBe("pptx");
     expect(documentFormatForPath("C:\\Docs\\README.MD")?.id).toBe("markdown");
     expect(documentFormatForPath("C:\\Docs\\photo.jpeg")?.displayType).toBe(
       "JPG"

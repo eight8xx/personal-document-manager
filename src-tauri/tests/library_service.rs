@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -321,13 +322,15 @@ fn pptx_extracts_slide_table_group_and_chart_text_without_notes_or_comments() {
     let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <p:sld
   xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
-  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <p:cSld>
     <p:spTree>
       <p:sp><p:txBody><a:p><a:r><a:t>幻灯片正文</a:t></a:r></a:p></p:txBody></p:sp>
       <p:graphicFrame><a:graphic><a:graphicData><a:tbl>
         <a:tr><a:tc><a:txBody><a:p><a:r><a:t>表格文本</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
       </a:tbl></a:graphicData></a:graphic></p:graphicFrame>
+      <p:graphicFrame r:id="rIdChart"/>
       <p:grpSp><p:sp><p:txBody><a:p><a:r><a:t>组合形状文本</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp>
     </p:spTree>
   </p:cSld>
@@ -340,12 +343,24 @@ fn pptx_extracts_slide_table_group_and_chart_text_without_notes_or_comments() {
 </c:chartSpace>"#;
     let notes_xml = r#"<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>备注中不应索引的文本</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#;
     let comments_xml = r#"<p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cm><p:text>批注中不应索引的文本</p:text></p:cm></p:cmLst>"#;
+    let slide_relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>
+</Relationships>"#;
+    let orphan_slide = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>孤儿幻灯片</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+    let orphan_chart = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt><c:v>孤儿图表</c:v></c:pt></c:strCache></c:strRef></c:tx></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
     fs::write(
         &source_path,
         pptx_fixture_with_entries(
             slide_xml,
             &[
                 ("ppt/charts/chart1.xml", chart_xml.as_bytes()),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    slide_relationships.as_bytes(),
+                ),
+                ("ppt/slides/slide2.xml", orphan_slide.as_bytes()),
+                ("ppt/charts/chart2.xml", orphan_chart.as_bytes()),
                 ("ppt/notesSlides/notesSlide1.xml", notes_xml.as_bytes()),
                 ("ppt/comments/comment1.xml", comments_xml.as_bytes()),
             ],
@@ -379,10 +394,12 @@ fn pptx_extracts_slide_table_group_and_chart_text_without_notes_or_comments() {
         DocumentSearchFilters::default()
     )
     .is_empty());
+    assert!(search(&service, "孤儿幻灯片", DocumentSearchFilters::default()).is_empty());
+    assert!(search(&service, "孤儿图表", DocumentSearchFilters::default()).is_empty());
 }
 
 #[test]
-fn pptx_preview_degrades_a_corrupt_slide_without_losing_the_document() {
+fn pptx_validation_rejects_a_slide_with_unclosed_relationship_graph() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
     let library_dir = root.path().join("Library");
@@ -397,24 +414,10 @@ fn pptx_preview_degrades_a_corrupt_slide_without_losing_the_document() {
 
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
-    let imported = service.import_document(&source_path).unwrap();
-
-    let DocumentPreview::Pptx {
-        text,
-        degraded_features,
-        ..
-    } = service.get_document_preview(&imported.id, None).unwrap()
-    else {
-        panic!("damaged slide should still return a PPTX preview");
-    };
-    assert_eq!(text, "演示文稿中没有可提取的文本。");
-    assert!(degraded_features
-        .iter()
-        .any(|feature| feature.contains("第 1 页")));
-
-    let indexed = service.index_pending_documents().unwrap();
-    assert_eq!(indexed.searchable, 1);
-    assert_eq!(service.list_documents().unwrap().len(), 1);
+    let error = service.import_document(&source_path).unwrap_err();
+    assert_eq!(error.code(), "importFile");
+    assert!(error.to_string().contains("无法解析 PPTX 关系引用"));
+    assert!(service.list_documents().unwrap().is_empty());
 }
 
 #[test]
@@ -1626,6 +1629,106 @@ fn docx_preview_reports_degraded_regions_without_failing_the_document() {
 }
 
 #[test]
+fn office_preview_packages_are_sanitized_before_they_reach_renderers() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let docx_path = root.path().join("remote-image.docx");
+    let pptx_path = root.path().join("remote-image.pptx");
+    let docx_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <w:body><w:p><w:r><w:t>安全正文</w:t></w:r></w:p>
+  <w:p><w:r><w:drawing><a:blip r:embed="rIdRemote"/></w:drawing></w:r></w:p></w:body>
+</w:document>"#;
+    let docx_relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdRemote" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://evil.example/tracker.png" TargetMode="External"/>
+</Relationships>"#;
+    let docx_root_relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdDocument" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    fs::write(
+        &docx_path,
+        stored_zip(&[
+            ("word/document.xml", docx_xml.as_bytes()),
+            ("_rels/.rels", docx_root_relationships.as_bytes()),
+            (
+                "word/_rels/document.xml.rels",
+                docx_relationships.as_bytes(),
+            ),
+        ]),
+    )
+    .unwrap();
+
+    let pptx_slide = r#"<p:sld
+      xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <p:cSld><p:spTree><p:pic><p:blipFill><a:blip r:embed="rIdRemote"/></p:blipFill></p:pic></p:spTree></p:cSld>
+    </p:sld>"#;
+    let pptx_slide_relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdRemote" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://evil.example/tracker.png" TargetMode="External"/>
+</Relationships>"#;
+    let pptx_root_relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdPresentation" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+  <Relationship Id="rIdThumbnail" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/>
+</Relationships>"#;
+    fs::write(
+        &pptx_path,
+        pptx_fixture_with_entries(
+            pptx_slide,
+            &[
+                ("_rels/.rels", pptx_root_relationships.as_bytes()),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    pptx_slide_relationships.as_bytes(),
+                ),
+                ("docProps/thumbnail.jpeg", b"EMBEDDED-THUMBNAIL"),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let docx = service.import_document(&docx_path).unwrap();
+    let pptx = service.import_document(&pptx_path).unwrap();
+
+    let DocumentPreview::Docx { data_url, .. } =
+        service.get_document_preview(&docx.id, None).unwrap()
+    else {
+        panic!("DOCX preview should be available");
+    };
+    let docx_package = bytes_from_data_url(&data_url);
+    assert!(!bytes_contain(
+        &docx_package,
+        b"https://evil.example/tracker.png"
+    ));
+    assert!(!bytes_contain(&docx_package, b"TargetMode=\"External\""));
+    assert!(!bytes_contain(&docx_package, b"rIdRemote"));
+
+    let DocumentPreview::Pptx { data_url, .. } =
+        service.get_document_preview(&pptx.id, None).unwrap()
+    else {
+        panic!("PPTX preview should be available");
+    };
+    let pptx_package = bytes_from_data_url(&data_url);
+    assert!(!bytes_contain(
+        &pptx_package,
+        b"https://evil.example/tracker.png"
+    ));
+    assert!(!bytes_contain(&pptx_package, b"TargetMode=\"External\""));
+    assert!(!bytes_contain(&pptx_package, b"rIdRemote"));
+    assert!(!bytes_contain(&pptx_package, b"EMBEDDED-THUMBNAIL"));
+}
+
+#[test]
 fn generates_thumbnails_and_reports_missing_library_copies_without_changing_state() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -1808,6 +1911,30 @@ fn pdf_preview_rejects_active_content_and_invalidates_temporary_page_cache() {
 }
 
 #[test]
+fn pdf_preview_rejects_active_objects_inside_a_compressed_object_stream() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("compressed-active.pdf");
+    fs::write(
+        &source_path,
+        pdf_with_compressed_object_stream(b"7 0 << /Type /Action /S /JavaScript /JS (alert(1)) >>"),
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    let DocumentPreview::Failure { code, message } =
+        service.get_document_preview(&imported.id, None).unwrap()
+    else {
+        panic!("compressed active PDF content must not be rendered");
+    };
+    assert_eq!(code, "unsafePreview");
+    assert!(message.to_ascii_lowercase().contains("javascript"));
+}
+
+#[test]
 fn searches_chinese_english_and_mixed_content_with_snippets() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -1932,7 +2059,7 @@ fn supports_short_metadata_queries_and_combined_filters() {
         )
         .unwrap();
 
-    let short_results = search(&service, "AI", DocumentSearchFilters::default());
+    let short_results = search(&service, "计划", DocumentSearchFilters::default());
     assert_eq!(short_results.len(), 1);
     assert_eq!(short_results[0].document.id, matching.id);
     assert_eq!(short_results[0].match_kind, SearchMatchKind::Metadata);
@@ -2948,6 +3075,19 @@ fn valid_pdf_with_text(text: &str) -> Vec<u8> {
     pdf
 }
 
+fn pdf_with_compressed_object_stream(contents: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(contents).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut pdf =
+        b"%PDF-1.7\n6 0 obj << /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length ".to_vec();
+    pdf.extend_from_slice(compressed.len().to_string().as_bytes());
+    pdf.extend_from_slice(b" >>\nstream\n");
+    pdf.extend_from_slice(&compressed);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
+    pdf
+}
+
 fn escape_pdf_text(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('(', "\\(")
@@ -2955,8 +3095,18 @@ fn escape_pdf_text(text: &str) -> String {
 }
 
 fn png_bytes_from_data_url(data_url: &str) -> Vec<u8> {
+    bytes_from_data_url(data_url)
+}
+
+fn bytes_from_data_url(data_url: &str) -> Vec<u8> {
     let (_, encoded) = data_url.split_once(',').unwrap();
     BASE64.decode(encoded).unwrap()
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn png_dimensions(bytes: &[u8]) -> (u32, u32) {

@@ -327,6 +327,64 @@ describe("DOCX 版式预览", () => {
     expect(revokeObjectURL.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("reuses rendered layout by content hash and invalidates it when the hash changes", async () => {
+    const client = new FakeBackendClient({ bootstrap });
+    renderMock.mockResolvedValue(
+      mockRenderedDocument({ content: "<p>可缓存段落</p>" })
+    );
+    const first = renderPreview(client);
+    expect(await screen.findByText("可缓存段落")).toBeInTheDocument();
+    expect(parseMock).toHaveBeenCalledTimes(1);
+    expect(renderMock).toHaveBeenCalledTimes(1);
+
+    first.unmount();
+    const cached = renderPreview(client);
+    expect(await screen.findByText("可缓存段落")).toBeInTheDocument();
+    expect(parseMock).toHaveBeenCalledTimes(1);
+    expect(renderMock).toHaveBeenCalledTimes(1);
+
+    cached.rerender(
+      <DocxPreview
+        client={client}
+        document={{ ...documentSummary, contentHash: "hash-cache-refresh" }}
+        preview={docxPreview}
+      />
+    );
+    await waitFor(() => {
+      expect(parseMock).toHaveBeenCalledTimes(2);
+      expect(renderMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("revokes object URLs created by an in-flight render after unmount", async () => {
+    const client = new FakeBackendClient({ bootstrap });
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL
+    });
+    let resolveRender!: (nodes: Node[]) => void;
+    renderMock.mockReturnValueOnce(
+      new Promise<Node[]>((resolve) => {
+        resolveRender = resolve;
+      })
+    );
+    const { unmount } = renderPreview(client);
+    await waitFor(() => expect(renderMock).toHaveBeenCalledTimes(1));
+
+    unmount();
+    resolveRender(
+      mockRenderedDocument({
+        content:
+          "<p>迟到内容</p><img src=\"blob:late-object-url\" alt=\"迟到图片\">"
+      })
+    );
+
+    await waitFor(() => {
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:late-object-url");
+    });
+  });
+
   it("does not load a remote link before the user activates it", () => {
     const openExternalUrl = vi.fn(async () => undefined);
     const client = new FakeBackendClient({

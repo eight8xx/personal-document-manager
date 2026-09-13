@@ -16,6 +16,7 @@ import {
 } from "react";
 import type { CSSProperties } from "react";
 
+import { documentFormatIdForType } from "../backend/documentFormats";
 import { toBackendError } from "../backend/error";
 import { safeExternalUrl } from "../backend/url";
 import type {
@@ -23,6 +24,10 @@ import type {
   DocumentPreview,
   DocumentSummary
 } from "../backend/types";
+import {
+  cacheDocxRender,
+  getCachedDocxRender
+} from "./previewRenderCache";
 
 type DocxDocumentPreview = Extract<DocumentPreview, { kind: "docx" }>;
 
@@ -48,7 +53,7 @@ const renderOptions: Partial<Options> = {
   renderFootnotes: true,
   renderEndnotes: true,
   ignoreLastRenderedPageBreak: false,
-  useBase64URL: false,
+  useBase64URL: true,
   renderChanges: false,
   renderComments: false,
   renderAltChunks: false
@@ -130,6 +135,11 @@ function sanitizeRenderedNode(
   }
 
   for (const descendant of Array.from(element.querySelectorAll("*"))) {
+    for (const attribute of Array.from(descendant.attributes)) {
+      if (attribute.name.toLocaleLowerCase().startsWith("on")) {
+        descendant.removeAttribute(attribute.name);
+      }
+    }
     if (["SCRIPT", "IFRAME", "OBJECT", "EMBED"].includes(descendant.tagName)) {
       replaceWithBlockedRegion(
         descendant,
@@ -189,7 +199,10 @@ function configureHyperlinks(
   onLinkError: (message: string) => void
 ) {
   for (const anchor of Array.from(root.querySelectorAll<HTMLAnchorElement>("a"))) {
-    const rawHref = anchor.getAttribute("href")?.trim() ?? "";
+    const rawHref =
+      anchor.getAttribute("href")?.trim() ??
+      anchor.dataset.docxSafeHref?.trim() ??
+      "";
     anchor.removeAttribute("href");
     anchor.removeAttribute("target");
 
@@ -202,6 +215,7 @@ function configureHyperlinks(
       continue;
     }
 
+    anchor.dataset.docxSafeHref = externalUrl ?? rawHref;
     anchor.classList.add("docx-safe-link");
     anchor.setAttribute("role", "link");
     anchor.tabIndex = 0;
@@ -258,6 +272,14 @@ function collectObjectUrls(...roots: Array<HTMLElement | null>) {
     }
   }
   return urls;
+}
+
+function collectNodeObjectUrls(nodes: Node[]) {
+  return collectObjectUrls(
+    ...nodes
+      .filter((node) => node.nodeType === Node.ELEMENT_NODE)
+      .map((node) => node as HTMLElement)
+  );
 }
 
 function revokeObjectUrls(urls: Set<string>) {
@@ -342,14 +364,23 @@ export function DocxPreview({
     styles?.replaceChildren();
 
     try {
-      const blob = blobFromDataUrl(preview.dataUrl);
-      void import("docx-preview")
-        .then(async ({ parseAsync, renderDocument }) => {
-          const wordDocument = await parseAsync(blob, renderOptions);
-          return renderDocument(wordDocument, renderOptions);
-        })
+      const formatId = documentFormatIdForType(document.fileType);
+      const cachedNodes =
+        formatId === null ? null : getCachedDocxRender(formatId, document);
+      const renderedNodes = cachedNodes
+        ? Promise.resolve(cachedNodes)
+        : import("docx-preview").then(
+            async ({ parseAsync, renderDocument }) => {
+              const blob = blobFromDataUrl(preview.dataUrl);
+              const wordDocument = await parseAsync(blob, renderOptions);
+              return renderDocument(wordDocument, renderOptions);
+            }
+          );
+      void renderedNodes
         .then((nodes) => {
+          const createdObjectUrls = collectNodeObjectUrls(nodes);
           if (!active || !body || !styles) {
+            revokeObjectUrls(createdObjectUrls);
             return;
           }
           const runtimeDegradations = new Set<string>();
@@ -378,7 +409,14 @@ export function DocxPreview({
           });
           setPageCount(Math.max(1, sections.length));
           setRuntimeDegradations([...runtimeDegradations]);
-          renderedObjectUrlsRef.current = collectObjectUrls(body, styles);
+          const retainedObjectUrls = collectObjectUrls(body, styles);
+          renderedObjectUrlsRef.current = new Set([
+            ...createdObjectUrls,
+            ...retainedObjectUrls
+          ]);
+          if (formatId && renderedObjectUrlsRef.current.size === 0) {
+            cacheDocxRender(formatId, document, [...styleNodes, ...bodyNodes]);
+          }
           updateFitScale();
         })
         .catch((caught) => {
@@ -411,7 +449,10 @@ export function DocxPreview({
   }, [
     client,
     document.contentHash,
+    document.fileSize,
+    document.fileType,
     document.id,
+    document.lastImportedAt,
     preview,
     renderAttempt,
     updateFitScale

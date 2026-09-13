@@ -1,6 +1,8 @@
 mod error;
 mod formats;
 mod models;
+mod ooxml;
+mod pdf_security;
 mod service;
 mod thumbnail;
 

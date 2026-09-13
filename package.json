@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build --configLoader runner",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "vitest run --configLoader runner",
+    "test:watch": "vitest --configLoader runner",
     "tauri": "tauri"
   },
   "dependencies": {

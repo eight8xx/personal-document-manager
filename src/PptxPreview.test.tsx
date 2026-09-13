@@ -131,6 +131,8 @@ function createViewerMock({
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   pptxMocks.open.mockReset();
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
     configurable: true,
@@ -211,6 +213,41 @@ describe("PPTX 导入与版式预览", () => {
     expect(
       screen.getByRole("button", { name: "适配 PPTX 预览宽度" })
     ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("reuses the rendered layout by content hash without reopening the renderer", async () => {
+    createViewerMock({ slideCount: 1, contents: ["缓存幻灯片"] });
+    const client = new FakeBackendClient({ bootstrap });
+    const first = render(
+      <PptxPreview
+        client={client}
+        document={documentSummary}
+        preview={pptxPreview}
+      />
+    );
+
+    expect((await screen.findAllByText("缓存幻灯片")).length).toBeGreaterThan(0);
+    expect(pptxMocks.open).toHaveBeenCalledTimes(1);
+    first.unmount();
+    const second = render(
+      <PptxPreview
+        client={client}
+        document={documentSummary}
+        preview={pptxPreview}
+      />
+    );
+    expect((await screen.findAllByText("缓存幻灯片")).length).toBeGreaterThan(0);
+    expect(pptxMocks.open).toHaveBeenCalledTimes(1);
+    second.unmount();
+    render(
+      <PptxPreview
+        client={client}
+        document={{ ...documentSummary, contentHash: "hash-pptx-refresh" }}
+        preview={pptxPreview}
+      />
+    );
+    expect((await screen.findAllByText("缓存幻灯片")).length).toBeGreaterThan(0);
+    expect(pptxMocks.open).toHaveBeenCalledTimes(2);
   });
 
   it("removes scripts, embedded media and remote resources and opens links only on click", async () => {
@@ -324,9 +361,40 @@ describe("PPTX 导入与版式预览", () => {
     expect(client.calls).toContain(`openDocument:${documentSummary.id}`);
   });
 
-  it("lazily generates and persists a real renderer thumbnail for the grid", async () => {
+  it("generates and persists a thumbnail from the first rendered slide", async () => {
     const thumbnailDataUrl =
       "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==";
+    const embeddedThumbnail = vi.fn();
+    vi.stubGlobal(
+      "Image",
+      class {
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+
+        set src(_value: string) {
+          queueMicrotask(() => this.onload?.());
+        }
+      }
+    );
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      fillStyle: "#ffffff",
+      fillRect: vi.fn(),
+      drawImage: vi.fn()
+    } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue(
+      thumbnailDataUrl
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      width: 800,
+      height: 450,
+      top: 0,
+      right: 800,
+      bottom: 450,
+      left: 0,
+      toJSON: () => ({})
+    } as DOMRect);
     const saveDocumentThumbnail = vi.fn(async (_id, dataUrl: string) => ({
       kind: "pptx" as const,
       dataUrl
@@ -354,9 +422,8 @@ describe("PPTX 导入与版式预览", () => {
           host.append(content);
         }
         content.append(slide);
-        options.onThumbnail?.(
-          thumbnailDataUrl.replace("data:image/jpeg;base64,", "")
-        );
+        options.onThumbnail?.("embedded-thumbnail");
+        embeddedThumbnail();
         options.onRenderComplete?.();
         return {
           slideCount: 1,
@@ -387,6 +454,11 @@ describe("PPTX 导入与版式预览", () => {
         thumbnailDataUrl
       );
     });
+    expect(embeddedThumbnail).toHaveBeenCalled();
+    expect(saveDocumentThumbnail).not.toHaveBeenCalledWith(
+      documentSummary.id,
+      "data:image/jpeg;base64,embedded-thumbnail"
+    );
   });
 
   it("falls back to the PPTX type icon when thumbnail rendering fails", async () => {
@@ -411,5 +483,28 @@ describe("PPTX 导入与版式预览", () => {
     expect(
       container.querySelector("svg.lucide-presentation")
     ).toBeInTheDocument();
+  });
+
+  it("uses a cached library thumbnail without invoking the renderer", async () => {
+    const cachedDataUrl =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z6ZkAAAAASUVORK5CYII=";
+    const client = new FakeBackendClient({
+      bootstrap,
+      getDocumentThumbnail: async () => ({
+        kind: "pptx",
+        dataUrl: cachedDataUrl
+      })
+    });
+
+    const { container } = render(
+      <PptxThumbnail client={client} document={documentSummary} />
+    );
+
+    await waitFor(() => {
+      expect(
+        container.querySelector<HTMLImageElement>(".pptx-generated img")
+      ).toHaveAttribute("src", cachedDataUrl);
+    });
+    expect(pptxMocks.open).not.toHaveBeenCalled();
   });
 });

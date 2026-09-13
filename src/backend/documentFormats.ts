@@ -1,6 +1,7 @@
 import capabilityData from "../../shared/document-format-capabilities.json";
 import type {
   DocumentFormatCapability,
+  DocumentFormatId,
   DocumentSummary
 } from "./types";
 
@@ -22,6 +23,13 @@ const capabilityByType = new Map(
   ])
 );
 
+const capabilityById = new Map(
+  documentFormatCapabilities.map((capability) => [
+    capability.id,
+    capability
+  ])
+);
+
 const capabilityByExtension = new Map(
   documentFormatCapabilities.flatMap((capability) =>
     capability.extensions.map((extension) => [extension, capability] as const)
@@ -31,7 +39,18 @@ const capabilityByExtension = new Map(
 export function documentFormatForType(
   fileType: string
 ): DocumentFormatCapability | null {
-  return capabilityByType.get(fileType.toLocaleLowerCase()) ?? null;
+  const normalized = fileType.trim().toLocaleLowerCase();
+  return (
+    capabilityById.get(normalized as DocumentFormatId) ??
+    capabilityByType.get(normalized) ??
+    null
+  );
+}
+
+export function documentFormatIdForType(
+  fileType: string
+): DocumentFormatId | null {
+  return documentFormatForType(fileType)?.id ?? null;
 }
 
 export function documentFormatForPath(

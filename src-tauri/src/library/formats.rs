@@ -18,6 +18,33 @@ pub enum DocumentFormatId {
     Pptx,
 }
 
+impl DocumentFormatId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Docx => "docx",
+            Self::Txt => "txt",
+            Self::Markdown => "markdown",
+            Self::Jpg => "jpg",
+            Self::Png => "png",
+            Self::Pptx => "pptx",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pdf" => Some(Self::Pdf),
+            "docx" => Some(Self::Docx),
+            "txt" => Some(Self::Txt),
+            "markdown" | "md" => Some(Self::Markdown),
+            "jpg" | "jpeg" => Some(Self::Jpg),
+            "png" => Some(Self::Png),
+            "pptx" => Some(Self::Pptx),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ValidationStrategy {
@@ -116,9 +143,20 @@ pub fn capability_for_path(path: &Path) -> Option<&'static DocumentFormatCapabil
 }
 
 pub fn capability_for_file_type(file_type: &str) -> Option<&'static DocumentFormatCapability> {
+    if let Some(id) = DocumentFormatId::parse(file_type) {
+        return capability_for_id(id);
+    }
+    document_format_capabilities().iter().find(|capability| {
+        capability
+            .display_type
+            .eq_ignore_ascii_case(file_type.trim())
+    })
+}
+
+pub fn capability_for_id(id: DocumentFormatId) -> Option<&'static DocumentFormatCapability> {
     document_format_capabilities()
         .iter()
-        .find(|capability| capability.display_type.eq_ignore_ascii_case(file_type))
+        .find(|capability| capability.id == id)
 }
 
 pub fn canonical_file_type(file_type: &str) -> Option<&'static str> {
@@ -187,6 +225,10 @@ mod tests {
         }
 
         let pptx = capability_for_file_type("PPTX").unwrap();
+        assert_eq!(
+            capability_for_file_type("pptx").unwrap().id,
+            DocumentFormatId::Pptx
+        );
         assert!(pptx.import_enabled);
         assert_eq!(pptx.validation, ValidationStrategy::PptxPackage);
         assert_eq!(pptx.preview, PreviewStrategy::PptxPages);

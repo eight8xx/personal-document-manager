@@ -109,7 +109,7 @@ mod platform {
     ) -> LibraryResult<RenderedPdfPage> {
         initialize_winrt();
         let bytes = fs::read(path)?;
-        ensure_safe_pdf_preview(&bytes)?;
+        crate::library::pdf_security::ensure_safe_pdf_preview(&bytes)?;
         render_pdf_page_from_bytes(&bytes, page_index, max_width, max_height)
     }
 
@@ -220,27 +220,6 @@ mod platform {
         // RPC_E_CHANGED_MODE means the thread already has a different COM apartment,
         // which is valid for the synchronous WinRT calls used here.
         let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-    }
-
-    fn ensure_safe_pdf_preview(bytes: &[u8]) -> LibraryResult<()> {
-        let lowered = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-        for token in [
-            b"/javascript".as_slice(),
-            b"/js".as_slice(),
-            b"/launch".as_slice(),
-            b"/embeddedfile".as_slice(),
-            b"/richmedia".as_slice(),
-            b"/openaction".as_slice(),
-            b"/aa".as_slice(),
-            b"/xfa".as_slice(),
-        ] {
-            if lowered.windows(token.len()).any(|window| window == token) {
-                return Err(LibraryError::UnsafePreview(
-                    "PDF 包含会在预览时被禁止的脚本、自动动作或嵌入对象。".to_string(),
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn thumbnail_error(error: windows::core::Error) -> LibraryError {
