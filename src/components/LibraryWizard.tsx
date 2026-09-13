@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 
-import { toBackendError } from "../backend/client";
+import { toBackendError } from "../backend/error";
 import type {
   BackendClient,
   LibraryLocationInspection,

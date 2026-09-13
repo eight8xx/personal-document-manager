@@ -1,15 +1,17 @@
-use std::fs::{self, OpenOptions};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::error::{LibraryError, LibraryResult};
 use super::models::{
-    BootstrapState, CloudSyncWarning, LibraryLocationInspection, LibraryMetadata, LibrarySummary,
-    LocationStatus, RecentLibrary, RecentLibraryRecord,
+    BootstrapState, CloudSyncWarning, DocumentProcessingStatus, DocumentSummary, IndexStatus,
+    LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary,
+    RecentLibraryRecord,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -30,7 +32,7 @@ pub struct LibraryService {
 
 struct OpenLibrary {
     summary: LibrarySummary,
-    _connection: Connection,
+    connection: Connection,
 }
 
 impl LibraryService {
@@ -203,10 +205,209 @@ impl LibraryService {
         let summary = summary_from_metadata(&path, &metadata);
         self.current = Some(OpenLibrary {
             summary: summary.clone(),
-            _connection: connection,
+            connection,
         });
         self.record_recent(&summary)?;
         Ok(summary)
+    }
+
+    pub fn import_document(
+        &mut self,
+        source_path: impl AsRef<Path>,
+    ) -> LibraryResult<DocumentSummary> {
+        let source_path = normalize_source_file(source_path.as_ref())?;
+        let source_metadata = fs::metadata(&source_path)?;
+        if !source_metadata.is_file() {
+            return Err(LibraryError::ImportFile(format!(
+                "只能导入文件：{}",
+                source_path.display()
+            )));
+        }
+
+        let file_name = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| LibraryError::ImportFile("源文件缺少文件名。".to_string()))?;
+        let file_type = supported_file_type(&source_path).ok_or_else(|| {
+            LibraryError::UnsupportedFile(
+                "不支持该文件格式。仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG 文件。".to_string(),
+            )
+        })?;
+        let file_size = i64::try_from(source_metadata.len())
+            .map_err(|_| LibraryError::ImportFile("文件大小超出支持范围。".to_string()))?;
+        let title = source_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| file_name.clone());
+
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let library_root = PathBuf::from(&library.summary.path);
+        let document_id = Uuid::new_v4().to_string();
+        let relative_directory = PathBuf::from(DOCUMENTS_DIR).join(&document_id);
+        let destination_directory = library_root.join(&relative_directory);
+        fs::create_dir_all(&destination_directory)?;
+
+        let destination_path = destination_directory.join(&file_name);
+        let temporary_path = destination_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        if let Err(error) = fs::copy(&source_path, &temporary_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(LibraryError::Io(error));
+        }
+        if let Err(error) = fs::rename(&temporary_path, &destination_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(LibraryError::Io(error));
+        }
+
+        let imported_at = now();
+        let source_path_text = source_path.to_string_lossy().into_owned();
+        let source_identifier = source_path_text.to_ascii_lowercase();
+        let library_path = relative_directory
+            .join(&file_name)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let hash_result = sha256_file(&destination_path);
+        let (content_hash, processing_status, index_status, error_stage, error_message) =
+            match hash_result {
+                Ok(hash) => (
+                    Some(hash),
+                    DocumentProcessingStatus::Ready,
+                    IndexStatus::Pending,
+                    None,
+                    None,
+                ),
+                Err(error) => (
+                    None,
+                    DocumentProcessingStatus::Failed,
+                    IndexStatus::Failed,
+                    Some("hashing".to_string()),
+                    Some(format!("无法计算文件哈希：{error}")),
+                ),
+            };
+
+        let document = DocumentSummary {
+            id: document_id.clone(),
+            title,
+            file_name,
+            file_type: file_type.to_string(),
+            file_size,
+            content_hash,
+            collection_id: "inbox".to_string(),
+            processing_status,
+            index_status,
+            error_stage,
+            error_message,
+            imported_at: imported_at.clone(),
+            source_path: source_path_text,
+            source_identifier,
+            last_imported_at: imported_at.clone(),
+        };
+
+        library.connection.execute(
+            "
+            INSERT INTO documents (
+                id, title, collection_id, file_name, file_type, file_size,
+                content_hash, library_path, processing_status, index_status,
+                error_stage, error_message, imported_at, created_at, updated_at
+            )
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13
+            )
+            ",
+            params![
+                document.id,
+                document.title,
+                document.collection_id,
+                document.file_name,
+                document.file_type,
+                document.file_size,
+                document.content_hash,
+                library_path,
+                document.processing_status.as_str(),
+                document.index_status.as_str(),
+                document.error_stage,
+                document.error_message,
+                imported_at,
+            ],
+        )?;
+
+        if let Err(error) = library.connection.execute(
+            "
+            INSERT INTO sources (
+                id, document_id, source_path, source_identifier, last_imported_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                document.id,
+                document.source_path,
+                document.source_identifier,
+                document.last_imported_at,
+            ],
+        ) {
+            let message = format!("无法记录来源信息：{error}");
+            library.connection.execute(
+                "
+                UPDATE documents
+                SET processing_status = 'failed',
+                    index_status = 'failed',
+                    error_stage = 'source',
+                    error_message = ?2,
+                    updated_at = ?3
+                WHERE id = ?1
+                ",
+                params![document.id, message, now()],
+            )?;
+            return Ok(DocumentSummary {
+                processing_status: DocumentProcessingStatus::Failed,
+                index_status: IndexStatus::Failed,
+                error_stage: Some("source".to_string()),
+                error_message: Some(message),
+                ..document
+            });
+        }
+
+        Ok(document)
+    }
+
+    pub fn list_documents(&self) -> LibraryResult<Vec<DocumentSummary>> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let mut statement = library.connection.prepare(
+            "
+            SELECT
+                d.id,
+                d.title,
+                d.file_name,
+                d.file_type,
+                d.file_size,
+                d.content_hash,
+                d.collection_id,
+                d.processing_status,
+                d.index_status,
+                d.error_stage,
+                d.error_message,
+                d.imported_at,
+                COALESCE(s.source_path, ''),
+                COALESCE(s.source_identifier, ''),
+                COALESCE(s.last_imported_at, d.imported_at)
+            FROM documents d
+            LEFT JOIN sources s ON s.document_id = d.id
+            WHERE d.deleted_at IS NULL
+            ORDER BY d.imported_at DESC, d.id DESC
+            ",
+        )?;
+        let documents = statement
+            .query_map([], document_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(documents)
     }
 
     pub fn list_recent_libraries(&self) -> Vec<RecentLibrary> {
@@ -243,7 +444,7 @@ impl LibraryService {
         initialize_schema(&connection)?;
         self.current = Some(OpenLibrary {
             summary,
-            _connection: connection,
+            connection,
         });
         Ok(())
     }
@@ -440,6 +641,101 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
         params![timestamp],
     )?;
     Ok(())
+}
+
+fn normalize_source_file(path: &Path) -> LibraryResult<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(LibraryError::ImportFile("请选择要导入的文件。".to_string()));
+    }
+
+    if !path.exists() {
+        return Err(LibraryError::ImportFile(format!(
+            "源文件不存在：{}",
+            path.display()
+        )));
+    }
+
+    let path = dunce_canonicalize(path)?;
+    if !path.is_file() {
+        return Err(LibraryError::ImportFile(format!(
+            "只能导入文件：{}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn supported_file_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => Some("PDF"),
+        "docx" => Some("DOCX"),
+        "txt" => Some("TXT"),
+        "md" | "markdown" => Some("Markdown"),
+        "jpg" | "jpeg" => Some("JPG"),
+        "png" => Some("PNG"),
+        _ => None,
+    }
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentSummary> {
+    let processing_status: String = row.get(7)?;
+    let processing_status = DocumentProcessingStatus::from_database(&processing_status)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unknown document processing status",
+                )),
+            )
+        })?;
+    let index_status: String = row.get(8)?;
+    let index_status = IndexStatus::from_database(&index_status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown document index status",
+            )),
+        )
+    })?;
+
+    Ok(DocumentSummary {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        file_name: row.get(2)?,
+        file_type: row.get(3)?,
+        file_size: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        content_hash: row.get(5)?,
+        collection_id: row.get(6)?,
+        processing_status,
+        index_status,
+        error_stage: row.get(9)?,
+        error_message: row.get(10)?,
+        imported_at: row.get(11)?,
+        source_path: row.get(12)?,
+        source_identifier: row.get(13)?,
+        last_imported_at: row.get(14)?,
+    })
 }
 
 fn normalize_path(path: &Path) -> LibraryResult<PathBuf> {

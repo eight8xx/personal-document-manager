@@ -1,50 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
   BackendClient,
-  BackendErrorShape,
   BootstrapState,
+  DocumentSummary,
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary
 } from "./types";
-
-export class BackendError extends Error {
-  readonly code: string;
-
-  constructor({ code, message }: BackendErrorShape) {
-    super(message);
-    this.name = "BackendError";
-    this.code = code;
-  }
-}
-
-export function toBackendError(error: unknown): BackendError {
-  if (error instanceof BackendError) {
-    return error;
-  }
-
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    "message" in error &&
-    typeof error.code === "string" &&
-    typeof error.message === "string"
-  ) {
-    return new BackendError({ code: error.code, message: error.message });
-  }
-
-  if (typeof error === "string") {
-    return new BackendError({ code: "unknown", message: error });
-  }
-
-  return new BackendError({
-    code: "unknown",
-    message: "操作失败，请稍后重试。"
-  });
-}
 
 export const tauriBackendClient: BackendClient = {
   bootstrap: () => invoke<BootstrapState>("bootstrap"),
@@ -60,6 +25,38 @@ export const tauriBackendClient: BackendClient = {
   },
   createLibrary: (path) => invoke<LibrarySummary>("create_library", { path }),
   openLibrary: (path) => invoke<LibrarySummary>("open_library", { path }),
+  pickDocumentFile: async () => {
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      title: "选择要导入的文档",
+      filters: [
+        {
+          name: "支持的文档",
+          extensions: [
+            "pdf",
+            "docx",
+            "txt",
+            "md",
+            "markdown",
+            "jpg",
+            "jpeg",
+            "png"
+          ]
+        }
+      ]
+    });
+    return typeof selected === "string" ? selected : null;
+  },
+  importDocument: (path) =>
+    invoke<DocumentSummary>("import_document", { path }),
+  listDocuments: () => invoke<DocumentSummary[]>("list_documents"),
+  subscribeToFileDrops: async (handler) =>
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "drop") {
+        handler(event.payload.paths);
+      }
+    }),
   listRecentLibraries: () =>
     invoke<RecentLibrary[]>("list_recent_libraries"),
   forgetRecentLibrary: (path) =>

@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use personal_document_manager_lib::library::{LibraryService, LocationStatus};
+use personal_document_manager_lib::library::{
+    DocumentProcessingStatus, IndexStatus, LibraryService, LocationStatus,
+};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -132,6 +134,101 @@ fn existing_library_is_detected_as_an_open_location() {
     assert_eq!(inspection.status, LocationStatus::ExistingLibrary);
     assert!(inspection.is_existing_library);
     assert!(is_library(Path::new(&inspection.path)));
+}
+
+#[test]
+fn imports_a_single_file_and_preserves_the_source() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("source").join("项目说明.md");
+    let source_bytes = "第一版导入闭环\n".as_bytes();
+    fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+
+    let imported = service.import_document(&source_path).unwrap();
+
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+    assert_eq!(source_path.file_name().unwrap(), "项目说明.md");
+    assert_eq!(imported.title, "项目说明");
+    assert_eq!(imported.file_name, "项目说明.md");
+    assert_eq!(imported.file_type, "Markdown");
+    assert_eq!(imported.file_size, source_bytes.len() as i64);
+    assert_eq!(
+        imported.content_hash,
+        Some("f0e90aeef1ad3ef3666f7cf73a7938d958078cddb1dcfc6eed65a394d9940e18".to_string())
+    );
+    assert_eq!(imported.collection_id, "inbox");
+    assert_eq!(imported.processing_status, DocumentProcessingStatus::Ready);
+    assert_eq!(imported.index_status, IndexStatus::Pending);
+    assert!(imported.source_path.ends_with("项目说明.md"));
+    assert_eq!(
+        imported.source_identifier,
+        imported.source_path.to_ascii_lowercase()
+    );
+    assert_eq!(imported.last_imported_at, imported.imported_at);
+
+    let library_copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    assert!(library_copy.is_file());
+    assert_eq!(fs::read(library_copy).unwrap(), source_bytes);
+    assert_eq!(service.list_documents().unwrap(), vec![imported]);
+}
+
+#[test]
+fn rejects_an_unsupported_file_before_copying_it() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("installer.exe");
+    fs::write(&source_path, b"not a document").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+
+    let error = service.import_document(&source_path).unwrap_err();
+    assert!(error.to_string().contains("不支持"));
+    assert_eq!(
+        fs::read_dir(library_dir.join("documents")).unwrap().count(),
+        0
+    );
+    assert!(source_path.is_file());
+}
+
+#[test]
+fn imports_every_supported_file_type() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+
+    let supported = [
+        ("report.pdf", "PDF"),
+        ("report.docx", "DOCX"),
+        ("notes.txt", "TXT"),
+        ("readme.md", "Markdown"),
+        ("scan.jpg", "JPG"),
+        ("photo.png", "PNG"),
+    ];
+
+    for (file_name, expected_type) in supported {
+        let source_path = root.path().join(file_name);
+        fs::write(&source_path, file_name.as_bytes()).unwrap();
+        let imported = service.import_document(&source_path).unwrap();
+        assert_eq!(imported.file_type, expected_type);
+        assert_eq!(
+            service.import_document(&source_path).unwrap().file_type,
+            expected_type
+        );
+    }
+
+    assert_eq!(service.list_documents().unwrap().len(), supported.len() * 2);
 }
 
 fn is_library(path: &Path) -> bool {

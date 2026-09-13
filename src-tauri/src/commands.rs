@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
-    BootstrapState, LibraryError, LibraryResult, LibraryService, LibrarySummary, RecentLibrary,
+    BootstrapState, DocumentSummary, LibraryError, LibraryResult, LibraryService, LibrarySummary,
+    RecentLibrary,
 };
 
 pub struct AppState {
@@ -106,6 +107,36 @@ fn open_library_contract(state: &AppState, path: String) -> Result<LibrarySummar
     state
         .service()?
         .open_library(path)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn import_document(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentSummary, CommandError> {
+    import_document_contract(&state, path)
+}
+
+fn import_document_contract(
+    state: &AppState,
+    path: String,
+) -> Result<DocumentSummary, CommandError> {
+    state
+        .service()?
+        .import_document(path)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<DocumentSummary>, CommandError> {
+    list_documents_contract(&state)
+}
+
+fn list_documents_contract(state: &AppState) -> Result<Vec<DocumentSummary>, CommandError> {
+    state
+        .service()?
+        .list_documents()
         .map_err(CommandError::from)
 }
 

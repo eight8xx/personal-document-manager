@@ -18,6 +18,12 @@ pub enum LibraryError {
     Database(#[from] rusqlite::Error),
     #[error("资料库元数据格式错误：{0}")]
     Json(#[from] serde_json::Error),
+    #[error("请先打开资料库。")]
+    NoCurrentLibrary,
+    #[error("{0}")]
+    UnsupportedFile(String),
+    #[error("{0}")]
+    ImportFile(String),
     #[error("无法打开目录：{0}")]
     OpenDirectory(String),
     #[error("资料库状态锁已损坏")]
@@ -33,6 +39,9 @@ impl LibraryError {
             Self::Io(_) => "filesystem",
             Self::Database(_) => "database",
             Self::Json(_) => "invalidMetadata",
+            Self::NoCurrentLibrary => "noCurrentLibrary",
+            Self::UnsupportedFile(_) => "unsupportedFile",
+            Self::ImportFile(_) => "importFile",
             Self::OpenDirectory(_) => "openDirectory",
             Self::StateLock => "stateLock",
         }

@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -10,13 +11,36 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { App } from "./App";
 import { FakeBackendClient } from "./backend/fakeClient";
-import type { BootstrapState, LibrarySummary } from "./backend/types";
+import type {
+  BootstrapState,
+  DocumentSummary,
+  LibrarySummary
+} from "./backend/types";
 
 const currentLibrary: LibrarySummary = {
   id: "library-current",
   name: "个人资料",
   path: "C:\\Documents\\个人资料",
   createdAt: "2026-09-13T08:00:00Z"
+};
+
+const importedDocument: DocumentSummary = {
+  id: "document-1",
+  title: "项目说明",
+  fileName: "项目说明.md",
+  fileType: "Markdown",
+  fileSize: 24,
+  contentHash:
+    "f0e90aeef1ad3ef3666f7cf73a7938d958078cddb1dcfc6eed65a394d9940e18",
+  collectionId: "inbox",
+  processingStatus: "ready",
+  indexStatus: "pending",
+  errorStage: null,
+  errorMessage: null,
+  importedAt: "2026-09-13T08:10:00Z",
+  sourcePath: "C:\\Documents\\项目说明.md",
+  sourceIdentifier: "c:\\documents\\项目说明.md",
+  lastImportedAt: "2026-09-13T08:10:00Z"
 };
 
 afterEach(() => {
@@ -57,7 +81,12 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "空资料库" })
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "导入文档" })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("main", { name: "空资料库" })).getByRole(
+        "button",
+        { name: "导入文档" }
+      )
+    ).toBeEnabled();
     expect(client.calls).toContain(
       "create:C:\\Documents\\我的资料库"
     );
@@ -124,7 +153,12 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "空资料库" })
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "导入文档" })).toBeDisabled();
+    expect(
+      within(screen.getByRole("main", { name: "空资料库" })).getByRole(
+        "button",
+        { name: "导入文档" }
+      )
+    ).toBeEnabled();
 
     const settingsButton = screen.getByRole("button", { name: "设置" });
     await user.click(settingsButton);
@@ -161,5 +195,134 @@ describe("App", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "资料库" })).not.toBeInTheDocument();
     await waitFor(() => expect(settingsButton).toHaveFocus());
+  });
+
+  it("imports a file selected from the picker and shows its status", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary(),
+      selectedDocument: importedDocument.sourcePath,
+      importDocument: async () => importedDocument
+    });
+
+    render(<App client={client} />);
+    const emptyLibrary = await screen.findByRole("main", {
+      name: "空资料库"
+    });
+    await user.click(
+      within(emptyLibrary).getByRole("button", { name: "导入文档" })
+    );
+
+    expect(await screen.findByText("项目说明")).toBeInTheDocument();
+    expect(screen.getByText("等待索引")).toBeInTheDocument();
+    expect(screen.getByText("项目说明.md")).toBeInTheDocument();
+    expect(client.calls).toContain(
+      `import:${importedDocument.sourcePath}`
+    );
+  });
+
+  it("imports a file dropped onto the workspace", async () => {
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary(),
+      importDocument: async () => importedDocument
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    client.emitFileDrop([importedDocument.sourcePath]);
+
+    expect(await screen.findByText("项目说明")).toBeInTheDocument();
+    expect(client.calls).toContain(
+      `import:${importedDocument.sourcePath}`
+    );
+  });
+
+  it("keeps a just-imported document when the initial list response arrives later", async () => {
+    let resolveDocuments:
+      | ((documents: DocumentSummary[]) => void)
+      | undefined;
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary(),
+      importDocument: async () => importedDocument
+    });
+    client.listDocuments = () =>
+      new Promise((resolve) => {
+        resolveDocuments = resolve;
+      });
+
+    render(<App client={client} />);
+    await waitFor(() => {
+      expect(client.calls).toContain("subscribeToFileDrops");
+    });
+    client.emitFileDrop([importedDocument.sourcePath]);
+    await waitFor(() => {
+      expect(client.calls).toContain(
+        `import:${importedDocument.sourcePath}`
+      );
+    });
+
+    await act(async () => {
+      resolveDocuments?.([]);
+    });
+
+    expect(await screen.findByText("项目说明")).toBeInTheDocument();
+  });
+
+  it("shows a clear error when the selected file type is unsupported", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary(),
+      selectedDocument: "C:\\Documents\\installer.exe"
+    });
+
+    render(<App client={client} />);
+    const emptyLibrary = await screen.findByRole("main", {
+      name: "空资料库"
+    });
+    await user.click(
+      within(emptyLibrary).getByRole("button", { name: "导入文档" })
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG");
+    expect(screen.queryByText("installer.exe")).not.toBeInTheDocument();
+  });
+
+  it("shows a retryable state when document processing fails", async () => {
+    const failedDocument: DocumentSummary = {
+      ...importedDocument,
+      id: "document-failed",
+      processingStatus: "failed",
+      indexStatus: "failed",
+      errorStage: "hashing",
+      errorMessage: "无法计算文件哈希"
+    };
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary(),
+      documents: [failedDocument]
+    });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText("项目说明")).toBeInTheDocument();
+    expect(screen.getByText("处理失败，等待重试")).toBeInTheDocument();
+  });
+
+  it("shows a clear error when more than one file is dropped", async () => {
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary()
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    client.emitFileDrop([
+      importedDocument.sourcePath,
+      "C:\\Documents\\第二份.md"
+    ]);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "一次只能导入一个文件"
+    );
+    expect(client.calls.some((call) => call.startsWith("import:"))).toBe(false);
   });
 });

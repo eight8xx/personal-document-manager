@@ -19,6 +19,8 @@ pub fn run() {
             commands::inspect_library_location,
             commands::create_library,
             commands::open_library,
+            commands::import_document,
+            commands::list_documents,
             commands::list_recent_libraries,
             commands::forget_recent_library,
             commands::open_library_directory,

@@ -1,7 +1,8 @@
 import { AlertCircle, LoaderCircle, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { tauriBackendClient, toBackendError } from "./backend/client";
+import { tauriBackendClient } from "./backend/client";
+import { toBackendError } from "./backend/error";
 import type {
   BackendClient,
   LibrarySummary,
@@ -134,6 +135,7 @@ export function App({ client = tauriBackendClient }: AppProps) {
       {library ? (
         <>
           <LibraryWorkspace
+            client={client}
             library={library}
             onOpenSettings={openSettings}
           />
