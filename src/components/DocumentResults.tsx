@@ -16,6 +16,11 @@ import type {
   DocumentSummary,
   DocumentThumbnail
 } from "../backend/types";
+import {
+  documentSupportsGeneratedThumbnail,
+  documentUsesLocalImage,
+  documentUsesPdfPreview
+} from "../backend/documentFormats";
 
 export interface StatusPresentation {
   label: string;
@@ -130,9 +135,8 @@ function DocumentThumbnailVisual({
   document: DocumentSummary;
 }) {
   const [thumbnail, setThumbnail] = useState<DocumentThumbnail | null>(null);
-  const usesGeneratedThumbnail = isImageDocument(document) || isPdfDocument(
-    document
-  );
+  const usesGeneratedThumbnail =
+    documentSupportsGeneratedThumbnail(document);
 
   useEffect(() => {
     let active = true;
@@ -588,16 +592,16 @@ export function findCollectionName(
 }
 
 export function documentTypeIcon(document: DocumentSummary) {
-  if (isImageDocument(document)) {
+  if (documentUsesLocalImage(document)) {
     return ImageIcon;
   }
   return FileText;
 }
 
 export function isImageDocument(document: DocumentSummary) {
-  return ["JPG", "JPEG", "PNG"].includes(document.fileType.toUpperCase());
+  return documentUsesLocalImage(document);
 }
 
 export function isPdfDocument(document: DocumentSummary) {
-  return document.fileType.toUpperCase() === "PDF";
+  return documentUsesPdfPreview(document);
 }

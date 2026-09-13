@@ -2319,13 +2319,12 @@ p {
   gap: 2px;
 }
 
-.pdf-preview-frame {
+.pdf-preview-page {
   width: 100%;
-  aspect-ratio: 1 / 1.414;
   min-height: 360px;
   display: block;
-  border: 0;
   background: var(--surface-muted);
+  object-fit: contain;
 }
 
 .image-preview {
@@ -2371,6 +2370,36 @@ p {
   line-height: 1.65;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.markdown-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-strong);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.markdown-link:hover,
+.markdown-link:focus-visible {
+  color: var(--accent);
+  outline: none;
+}
+
+.preview-inline-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 11px;
+  border-top: 1px solid var(--border);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 11px;
 }
 
 .details-empty {

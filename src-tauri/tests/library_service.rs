@@ -211,6 +211,31 @@ fn rejects_an_unsupported_file_before_copying_it() {
 }
 
 #[test]
+fn reserves_pptx_without_enabling_import_and_rejects_unsafe_external_urls() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("slides.pptx");
+    fs::write(&source_path, b"PK\x03\x04future presentation").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+
+    let error = service.import_document(&source_path).unwrap_err();
+    assert_eq!(error.code(), "unsupportedFile");
+    assert!(fs::read_dir(library_dir.join("documents"))
+        .unwrap()
+        .next()
+        .is_none());
+
+    let error = service
+        .open_external_url("javascript:alert('blocked')")
+        .unwrap_err();
+    assert_eq!(error.code(), "invalidExternalUrl");
+    assert!(error.to_string().contains("HTTP 或 HTTPS"));
+}
+
+#[test]
 fn imports_every_supported_file_type() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -1162,11 +1187,7 @@ fn previews_real_library_text_docx_and_pdf_contents() {
         stored_zip(&[("word/document.xml", docx_xml.as_bytes())]),
     )
     .unwrap();
-    fs::write(
-        &pdf_path,
-        b"%PDF-1.4\n1 0 obj << /Type /Pages /Count 2 >> endobj\n%%EOF",
-    )
-    .unwrap();
+    fs::write(&pdf_path, valid_pdf()).unwrap();
 
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
@@ -1176,18 +1197,19 @@ fn previews_real_library_text_docx_and_pdf_contents() {
     let pdf = service.import_document(&pdf_path).unwrap();
 
     assert_eq!(
-        service.get_document_preview(&text.id).unwrap(),
+        service.get_document_preview(&text.id, None).unwrap(),
         DocumentPreview::Text {
             text: "纯文本预览内容".to_string()
         }
     );
     assert_eq!(
-        service.get_document_preview(&markdown.id).unwrap(),
-        DocumentPreview::Text {
+        service.get_document_preview(&markdown.id, None).unwrap(),
+        DocumentPreview::Markdown {
             text: "# Markdown\n\n只读文本内容".to_string()
         }
     );
-    let DocumentPreview::Docx { text, notice } = service.get_document_preview(&docx.id).unwrap()
+    let DocumentPreview::Docx { text, notice } =
+        service.get_document_preview(&docx.id, None).unwrap()
     else {
         panic!("DOCX should return extracted text");
     };
@@ -1197,12 +1219,14 @@ fn previews_real_library_text_docx_and_pdf_contents() {
     let DocumentPreview::Pdf {
         data_url,
         page_count,
-    } = service.get_document_preview(&pdf.id).unwrap()
+        page,
+    } = service.get_document_preview(&pdf.id, None).unwrap()
     else {
         panic!("PDF should return an inline document preview");
     };
-    assert!(data_url.starts_with("data:application/pdf;base64,"));
-    assert_eq!(page_count, Some(2));
+    assert!(data_url.starts_with("data:image/png;base64,"));
+    assert_eq!(page_count, Some(1));
+    assert_eq!(page, 1);
 }
 
 #[test]
@@ -1284,12 +1308,107 @@ fn generates_thumbnails_and_reports_missing_library_copies_without_changing_stat
         service.get_document_thumbnail(&image.id).unwrap(),
         DocumentThumbnail::Fallback { .. }
     ));
-    let preview_error = service.get_document_preview(&image.id).unwrap_err();
-    assert_eq!(preview_error.code(), "documentFileMissing");
-    assert!(preview_error.to_string().contains("资料库副本不存在"));
+    let DocumentPreview::Failure { code, message } =
+        service.get_document_preview(&image.id, None).unwrap()
+    else {
+        panic!("missing library copy should return a structured preview failure");
+    };
+    assert_eq!(code, "documentFileMissing");
+    assert!(message.contains("资料库副本不存在"));
     let open_error = service.open_document(&image.id).unwrap_err();
     assert_eq!(open_error.code(), "documentFileMissing");
     assert_eq!(service.list_documents().unwrap(), documents_before);
+}
+
+#[test]
+fn pdf_preview_rejects_active_content_and_invalidates_temporary_page_cache() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("report.pdf");
+    fs::write(&source_path, valid_pdf()).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    let library = service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    let first_hash = imported.content_hash.clone().unwrap();
+    let DocumentPreview::Pdf {
+        data_url,
+        page_count,
+        page,
+    } = service.get_document_preview(&imported.id, None).unwrap()
+    else {
+        panic!("safe PDF should render a static page image");
+    };
+    assert!(data_url.starts_with("data:image/png;base64,"));
+    assert_eq!(page_count, Some(1));
+    assert_eq!(page, 1);
+
+    let first_cache_directory = std::env::temp_dir()
+        .join("personal-document-manager")
+        .join("rendered-pages")
+        .join(&library.id)
+        .join(&imported.id)
+        .join(&first_hash);
+    let first_cache_page = first_cache_directory.join("page-1.png");
+    assert!(first_cache_page.is_file());
+    let first_modified = fs::metadata(&first_cache_page).unwrap().modified().unwrap();
+    assert!(matches!(
+        service.get_document_preview(&imported.id, None).unwrap(),
+        DocumentPreview::Pdf { .. }
+    ));
+    assert_eq!(
+        fs::metadata(&first_cache_page).unwrap().modified().unwrap(),
+        first_modified
+    );
+
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    fs::write(&copy, valid_pdf_with_text("Replacement PDF page")).unwrap();
+    drop(service);
+
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    restarted.index_pending_documents().unwrap();
+    let refreshed = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    let refreshed_hash = refreshed.content_hash.unwrap();
+    assert_ne!(refreshed_hash, first_hash);
+    assert!(matches!(
+        restarted.get_document_preview(&imported.id, None).unwrap(),
+        DocumentPreview::Pdf { .. }
+    ));
+    assert!(!first_cache_directory.exists());
+    assert!(std::env::temp_dir()
+        .join("personal-document-manager")
+        .join("rendered-pages")
+        .join(&library.id)
+        .join(&imported.id)
+        .join(&refreshed_hash)
+        .join("page-1.png")
+        .is_file());
+
+    let unsafe_path = root.path().join("unsafe.pdf");
+    fs::write(
+        &unsafe_path,
+        b"%PDF-1.4\n1 0 obj << /OpenAction 2 0 R /JavaScript (app.alert('blocked')) >> endobj\n%%EOF",
+    )
+    .unwrap();
+    let unsafe_document = restarted.import_document(&unsafe_path).unwrap();
+    let DocumentPreview::Failure { code, message } = restarted
+        .get_document_preview(&unsafe_document.id, None)
+        .unwrap()
+    else {
+        panic!("active PDF content must not be rendered");
+    };
+    assert_eq!(code, "unsafePreview");
+    assert!(message.contains("禁止"));
 }
 
 #[test]
@@ -2355,7 +2474,12 @@ fn png_fixture(width: u32, height: u32) -> Vec<u8> {
 }
 
 fn valid_pdf() -> Vec<u8> {
-    let content = b"BT /F1 24 Tf 36 100 Td (PDF page) Tj ET";
+    valid_pdf_with_text("PDF page")
+}
+
+fn valid_pdf_with_text(text: &str) -> Vec<u8> {
+    let content = format!("BT /F1 24 Tf 36 100 Td ({}) Tj ET", escape_pdf_text(text));
+    let content = content.as_bytes();
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
@@ -2387,6 +2511,12 @@ fn valid_pdf() -> Vec<u8> {
         .as_bytes(),
     );
     pdf
+}
+
+fn escape_pdf_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
 }
 
 fn png_bytes_from_data_url(data_url: &str) -> Vec<u8> {

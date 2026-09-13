@@ -9,11 +9,12 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState,
-    CollectionDeleteResult, CollectionSummary, DocumentIndexChangedEvent, DocumentIndexPhase,
-    DocumentMetadataUpdate, DocumentPreview, DocumentSearchQuery, DocumentSearchResponse,
-    DocumentSummary, DocumentThumbnail, EmptyTrashResult, ExternalChangeMonitor, ImportBatch,
-    ImportDecision, ImportItemResult, ImportProgress, IndexRunResult, IndexStatus, LibraryError,
-    LibraryResult, LibraryService, LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
+    CollectionDeleteResult, CollectionSummary, DocumentFormatCapability, DocumentIndexChangedEvent,
+    DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentSearchQuery,
+    DocumentSearchResponse, DocumentSummary, DocumentThumbnail, EmptyTrashResult,
+    ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult, ImportProgress,
+    IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService, LibrarySummary,
+    RecentLibrary, TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
@@ -729,18 +730,20 @@ pub async fn retry_document_index(
 #[tauri::command]
 pub fn get_document_preview(
     document_id: String,
+    page: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<DocumentPreview, CommandError> {
-    get_document_preview_contract(&state, document_id)
+    get_document_preview_contract(&state, document_id, page)
 }
 
 fn get_document_preview_contract(
     state: &AppState,
     document_id: String,
+    page: Option<u32>,
 ) -> Result<DocumentPreview, CommandError> {
     state
         .service()?
-        .get_document_preview(&document_id)
+        .get_document_preview(&document_id, page)
         .map_err(CommandError::from)
 }
 
@@ -774,6 +777,19 @@ fn open_document_contract(state: &AppState, document_id: String) -> Result<(), C
         .service()?
         .open_document(&document_id)
         .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn open_external_url(url: String, state: State<'_, AppState>) -> Result<(), CommandError> {
+    state
+        .service()?
+        .open_external_url(&url)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn list_document_format_capabilities() -> Result<Vec<DocumentFormatCapability>, CommandError> {
+    Ok(crate::library::document_format_capabilities().to_vec())
 }
 
 #[tauri::command]
@@ -828,14 +844,14 @@ mod tests {
         add_tag_to_document_contract, bootstrap_contract, create_collection_contract,
         create_library_contract, create_tag_contract, delete_collection_contract,
         delete_tag_contract, empty_trash_contract, inspect_library_location_contract,
-        list_collections_contract, list_tags_contract, list_trash_documents_contract,
-        move_collection_contract, move_document_to_collection_contract,
-        move_document_to_trash_contract, pending_index_count_contract,
-        permanently_delete_document_contract, remove_tag_from_document_contract,
-        rename_collection_contract, rename_tag_contract, resolve_import_item_contract,
-        restore_document_contract, retry_import_item_contract, spawn_import_task,
-        start_import_contract, update_document_metadata_contract, AppState, CommandError,
-        LibraryChangedEvent,
+        list_collections_contract, list_document_format_capabilities, list_tags_contract,
+        list_trash_documents_contract, move_collection_contract,
+        move_document_to_collection_contract, move_document_to_trash_contract,
+        pending_index_count_contract, permanently_delete_document_contract,
+        remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
+        resolve_import_item_contract, restore_document_contract, retry_import_item_contract,
+        spawn_import_task, start_import_contract, update_document_metadata_contract, AppState,
+        CommandError, LibraryChangedEvent,
     };
     use crate::library::{
         BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
@@ -882,13 +898,15 @@ mod tests {
     #[test]
     fn preview_and_thumbnail_responses_use_camel_case() {
         let preview = serde_json::to_value(DocumentPreview::Pdf {
-            data_url: "data:application/pdf;base64,AA==".to_string(),
+            data_url: "data:image/png;base64,AA==".to_string(),
             page_count: Some(3),
+            page: 1,
         })
         .unwrap();
         assert_eq!(preview["kind"], "pdf");
         assert!(preview.get("dataUrl").is_some());
         assert!(preview.get("pageCount").is_some());
+        assert!(preview.get("page").is_some());
         assert!(preview.get("data_url").is_none());
 
         let thumbnail = serde_json::to_value(DocumentThumbnail::Fallback {
@@ -897,6 +915,20 @@ mod tests {
         .unwrap();
         assert_eq!(thumbnail["kind"], "fallback");
         assert!(thumbnail.get("reason").is_some());
+    }
+
+    #[test]
+    fn format_capability_command_matches_the_shared_contract() {
+        let capabilities = list_document_format_capabilities().unwrap();
+        let value = serde_json::to_value(capabilities).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 7);
+        assert_eq!(value[0]["id"], "pdf");
+        assert_eq!(value[0]["displayType"], "PDF");
+        assert_eq!(value[0]["security"]["scripts"], "blocked");
+        assert_eq!(value[0]["security"]["remoteResources"], "blocked");
+        assert_eq!(value[0]["security"]["sourceMutation"], "blocked");
+        assert_eq!(value[6]["id"], "pptx");
+        assert_eq!(value[6]["importEnabled"], false);
     }
 
     #[test]

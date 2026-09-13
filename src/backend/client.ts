@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 
+import { importableDocumentExtensions } from "./documentFormats";
 import type {
   BackendClient,
   BatchDocumentOperationRequest,
@@ -11,6 +12,7 @@ import type {
   CollectionDeleteResult,
   CollectionSummary,
   DocumentIndexChangedEvent,
+  DocumentFormatCapability,
   DocumentMetadataUpdate,
   DocumentPreview,
   DocumentSearchQuery,
@@ -52,16 +54,7 @@ export const tauriBackendClient: BackendClient = {
       filters: [
         {
           name: "支持的文档",
-          extensions: [
-            "pdf",
-            "docx",
-            "txt",
-            "md",
-            "markdown",
-            "jpg",
-            "jpeg",
-            "png"
-          ]
+          extensions: importableDocumentExtensions
         }
       ]
     });
@@ -75,16 +68,7 @@ export const tauriBackendClient: BackendClient = {
       filters: [
         {
           name: "支持的文档",
-          extensions: [
-            "pdf",
-            "docx",
-            "txt",
-            "md",
-            "markdown",
-            "jpg",
-            "jpeg",
-            "png"
-          ]
+          extensions: importableDocumentExtensions
         }
       ]
     });
@@ -116,12 +100,15 @@ export const tauriBackendClient: BackendClient = {
         handler(event.payload.paths);
       }
     }),
-  getDocumentPreview: (documentId) =>
-    invoke<DocumentPreview>("get_document_preview", { documentId }),
+  getDocumentPreview: (documentId, page) =>
+    invoke<DocumentPreview>("get_document_preview", { documentId, page }),
   getDocumentThumbnail: (documentId) =>
     invoke<DocumentThumbnail>("get_document_thumbnail", { documentId }),
   openDocument: (documentId) =>
     invoke<void>("open_document", { documentId }),
+  openExternalUrl: (url) => invoke<void>("open_external_url", { url }),
+  listDocumentFormatCapabilities: () =>
+    invoke<DocumentFormatCapability[]>("list_document_format_capabilities"),
   listRecentLibraries: () =>
     invoke<RecentLibrary[]>("list_recent_libraries"),
   forgetRecentLibrary: (path) =>

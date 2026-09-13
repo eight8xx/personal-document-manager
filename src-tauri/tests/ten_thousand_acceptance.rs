@@ -244,8 +244,9 @@ fn ten_thousand_document_library_acceptance() {
         .iter()
         .find(|document| document.file_type == "TXT")
         .unwrap();
-    let DocumentPreview::Text { text } =
-        service.get_document_preview(&preview_document.id).unwrap()
+    let DocumentPreview::Text { text } = service
+        .get_document_preview(&preview_document.id, None)
+        .unwrap()
     else {
         panic!("TXT preview should return text");
     };

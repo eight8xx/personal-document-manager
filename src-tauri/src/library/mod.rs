@@ -1,9 +1,15 @@
 mod error;
+mod formats;
 mod models;
 mod service;
 mod thumbnail;
 
 pub use error::{LibraryError, LibraryResult};
+pub use formats::{
+    canonical_file_type, document_format_capabilities, DocumentFormatCapability, DocumentFormatId,
+    FormatSecurity, PreviewStrategy, SecurityPolicy, TextExtractionStrategy, ThumbnailStrategy,
+    ValidationStrategy,
+};
 pub use models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,

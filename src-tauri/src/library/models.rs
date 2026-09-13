@@ -171,6 +171,7 @@ pub enum DocumentPreview {
     Pdf {
         data_url: String,
         page_count: Option<u32>,
+        page: u32,
     },
     Image {
         data_url: String,
@@ -178,9 +179,16 @@ pub enum DocumentPreview {
     Text {
         text: String,
     },
+    Markdown {
+        text: String,
+    },
     Docx {
         text: String,
         notice: String,
+    },
+    Failure {
+        code: String,
+        message: String,
     },
     Unsupported {
         message: String,

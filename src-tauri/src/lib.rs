@@ -64,6 +64,8 @@ pub fn run() {
             commands::get_document_preview,
             commands::get_document_thumbnail,
             commands::open_document,
+            commands::open_external_url,
+            commands::list_document_format_capabilities,
             commands::list_recent_libraries,
             commands::forget_recent_library,
             commands::open_library_directory,

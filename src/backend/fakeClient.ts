@@ -1,4 +1,11 @@
 import { BackendError, toBackendError } from "./error";
+import {
+  documentFormatCapabilities,
+  documentFormatForPath,
+  documentFormatForType,
+  fileTypeForPath,
+  unsupportedDocumentMessage
+} from "./documentFormats";
 import type {
   BackendClient,
   BatchDocumentItemResult,
@@ -9,6 +16,7 @@ import type {
   CollectionSummary,
   DocumentIndexChangedEvent,
   DocumentIndexChangedHandler,
+  DocumentFormatCapability,
   DocumentMetadataUpdate,
   DocumentPreview,
   DocumentSearchQuery,
@@ -52,9 +60,13 @@ export interface FakeBackendOptions {
   retryImportItem?: (itemId: string) => Promise<ImportItemResult>;
   documentPreviews?: Record<string, DocumentPreview>;
   documentThumbnails?: Record<string, DocumentThumbnail>;
-  getDocumentPreview?: (documentId: string) => Promise<DocumentPreview>;
+  getDocumentPreview?: (
+    documentId: string,
+    page?: number
+  ) => Promise<DocumentPreview>;
   getDocumentThumbnail?: (documentId: string) => Promise<DocumentThumbnail>;
   openDocument?: (documentId: string) => Promise<void>;
+  openExternalUrl?: (url: string) => Promise<void>;
   documentContents?: Record<string, string>;
   indexFailures?: Record<string, string>;
   searchDocuments?: (
@@ -84,18 +96,7 @@ function defaultLibrary(path: string): LibrarySummary {
 
 function defaultDocument(path: string): DocumentSummary {
   const fileName = path.split(/[\\/]/).filter(Boolean).at(-1) ?? "未命名文档";
-  const extension = fileName.split(".").at(-1)?.toLowerCase() ?? "";
-  const fileType =
-    {
-      pdf: "PDF",
-      docx: "DOCX",
-      txt: "TXT",
-      md: "Markdown",
-      markdown: "Markdown",
-      jpg: "JPG",
-      jpeg: "JPG",
-      png: "PNG"
-    }[extension] ?? extension.toUpperCase();
+  const fileType = fileTypeForPath(fileName) ?? fileName.toUpperCase();
   const importedAt = "2026-09-13T08:10:00Z";
 
   return {
@@ -127,26 +128,6 @@ const inbox: CollectionSummary = {
   isInbox: true,
   documentCount: 0
 };
-
-function fileTypeForPath(path: string): string | null {
-  const extension = path.split(".").at(-1)?.toLowerCase() ?? "";
-  if (!extension) {
-    return null;
-  }
-
-  return (
-    {
-      pdf: "PDF",
-      docx: "DOCX",
-      txt: "TXT",
-      md: "Markdown",
-      markdown: "Markdown",
-      jpg: "JPG",
-      jpeg: "JPG",
-      png: "PNG"
-    }[extension] ?? extension.toUpperCase()
-  );
-}
 
 function countsForItems(items: ImportItemResult[]) {
   return {
@@ -206,13 +187,16 @@ export class FakeBackendClient implements BackendClient {
   private readonly documentPreviews: Record<string, DocumentPreview>;
   private readonly documentThumbnails: Record<string, DocumentThumbnail>;
   private readonly getDocumentPreviewImpl:
-    | ((documentId: string) => Promise<DocumentPreview>)
+    | ((documentId: string, page?: number) => Promise<DocumentPreview>)
     | null;
   private readonly getDocumentThumbnailImpl:
     | ((documentId: string) => Promise<DocumentThumbnail>)
     | null;
   private readonly openDocumentImpl:
     | ((documentId: string) => Promise<void>)
+    | null;
+  private readonly openExternalUrlImpl:
+    | ((url: string) => Promise<void>)
     | null;
   private readonly documentContents: Record<string, string>;
   private readonly indexFailures: Record<string, string>;
@@ -272,6 +256,7 @@ export class FakeBackendClient implements BackendClient {
     this.getDocumentPreviewImpl = options.getDocumentPreview ?? null;
     this.getDocumentThumbnailImpl = options.getDocumentThumbnail ?? null;
     this.openDocumentImpl = options.openDocument ?? null;
+    this.openExternalUrlImpl = options.openExternalUrl ?? null;
     this.documentContents = structuredClone(options.documentContents ?? {});
     this.indexFailures = structuredClone(options.indexFailures ?? {});
     this.searchDocumentsImpl = options.searchDocuments ?? null;
@@ -373,17 +358,10 @@ export class FakeBackendClient implements BackendClient {
       return document;
     }
 
-    const extension = path.split(".").at(-1)?.toLowerCase();
-    if (
-      !extension ||
-      !["pdf", "docx", "txt", "md", "markdown", "jpg", "jpeg", "png"].includes(
-        extension
-      )
-    ) {
+    if (!documentFormatForPath(path)) {
       throw new BackendError({
         code: "unsupportedFile",
-        message:
-          "不支持该文件格式。仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG 文件。"
+        message: unsupportedDocumentMessage()
       });
     }
 
@@ -746,37 +724,54 @@ export class FakeBackendClient implements BackendClient {
     );
   }
 
-  async getDocumentPreview(documentId: string): Promise<DocumentPreview> {
+  async getDocumentPreview(
+    documentId: string,
+    page?: number
+  ): Promise<DocumentPreview> {
     this.calls.push(`getDocumentPreview:${documentId}`);
     if (this.getDocumentPreviewImpl) {
-      return this.getDocumentPreviewImpl(documentId);
+      return this.getDocumentPreviewImpl(documentId, page);
     }
     if (this.documentPreviews[documentId]) {
       return structuredClone(this.documentPreviews[documentId]);
     }
 
     const document = this.requireDocument(documentId);
-    if (document.fileType === "PDF") {
+    const capability = documentFormatForType(document.fileType);
+    if (!capability) {
       return {
-        kind: "pdf",
-        dataUrl: "data:application/pdf;base64,JVBERi0xLjQ=",
-        pageCount: null
+        kind: "unsupported",
+        message: `暂不支持预览 ${document.fileType} 格式。`
       };
     }
-    if (document.fileType === "JPG" || document.fileType === "PNG") {
+    if (capability.preview === "pdfPages") {
+      return {
+        kind: "pdf",
+        dataUrl: "data:image/png;base64,iVBORw0KGgo=",
+        pageCount: 3,
+        page: page ?? 1
+      };
+    }
+    if (capability.preview === "localImage") {
       return {
         kind: "image",
         dataUrl: "data:image/png;base64,iVBORw0KGgo="
       };
     }
-    if (document.fileType === "DOCX") {
+    if (capability.preview === "extractedOfficeText") {
       return {
         kind: "docx",
         text: `${document.title} 的提取文本`,
         notice: "DOCX 预览仅显示提取文本，不是完整版式预览。"
       };
     }
-    if (document.fileType === "TXT" || document.fileType === "Markdown") {
+    if (capability.preview === "safeMarkdown") {
+      return {
+        kind: "markdown",
+        text: `${document.title} 的只读预览文本`
+      };
+    }
+    if (capability.preview === "plainText") {
       return {
         kind: "text",
         text: `${document.title} 的只读预览文本`
@@ -798,14 +793,15 @@ export class FakeBackendClient implements BackendClient {
     }
 
     const document = this.requireDocument(documentId);
-    if (document.fileType === "PDF") {
+    const capability = documentFormatForType(document.fileType);
+    if (capability?.thumbnail === "pdfFirstPage") {
       return {
         kind: "pdf",
         dataUrl:
           "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
       };
     }
-    if (document.fileType === "JPG" || document.fileType === "PNG") {
+    if (capability?.thumbnail === "localImage") {
       return {
         kind: "image",
         dataUrl:
@@ -825,6 +821,27 @@ export class FakeBackendClient implements BackendClient {
       return;
     }
     this.requireDocument(documentId);
+  }
+
+  async openExternalUrl(url: string): Promise<void> {
+    this.calls.push(`openExternalUrl:${url}`);
+    if (this.openExternalUrlImpl) {
+      await this.openExternalUrlImpl(url);
+      return;
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      throw new BackendError({
+        code: "unsafeUrl",
+        message: "只允许打开 HTTP 或 HTTPS 链接。"
+      });
+    }
+  }
+
+  async listDocumentFormatCapabilities(): Promise<
+    DocumentFormatCapability[]
+  > {
+    this.calls.push("listDocumentFormatCapabilities");
+    return structuredClone(documentFormatCapabilities);
   }
 
   async listRecentLibraries(): Promise<RecentLibrary[]> {

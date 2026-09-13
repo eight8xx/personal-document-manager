@@ -84,6 +84,7 @@ export type DocumentPreview =
       kind: "pdf";
       dataUrl: string;
       pageCount: number | null;
+      page: number;
     }
   | {
       kind: "image";
@@ -94,9 +95,18 @@ export type DocumentPreview =
       text: string;
     }
   | {
+      kind: "markdown";
+      text: string;
+    }
+  | {
       kind: "docx";
       text: string;
       notice: string;
+    }
+  | {
+      kind: "failure";
+      code: string;
+      message: string;
     }
   | {
       kind: "unsupported";
@@ -112,6 +122,63 @@ export type DocumentThumbnail =
       kind: "fallback";
       reason: string;
     };
+
+export type DocumentFormatId =
+  | "pdf"
+  | "docx"
+  | "txt"
+  | "markdown"
+  | "jpg"
+  | "png"
+  | "pptx";
+
+export type FormatSecurityPolicy = "blocked" | "userInitiated";
+
+export interface DocumentFormatSecurity {
+  macros: FormatSecurityPolicy;
+  scripts: FormatSecurityPolicy;
+  embeddedObjects: FormatSecurityPolicy;
+  remoteResources: FormatSecurityPolicy;
+  mediaAutoplay: FormatSecurityPolicy;
+  sourceMutation: FormatSecurityPolicy;
+  externalNavigation: FormatSecurityPolicy;
+}
+
+export interface DocumentFormatCapability {
+  id: DocumentFormatId;
+  displayType: string;
+  extensions: string[];
+  importEnabled: boolean;
+  validation:
+    | "pdfSignature"
+    | "docxPackage"
+    | "plainText"
+    | "jpegSignature"
+    | "pngSignature"
+    | "officeOpenXmlReserved";
+  preview:
+    | "pdfPages"
+    | "extractedOfficeText"
+    | "plainText"
+    | "safeMarkdown"
+    | "localImage"
+    | "pptxPagesReserved";
+  thumbnail:
+    | "pdfFirstPage"
+    | "localImage"
+    | "typeIcon"
+    | "pptxFirstPageReserved";
+  textExtraction:
+    | "pdfText"
+    | "docxText"
+    | "plainText"
+    | "none"
+    | "pptxTextReserved";
+  searchable: boolean;
+  mediaType: string | null;
+  renderer: string;
+  security: DocumentFormatSecurity;
+}
 
 export interface TagSummary {
   id: string;
@@ -293,9 +360,14 @@ export interface BackendClient {
   ): Promise<() => void>;
   listDocuments(): Promise<DocumentSummary[]>;
   subscribeToFileDrops(handler: FileDropHandler): Promise<() => void>;
-  getDocumentPreview(documentId: string): Promise<DocumentPreview>;
+  getDocumentPreview(
+    documentId: string,
+    page?: number
+  ): Promise<DocumentPreview>;
   getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail>;
   openDocument(documentId: string): Promise<void>;
+  openExternalUrl(url: string): Promise<void>;
+  listDocumentFormatCapabilities(): Promise<DocumentFormatCapability[]>;
   listRecentLibraries(): Promise<RecentLibrary[]>;
   forgetRecentLibrary(path: string): Promise<RecentLibrary[]>;
   openLibraryDirectory(path: string): Promise<void>;

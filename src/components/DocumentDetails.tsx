@@ -12,7 +12,8 @@ import {
   Tags,
   Trash2
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import { toBackendError } from "../backend/error";
 import type {
@@ -37,78 +38,88 @@ interface DocumentDetailsProps {
   onRetryIndex: (document: DocumentSummary) => void;
 }
 
-function pdfPreviewUrl(dataUrl: string, page: number) {
-  return `${dataUrl.split("#", 1)[0]}#page=${page}&zoom=page-width&view=FitH`;
-}
-
-function pdfBlobFromDataUrl(dataUrl: string) {
-  const [header, payload] = dataUrl.split(",", 2);
-  if (!header || !payload || !header.includes(";base64")) {
-    return null;
-  }
+function safeExternalUrl(url: string) {
   try {
-    const binary = window.atob(payload);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index);
-    }
-    return new Blob([bytes], { type: "application/pdf" });
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? parsed.toString()
+      : null;
   } catch {
     return null;
   }
 }
 
-function ControlledPdfFrame({
-  dataUrl,
-  documentId,
-  page,
-  title
+function MarkdownPreview({
+  text,
+  client
 }: {
-  dataUrl: string;
-  documentId: string;
-  page: number;
-  title: string;
+  text: string;
+  client: BackendClient;
 }) {
-  const [source, setSource] = useState(() => pdfPreviewUrl(dataUrl, page));
+  const [linkError, setLinkError] = useState("");
+  const pattern = /(!?)\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
 
-  useEffect(() => {
-    let objectUrl: string | null = null;
-    let nextSource = pdfPreviewUrl(dataUrl, page);
-    if (typeof URL.createObjectURL === "function") {
-      const blob = pdfBlobFromDataUrl(dataUrl);
-      if (blob) {
-        objectUrl = URL.createObjectURL(blob);
-        nextSource = pdfPreviewUrl(objectUrl, page);
-      }
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      parts.push(text.slice(cursor, match.index));
     }
-    setSource(nextSource);
-    return () => {
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
-    };
-  }, [dataUrl, page]);
+    const [, imageMarker, label, rawUrl] = match;
+    const url = safeExternalUrl(rawUrl);
+    if (imageMarker || !url) {
+      parts.push(match[0]);
+    } else {
+      parts.push(
+        <button
+          className="markdown-link"
+          type="button"
+          key={`${match.index}:${url}`}
+          onClick={() => {
+            setLinkError("");
+            void client.openExternalUrl(url).catch((caught) => {
+              setLinkError(toBackendError(caught).message);
+            });
+          }}
+        >
+          {label}
+        </button>
+      );
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
 
   return (
-    <iframe
-      key={`${documentId}:${page}`}
-      className="pdf-preview-frame"
-      title={`${title} PDF 预览`}
-      src={source}
-    />
+    <div className="text-preview markdown-preview">
+      <pre tabIndex={0}>{parts}</pre>
+      {linkError ? (
+        <p className="preview-inline-error" role="alert">
+          <AlertCircle size={14} aria-hidden="true" />
+          {linkError}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
 function PreviewContent({
+  client,
   preview,
   document,
   page,
-  onPageChange
+  onPageChange,
+  onRetry
 }: {
+  client: BackendClient;
   preview: DocumentPreview;
   document: DocumentSummary;
   page: number;
   onPageChange: (page: number) => void;
+  onRetry: () => void;
 }) {
   if (preview.kind === "pdf") {
     const hasNextPage = preview.pageCount === null || page < preview.pageCount;
@@ -142,11 +153,11 @@ function PreviewContent({
             </button>
           </div>
         </div>
-        <ControlledPdfFrame
-          dataUrl={preview.dataUrl}
-          documentId={document.id}
-          page={page}
-          title={document.title}
+        <img
+          className="pdf-preview-page"
+          src={preview.dataUrl}
+          alt={`${document.title} 第 ${page} 页预览`}
+          data-preview-kind="pdf-page"
         />
       </div>
     );
@@ -167,6 +178,23 @@ function PreviewContent({
           <p className="preview-notice">{preview.notice}</p>
         ) : null}
         <pre tabIndex={0}>{preview.text}</pre>
+      </div>
+    );
+  }
+
+  if (preview.kind === "markdown") {
+    return <MarkdownPreview text={preview.text} client={client} />;
+  }
+
+  if (preview.kind === "failure") {
+    return (
+      <div className="preview-error" role="alert">
+        <AlertCircle size={22} aria-hidden="true" />
+        <strong>无法加载预览</strong>
+        <span>{preview.message}</span>
+        <button className="button quiet" type="button" onClick={onRetry}>
+          重试预览
+        </button>
       </div>
     );
   }
@@ -194,6 +222,10 @@ export function DocumentDetails({
   const documentContentHash = document?.contentHash ?? null;
   const documentFileSize = document?.fileSize ?? null;
   const documentLastImportedAt = document?.lastImportedAt ?? null;
+  const previewKey = documentId
+    ? `${documentId}:${documentContentHash}:${documentFileSize}:${documentLastImportedAt}`
+    : "";
+  const previousPreviewKey = useRef(previewKey);
   const [preview, setPreview] = useState<DocumentPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
@@ -204,10 +236,15 @@ export function DocumentDetails({
 
   useEffect(() => {
     let active = true;
-    setPreview(null);
+    const contentChanged = previousPreviewKey.current !== previewKey;
+    previousPreviewKey.current = previewKey;
+    const requestedPage = contentChanged ? 1 : pdfPage;
+    if (contentChanged) {
+      setPreview(null);
+      setPdfPage(1);
+      setOpenError("");
+    }
     setPreviewError("");
-    setOpenError("");
-    setPdfPage(1);
 
     if (!documentId) {
       setPreviewLoading(false);
@@ -218,7 +255,7 @@ export function DocumentDetails({
 
     setPreviewLoading(true);
     void client
-      .getDocumentPreview(documentId)
+      .getDocumentPreview(documentId, requestedPage)
       .then((result) => {
         if (active) {
           setPreview(result);
@@ -241,9 +278,8 @@ export function DocumentDetails({
   }, [
     client,
     documentId,
-    documentContentHash,
-    documentFileSize,
-    documentLastImportedAt,
+    previewKey,
+    pdfPage,
     reloadToken
   ]);
 
@@ -428,10 +464,12 @@ export function DocumentDetails({
               </div>
             ) : preview ? (
               <PreviewContent
+                client={client}
                 preview={preview}
                 document={document}
                 page={pdfPage}
                 onPageChange={(page) => setPdfPage(Math.max(1, page))}
+                onRetry={() => setReloadToken((value) => value + 1)}
               />
             ) : (
               <div className="preview-fallback">

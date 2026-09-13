@@ -59,57 +59,40 @@ const documents = [
   documentFor("docx", "会议记录", "DOCX")
 ];
 
-const originalCreateObjectUrl = URL.createObjectURL;
-const originalRevokeObjectUrl = URL.revokeObjectURL;
-
 afterEach(() => {
   cleanup();
   window.sessionStorage.clear();
-  if (originalCreateObjectUrl) {
-    URL.createObjectURL = originalCreateObjectUrl;
-  } else {
-    delete (URL as Partial<typeof URL>).createObjectURL;
-  }
-  if (originalRevokeObjectUrl) {
-    URL.revokeObjectURL = originalRevokeObjectUrl;
-  } else {
-    delete (URL as Partial<typeof URL>).revokeObjectURL;
-  }
 });
 
 describe("文档预览与外部打开", () => {
   it("shows loading and renders PDF, image, text, Markdown and DOCX previews", async () => {
-    let objectUrlSequence = 0;
-    const createObjectURL = vi.fn(
-      () => `blob:controlled-pdf-${(objectUrlSequence += 1)}`
-    );
-    const revokeObjectURL = vi.fn();
-    URL.createObjectURL = createObjectURL;
-    URL.revokeObjectURL = revokeObjectURL;
-
     let resolvePreview:
       | ((value: Awaited<ReturnType<FakeBackendClient["getDocumentPreview"]>>) => void)
       | undefined;
+    let firstPreviewPending = true;
     const client = new FakeBackendClient({
       bootstrap,
       documents,
       documentPreviews: {
         pdf: {
           kind: "pdf",
-          dataUrl: "data:application/pdf;base64,JVBERi0xLjQ=",
-          pageCount: 3
+          dataUrl: "data:image/png;base64,page-one",
+          pageCount: 3,
+          page: 1
         }
       }
     });
-    client.getDocumentPreview = (documentId) => {
-      if (documentId === "pdf") {
+    client.getDocumentPreview = (documentId, page) => {
+      if (documentId === "pdf" && firstPreviewPending) {
+        firstPreviewPending = false;
         return new Promise((resolve) => {
           resolvePreview = resolve;
         });
       }
       return FakeBackendClient.prototype.getDocumentPreview.call(
         client,
-        documentId
+        documentId,
+        page
       );
     };
 
@@ -125,42 +108,35 @@ describe("文档预览与外部打开", () => {
     await act(async () => {
       resolvePreview?.({
         kind: "pdf",
-        dataUrl: "data:application/pdf;base64,JVBERi0xLjQ=",
-        pageCount: 3
+        dataUrl: "data:image/png;base64,page-one",
+        pageCount: 3,
+        page: 1
       });
     });
 
-    const pdfFrame = await screen.findByTitle("年度报告 PDF 预览");
-    await waitFor(() => {
-      expect(pdfFrame).toHaveAttribute(
-        "src",
-        expect.stringContaining("blob:controlled-pdf-1#page=1")
-      );
+    const pdfPage = await screen.findByRole("img", {
+      name: "年度报告 第 1 页预览"
     });
-    expect(pdfFrame).toHaveAttribute(
+    expect(pdfPage).toHaveAttribute(
       "src",
-      expect.stringContaining("#page=1")
+      "data:image/png;base64,page-one"
     );
     await user.click(screen.getByRole("button", { name: "PDF 下一页" }));
-    expect(screen.getByTitle("年度报告 PDF 预览")).toHaveAttribute(
-      "src",
-      expect.stringContaining("blob:controlled-pdf-2#page=2")
-    );
+    expect(
+      await screen.findByRole("img", {
+        name: "年度报告 第 2 页预览"
+      })
+    ).toBeInTheDocument();
     expect(screen.getByText("第 2 页 / 3")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(revokeObjectURL).toHaveBeenCalledWith("blob:controlled-pdf-1");
-    });
-    expect(screen.getAllByTitle("年度报告 PDF 预览")).toHaveLength(1);
 
     await user.click(
       screen.getByRole("button", { name: "选择文档 扫描图" })
     );
     const image = await screen.findByRole("img", { name: "扫描图 预览" });
     expect(image).toHaveAttribute("src", expect.stringContaining("image/png"));
-    await waitFor(() => {
-      expect(revokeObjectURL).toHaveBeenCalledWith("blob:controlled-pdf-2");
-    });
-    expect(screen.queryByTitle("年度报告 PDF 预览")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("img", { name: "年度报告 第 2 页预览" })
+    ).not.toBeInTheDocument();
 
     await user.click(
       screen.getByRole("button", { name: "选择文档 纯文本" })
@@ -215,7 +191,9 @@ describe("文档预览与外部打开", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 年度报告" })
     );
-    expect(await screen.findByTitle("年度报告 PDF 预览")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("img", { name: "年度报告 第 1 页预览" })
+    ).toBeInTheDocument();
     await user.click(
       screen.getByRole("button", {
         name: "用系统默认程序打开 年度报告"
@@ -310,15 +288,71 @@ describe("文档预览与外部打开", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("refreshes thumbnail and preview when the same document id gets a new content hash", async () => {
-    let objectUrlSequence = 0;
-    const createObjectURL = vi.fn(
-      () => `blob:reindexed-preview-${(objectUrlSequence += 1)}`
-    );
-    const revokeObjectURL = vi.fn();
-    URL.createObjectURL = createObjectURL;
-    URL.revokeObjectURL = revokeObjectURL;
+  it("renders Markdown as text, leaves raw HTML inert, and opens links only after a click", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: [documents[3]],
+      getDocumentPreview: async () => ({
+        kind: "markdown",
+        text: "<script>window.fail = true</script>\n[打开资料](https://example.com/report)\n[javascript](javascript:alert(1))"
+      })
+    });
+    render(<App client={client} />);
+    await screen.findByText("项目说明");
 
+    await user.click(
+      screen.getByRole("button", { name: "选择文档 项目说明" })
+    );
+    expect(
+      await screen.findByText(/<script>window\.fail = true<\/script>/)
+    ).toBeInTheDocument();
+
+    const safeLink = screen.getByRole("button", { name: "打开资料" });
+    expect(client.calls).not.toContain(
+      "openExternalUrl:https://example.com/report"
+    );
+    await user.click(safeLink);
+    expect(client.calls).toContain(
+      "openExternalUrl:https://example.com/report"
+    );
+    expect(
+      screen.queryByRole("button", { name: "javascript" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/\[javascript\]\(javascript:alert\(1\)\)/)
+    ).toBeInTheDocument();
+  });
+
+  it("keeps metadata and external open available when preview returns a structured failure", async () => {
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: [documents[0]],
+      getDocumentPreview: async () => ({
+        kind: "failure",
+        code: "unsafePreview",
+        message: "PDF 包含被禁止的脚本。"
+      })
+    });
+    const user = userEvent.setup();
+    render(<App client={client} />);
+    await screen.findByText("年度报告");
+
+    await user.click(
+      screen.getByRole("button", { name: "选择文档 年度报告" })
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "PDF 包含被禁止的脚本。"
+    );
+    expect(screen.getByRole("heading", { name: /年度报告/ })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "用系统默认程序打开 年度报告"
+      })
+    ).toBeEnabled();
+  });
+
+  it("refreshes thumbnail and preview when the same document id gets a new content hash", async () => {
     const original = documents[0];
     const refreshed = {
       ...original,
@@ -344,9 +378,10 @@ describe("文档预览与外部打开", () => {
           kind: "pdf",
           dataUrl:
             previewAttempts === 1
-              ? "data:application/pdf;base64,JVBERi0xLjQ="
-              : "data:application/pdf;base64,JVBERi0xLgo=",
-          pageCount: 1
+              ? "data:image/png;base64,first-page"
+              : "data:image/png;base64,refreshed-page",
+          pageCount: 1,
+          page: 1
         };
       }
     });
@@ -365,13 +400,13 @@ describe("文档预览与外部打开", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 年度报告" })
     );
-    const pdfFrame = await screen.findByTitle("年度报告 PDF 预览");
-    await waitFor(() => {
-      expect(pdfFrame).toHaveAttribute(
-        "src",
-        expect.stringContaining("blob:reindexed-preview-1#page=1")
-      );
+    const pdfPage = await screen.findByRole("img", {
+      name: "年度报告 第 1 页预览"
     });
+    expect(pdfPage).toHaveAttribute(
+      "src",
+      "data:image/png;base64,first-page"
+    );
     await waitFor(() =>
       expect(client.calls).toContain("subscribeToDocumentIndexChanges")
     );
@@ -399,12 +434,13 @@ describe("文档预览与外部打开", () => {
       ).toHaveLength(2);
     });
     await waitFor(() => {
-      expect(screen.getByTitle("年度报告 PDF 预览")).toHaveAttribute(
+      expect(
+        screen.getByRole("img", { name: "年度报告 第 1 页预览" })
+      ).toHaveAttribute(
         "src",
-        expect.stringContaining("blob:reindexed-preview-2#page=1")
+        "data:image/png;base64,refreshed-page"
       );
     });
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:reindexed-preview-1");
   });
 
   it("shows the external program startup error and keeps the selected document unchanged", async () => {

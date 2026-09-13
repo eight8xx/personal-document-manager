@@ -1,0 +1,156 @@
+[
+  {
+    "id": "pdf",
+    "displayType": "PDF",
+    "extensions": ["pdf"],
+    "importEnabled": true,
+    "validation": "pdfSignature",
+    "preview": "pdfPages",
+    "thumbnail": "pdfFirstPage",
+    "textExtraction": "pdfText",
+    "searchable": true,
+    "mediaType": "application/pdf",
+    "renderer": "platformPdf",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "docx",
+    "displayType": "DOCX",
+    "extensions": ["docx"],
+    "importEnabled": true,
+    "validation": "docxPackage",
+    "preview": "extractedOfficeText",
+    "thumbnail": "typeIcon",
+    "textExtraction": "docxText",
+    "searchable": true,
+    "mediaType": null,
+    "renderer": "docxPreviewReserved",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "txt",
+    "displayType": "TXT",
+    "extensions": ["txt"],
+    "importEnabled": true,
+    "validation": "plainText",
+    "preview": "plainText",
+    "thumbnail": "typeIcon",
+    "textExtraction": "plainText",
+    "searchable": true,
+    "mediaType": "text/plain",
+    "renderer": "reactText",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "markdown",
+    "displayType": "Markdown",
+    "extensions": ["md", "markdown"],
+    "importEnabled": true,
+    "validation": "plainText",
+    "preview": "safeMarkdown",
+    "thumbnail": "typeIcon",
+    "textExtraction": "plainText",
+    "searchable": true,
+    "mediaType": "text/markdown",
+    "renderer": "reactMarkdownSubset",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "jpg",
+    "displayType": "JPG",
+    "extensions": ["jpg", "jpeg"],
+    "importEnabled": true,
+    "validation": "jpegSignature",
+    "preview": "localImage",
+    "thumbnail": "localImage",
+    "textExtraction": "none",
+    "searchable": false,
+    "mediaType": "image/jpeg",
+    "renderer": "localImageDecoder",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "png",
+    "displayType": "PNG",
+    "extensions": ["png"],
+    "importEnabled": true,
+    "validation": "pngSignature",
+    "preview": "localImage",
+    "thumbnail": "localImage",
+    "textExtraction": "none",
+    "searchable": false,
+    "mediaType": "image/png",
+    "renderer": "localImageDecoder",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "pptx",
+    "displayType": "PPTX",
+    "extensions": ["pptx"],
+    "importEnabled": false,
+    "validation": "officeOpenXmlReserved",
+    "preview": "pptxPagesReserved",
+    "thumbnail": "pptxFirstPageReserved",
+    "textExtraction": "pptxTextReserved",
+    "searchable": true,
+    "mediaType": null,
+    "renderer": "fileViewerPptxReserved",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  }
+]

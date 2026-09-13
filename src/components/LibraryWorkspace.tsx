@@ -22,6 +22,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 
 import { BackendError, toBackendError } from "../backend/error";
+import { importableDocumentTypes } from "../backend/documentFormats";
 import type {
   BackendClient,
   BatchDocumentOperation,
@@ -1195,8 +1196,9 @@ export function LibraryWorkspace({
         (document) => document.id === selectedDocumentId
       ) ?? null
     : null;
-  const fileTypes = [...new Set(documents.map((document) => document.fileType))]
-    .sort((left, right) => left.localeCompare(right, "zh-CN"));
+  const fileTypes = [...importableDocumentTypes].sort((left, right) =>
+    left.localeCompare(right, "zh-CN")
+  );
   let emptyStateKind: DocumentEmptyStateKind | null = null;
   if (documents.length === 0) {
     emptyStateKind = "library";

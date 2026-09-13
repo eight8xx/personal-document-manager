@@ -20,6 +20,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::error::{LibraryError, LibraryResult};
+use super::formats::{
+    canonical_file_type, capability_for_file_type, capability_for_path,
+    require_capability_for_file_type, unsupported_message, PreviewStrategy, TextExtractionStrategy,
+    ThumbnailStrategy, ValidationStrategy,
+};
 use super::models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,
@@ -454,14 +459,12 @@ impl LibraryService {
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
             .ok_or_else(|| LibraryError::ImportFile("源文件缺少文件名。".to_string()))?;
-        let file_type = supported_file_type(&source_path).ok_or_else(|| {
-            LibraryError::UnsupportedFile(
-                "不支持该文件格式。仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG 文件。".to_string(),
-            )
-        })?;
+        let capability = capability_for_path(&source_path)
+            .ok_or_else(|| LibraryError::UnsupportedFile(unsupported_message()))?;
+        let file_type = capability.display_type.as_str();
         let file_size = i64::try_from(source_metadata.len())
             .map_err(|_| LibraryError::ImportFile("文件大小超出支持范围。".to_string()))?;
-        if let Err(message) = validate_file_content(&source_path, file_type) {
+        if let Err(message) = validate_file_content(&source_path, capability) {
             return Err(LibraryError::ImportFile(message));
         }
         let title = source_path
@@ -868,17 +871,18 @@ impl LibraryService {
                 ));
             }
         };
-        let Some(file_type) = supported_file_type(&source_path) else {
+        let Some(capability) = capability_for_path(&source_path) else {
             return Ok(self.failure_item(
                 item_id,
                 source_path_text,
                 Some(file_name),
                 None,
                 "scan",
-                "不支持该文件格式。仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG 文件。".to_string(),
+                unsupported_message(),
                 true,
             ));
         };
+        let file_type = capability.display_type.clone();
         let file_size = match i64::try_from(source_metadata.len()) {
             Ok(size) => size,
             Err(_) => {
@@ -886,19 +890,19 @@ impl LibraryService {
                     item_id,
                     source_path_text,
                     Some(file_name),
-                    Some(file_type.to_string()),
+                    Some(file_type.clone()),
                     "scan",
                     "文件大小超出支持范围。".to_string(),
                     true,
                 ));
             }
         };
-        if let Err(message) = validate_file_content(&source_path, file_type) {
+        if let Err(message) = validate_file_content(&source_path, capability) {
             return Ok(self.failure_item(
                 item_id,
                 source_path_text,
                 Some(file_name),
-                Some(file_type.to_string()),
+                Some(file_type.clone()),
                 "validate",
                 message,
                 true,
@@ -911,7 +915,7 @@ impl LibraryService {
                     item_id,
                     source_path_text,
                     Some(file_name),
-                    Some(file_type.to_string()),
+                    Some(file_type.clone()),
                     "hash",
                     format!("无法计算文件哈希：{error}"),
                     true,
@@ -924,7 +928,7 @@ impl LibraryService {
             source_path: source_path_text,
             source_identifier,
             file_name,
-            file_type: file_type.to_string(),
+            file_type: file_type.clone(),
             file_size,
         };
 
@@ -2827,34 +2831,17 @@ impl LibraryService {
         load_document_summary(&library.connection, document_id)
     }
 
-    pub fn get_document_preview(&self, document_id: &str) -> LibraryResult<DocumentPreview> {
+    pub fn get_document_preview(
+        &self,
+        document_id: &str,
+        page: Option<u32>,
+    ) -> LibraryResult<DocumentPreview> {
         let stored = self.load_stored_document_file(document_id)?;
-        let path = self.document_copy_path(&stored)?;
-        ensure_document_copy_exists(&path)?;
-
-        match stored.file_type.as_str() {
-            "PDF" => {
-                let bytes = fs::read(&path)?;
-                Ok(DocumentPreview::Pdf {
-                    data_url: data_url("application/pdf", &bytes),
-                    page_count: estimate_pdf_page_count(&bytes),
-                })
-            }
-            "JPG" | "PNG" => {
-                let bytes = fs::read(&path)?;
-                Ok(DocumentPreview::Image {
-                    data_url: data_url(image_media_type(&stored.file_type), &bytes),
-                })
-            }
-            "TXT" | "Markdown" => Ok(DocumentPreview::Text {
-                text: read_utf8_text(&path)?,
-            }),
-            "DOCX" => Ok(DocumentPreview::Docx {
-                text: extract_docx_text(&path)?,
-                notice: "DOCX 预览仅显示提取文本，不是完整版式预览。".to_string(),
-            }),
-            _ => Ok(DocumentPreview::Unsupported {
-                message: format!("暂不支持预览 {} 格式。", stored.file_type),
+        match self.preview_document(&stored, page) {
+            Ok(preview) => Ok(preview),
+            Err(error) => Ok(DocumentPreview::Failure {
+                code: error.code().to_string(),
+                message: error.to_string(),
             }),
         }
     }
@@ -2862,20 +2849,22 @@ impl LibraryService {
     pub fn get_document_thumbnail(&self, document_id: &str) -> LibraryResult<DocumentThumbnail> {
         let stored = self.load_stored_document_file(document_id)?;
         let path = self.document_copy_path(&stored)?;
+        let capability = require_capability_for_file_type(&stored.file_type)?;
 
-        let result = match stored.file_type.as_str() {
-            "PDF" => self
-                .thumbnail_png(&stored, &path)
-                .map(|bytes| DocumentThumbnail::Pdf {
-                    data_url: data_url("image/png", &bytes),
-                }),
-            "JPG" | "PNG" => {
+        let result = match capability.thumbnail {
+            ThumbnailStrategy::PdfFirstPage => {
+                self.thumbnail_png(&stored, &path)
+                    .map(|bytes| DocumentThumbnail::Pdf {
+                        data_url: data_url("image/png", &bytes),
+                    })
+            }
+            ThumbnailStrategy::LocalImage => {
                 self.thumbnail_png(&stored, &path)
                     .map(|bytes| DocumentThumbnail::Image {
                         data_url: data_url("image/png", &bytes),
                     })
             }
-            _ => {
+            ThumbnailStrategy::TypeIcon | ThumbnailStrategy::PptxFirstPageReserved => {
                 return Ok(DocumentThumbnail::Fallback {
                     reason: format!("{} 使用类型图标。", stored.file_type),
                 });
@@ -2885,6 +2874,113 @@ impl LibraryService {
         Ok(result.unwrap_or_else(|error| DocumentThumbnail::Fallback {
             reason: format!("无法生成缩略图：{error}"),
         }))
+    }
+
+    fn preview_document(
+        &self,
+        stored: &StoredDocumentFile,
+        page: Option<u32>,
+    ) -> LibraryResult<DocumentPreview> {
+        let path = self.document_copy_path(stored)?;
+        ensure_document_copy_exists(&path)?;
+        let capability = require_capability_for_file_type(&stored.file_type)?;
+
+        match capability.preview {
+            PreviewStrategy::PdfPages => {
+                let page_number = page.unwrap_or(1).max(1);
+                let rendered = self.render_cached_pdf_page(stored, &path, page_number - 1)?;
+                Ok(DocumentPreview::Pdf {
+                    data_url: data_url("image/png", &rendered.png),
+                    page_count: Some(rendered.page_count),
+                    page: page_number,
+                })
+            }
+            PreviewStrategy::LocalImage => {
+                let bytes = fs::read(&path)?;
+                Ok(DocumentPreview::Image {
+                    data_url: data_url(
+                        capability
+                            .media_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream"),
+                        &bytes,
+                    ),
+                })
+            }
+            PreviewStrategy::PlainText => Ok(DocumentPreview::Text {
+                text: read_utf8_text(&path)?,
+            }),
+            PreviewStrategy::SafeMarkdown => Ok(DocumentPreview::Markdown {
+                text: read_utf8_text(&path)?,
+            }),
+            PreviewStrategy::ExtractedOfficeText => Ok(DocumentPreview::Docx {
+                text: extract_docx_text(&path)?,
+                notice: "DOCX 预览仅显示提取文本，不是完整版式预览。".to_string(),
+            }),
+            PreviewStrategy::PptxPagesReserved => Ok(DocumentPreview::Unsupported {
+                message: "PPTX 版式预览将在后续功能中启用。".to_string(),
+            }),
+        }
+    }
+
+    fn render_cached_pdf_page(
+        &self,
+        stored: &StoredDocumentFile,
+        path: &Path,
+        page_index: u32,
+    ) -> LibraryResult<thumbnail::RenderedPdfPage> {
+        let version = match stored.content_hash.as_deref() {
+            Some(hash) if !hash.is_empty() => hash.to_string(),
+            _ => sha256_file(path)?,
+        };
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let cache_directory =
+            rendered_page_cache_directory(&library.summary.id, &stored.id, &version);
+        let cache_path = cache_directory.join(format!("page-{}.png", page_index + 1));
+
+        if let Ok(bytes) = fs::read(&cache_path) {
+            if is_png(&bytes) {
+                let page_count = match fs::read(path)
+                    .ok()
+                    .as_deref()
+                    .and_then(estimate_pdf_page_count)
+                {
+                    Some(page_count) => page_count,
+                    None => thumbnail::render_pdf_page_png(path, page_index)?.page_count,
+                };
+                return Ok(thumbnail::RenderedPdfPage {
+                    png: bytes,
+                    page_count,
+                });
+            }
+            let _ = fs::remove_file(&cache_path);
+        }
+
+        let rendered = thumbnail::render_pdf_page_png(path, page_index)?;
+        if !is_png(&rendered.png) {
+            return Err(LibraryError::Preview(
+                "PDF 渲染器没有返回有效 PNG。".to_string(),
+            ));
+        }
+
+        fs::create_dir_all(&cache_directory)?;
+        let temporary_path =
+            cache_directory.join(format!(".page-{}.{}.tmp", page_index + 1, Uuid::new_v4()));
+        fs::write(&temporary_path, &rendered.png)?;
+        if let Err(error) = fs::rename(&temporary_path, &cache_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error.into());
+        }
+        remove_other_render_versions(
+            cache_directory
+                .parent()
+                .expect("rendered page cache directory must have a document parent"),
+            &cache_directory,
+        );
+        Ok(rendered)
     }
 
     fn thumbnail_png(&self, stored: &StoredDocumentFile, path: &Path) -> LibraryResult<Vec<u8>> {
@@ -2907,7 +3003,8 @@ impl LibraryService {
             let _ = fs::remove_file(&cache_path);
         }
 
-        let generated = thumbnail::generate_png_thumbnail(path, &stored.file_type)?;
+        let capability = require_capability_for_file_type(&stored.file_type)?;
+        let generated = thumbnail::generate_png_thumbnail(path, capability)?;
         if !is_png(&generated) {
             return Err(LibraryError::Preview(
                 "缩略图生成器没有返回有效 PNG。".to_string(),
@@ -2931,6 +3028,16 @@ impl LibraryService {
         ensure_document_copy_exists(&path)?;
 
         open::that(&path).map_err(|error| LibraryError::OpenDocument(error.to_string()))
+    }
+
+    pub fn open_external_url(&self, url: &str) -> LibraryResult<()> {
+        let url = url.trim();
+        if !is_safe_external_url(url) {
+            return Err(LibraryError::InvalidExternalUrl(
+                "只允许打开由用户明确点击的 HTTP 或 HTTPS 链接。".to_string(),
+            ));
+        }
+        open::that(url).map_err(|error| LibraryError::OpenDocument(error.to_string()))
     }
 
     pub fn list_recent_libraries(&self) -> Vec<RecentLibrary> {
@@ -3217,7 +3324,19 @@ fn refresh_document_copy(
         content_hash: None,
         file_modified_at,
     })?;
-    if let Err(message) = validate_file_content(path, expected_file_type) {
+    let capability = match capability_for_file_type(expected_file_type) {
+        Some(capability) => capability,
+        None => {
+            return Err(DocumentRefreshFailure {
+                stage: "externalUnsupported",
+                message: format!("不支持的文档格式：{expected_file_type}"),
+                file_size: Some(file_size),
+                content_hash: Some(content_hash),
+                file_modified_at,
+            });
+        }
+    };
+    if let Err(message) = validate_file_content(path, capability) {
         return Err(DocumentRefreshFailure {
             stage: "externalValidation",
             message,
@@ -4208,21 +4327,15 @@ fn normalize_source_file(path: &Path) -> LibraryResult<PathBuf> {
 }
 
 fn supported_file_type(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
-    match extension.as_str() {
-        "pdf" => Some("PDF"),
-        "docx" => Some("DOCX"),
-        "txt" => Some("TXT"),
-        "md" | "markdown" => Some("Markdown"),
-        "jpg" | "jpeg" => Some("JPG"),
-        "png" => Some("PNG"),
-        _ => None,
-    }
+    capability_for_path(path).map(|capability| capability.display_type.as_str())
 }
 
-fn validate_file_content(path: &Path, file_type: &str) -> Result<(), String> {
-    match file_type {
-        "PDF" => {
+fn validate_file_content(
+    path: &Path,
+    capability: &super::formats::DocumentFormatCapability,
+) -> Result<(), String> {
+    match capability.validation {
+        ValidationStrategy::PdfSignature => {
             let prefix = read_prefix(path, 1024)?;
             if prefix.windows(5).any(|window| window == b"%PDF-") {
                 Ok(())
@@ -4230,14 +4343,19 @@ fn validate_file_content(path: &Path, file_type: &str) -> Result<(), String> {
                 Err("文件内容不是有效的 PDF。".to_string())
             }
         }
-        "JPG" => expect_prefix(path, &[0xFF, 0xD8, 0xFF], "文件内容不是有效的 JPG。"),
-        "PNG" => expect_prefix(
+        ValidationStrategy::JpegSignature => {
+            expect_prefix(path, &[0xFF, 0xD8, 0xFF], "文件内容不是有效的 JPG。")
+        }
+        ValidationStrategy::PngSignature => expect_prefix(
             path,
             &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
             "文件内容不是有效的 PNG。",
         ),
-        "DOCX" => expect_prefix(path, b"PK", "文件内容不是有效的 DOCX。"),
-        _ => Ok(()),
+        ValidationStrategy::DocxPackage => expect_prefix(path, b"PK", "文件内容不是有效的 DOCX。"),
+        ValidationStrategy::PlainText => Ok(()),
+        ValidationStrategy::OfficeOpenXmlReserved => {
+            Err(format!("{} 尚未启用导入。", capability.display_type))
+        }
     }
 }
 
@@ -4292,14 +4410,6 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn image_media_type(file_type: &str) -> &'static str {
-    match file_type {
-        "JPG" => "image/jpeg",
-        "PNG" => "image/png",
-        _ => "application/octet-stream",
-    }
-}
-
 fn is_png(bytes: &[u8]) -> bool {
     bytes.len() >= 24
         && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
@@ -4350,6 +4460,40 @@ fn remove_thumbnail_versions(library_root: &Path, document_id: &str) {
     }
 }
 
+fn rendered_page_cache_directory(library_id: &str, document_id: &str, version: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("personal-document-manager")
+        .join("rendered-pages")
+        .join(safe_cache_component(library_id))
+        .join(safe_cache_component(document_id))
+        .join(safe_cache_component(version))
+}
+
+fn safe_cache_component(value: &str) -> String {
+    let safe = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(80)
+        .collect::<String>();
+    if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
+fn remove_other_render_versions(document_cache_directory: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(document_cache_directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path != keep && path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 fn data_url(media_type: &str, bytes: &[u8]) -> String {
     format!("data:{media_type};base64,{}", BASE64.encode(bytes))
 }
@@ -4368,6 +4512,14 @@ fn ensure_document_copy_exists(path: &Path) -> LibraryResult<()> {
             path.display()
         )))
     }
+}
+
+fn is_safe_external_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > 4096 || url.chars().any(char::is_control) {
+        return false;
+    }
+    let lowercase = url.to_ascii_lowercase();
+    lowercase.starts_with("https://") || lowercase.starts_with("http://")
 }
 
 fn estimate_pdf_page_count(bytes: &[u8]) -> Option<u32> {
@@ -4586,8 +4738,11 @@ fn normalize_search_filters(
     let filters = DocumentSearchFilters {
         collection_id: normalize_optional_text(filters.collection_id),
         tag_id: normalize_optional_text(filters.tag_id),
-        file_type: normalize_optional_text(filters.file_type)
-            .map(|file_type| file_type.to_ascii_uppercase()),
+        file_type: normalize_optional_text(filters.file_type).and_then(|file_type| {
+            canonical_file_type(&file_type)
+                .map(str::to_string)
+                .or_else(|| Some(file_type.to_ascii_uppercase()))
+        }),
         document_date_from: normalize_optional_text(filters.document_date_from),
         document_date_to: normalize_optional_text(filters.document_date_to),
     };
@@ -4715,14 +4870,15 @@ fn fts_phrase(query: &str) -> String {
 }
 
 fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
-    match file_type {
-        "PDF" => extract_pdf_text(path),
-        "DOCX" => extract_docx_text(path),
-        "TXT" | "Markdown" => read_utf8_text(path),
-        "JPG" | "PNG" => Ok(String::new()),
-        _ => Err(LibraryError::UnsupportedFile(format!(
-            "不支持的索引格式：{file_type}"
-        ))),
+    let capability = require_capability_for_file_type(file_type)?;
+    match capability.text_extraction {
+        TextExtractionStrategy::PdfText => extract_pdf_text(path),
+        TextExtractionStrategy::DocxText => extract_docx_text(path),
+        TextExtractionStrategy::PlainText => read_utf8_text(path),
+        TextExtractionStrategy::None => Ok(String::new()),
+        TextExtractionStrategy::PptxTextReserved => Err(LibraryError::UnsupportedFile(
+            "PPTX 正文提取将在后续功能中启用。".to_string(),
+        )),
     }
 }
 

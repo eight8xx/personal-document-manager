@@ -50,6 +50,10 @@ pub enum LibraryError {
     DocumentFileMissing(String),
     #[error("{0}")]
     Preview(String),
+    #[error("{0}")]
+    UnsafePreview(String),
+    #[error("{0}")]
+    InvalidExternalUrl(String),
     #[error("无法打开目录：{0}")]
     OpenDirectory(String),
     #[error("无法打开文档：{0}")]
@@ -83,6 +87,8 @@ impl LibraryError {
             Self::DocumentNotFound(_) => "documentNotFound",
             Self::DocumentFileMissing(_) => "documentFileMissing",
             Self::Preview(_) => "preview",
+            Self::UnsafePreview(_) => "unsafePreview",
+            Self::InvalidExternalUrl(_) => "invalidExternalUrl",
             Self::OpenDirectory(_) => "openDirectory",
             Self::OpenDocument(_) => "openDocument",
             Self::StateLock => "stateLock",
