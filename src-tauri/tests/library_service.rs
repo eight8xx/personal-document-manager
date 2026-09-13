@@ -1,10 +1,14 @@
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use personal_document_manager_lib::library::{
-    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
-    DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail, ImportDecision,
-    ImportItemStatus, IndexStatus, LibraryService, LocationStatus, SearchMatchKind,
+    DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus,
+    DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail,
+    ExternalChangeMonitor, ImportDecision, ImportItemStatus, IndexStatus, LibraryService,
+    LocationStatus, SearchMatchKind,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -1197,6 +1201,274 @@ fn updates_metadata_search_results_and_marks_failed_index_retryable() {
 }
 
 #[test]
+fn monitor_coalesces_consecutive_saves_and_refreshes_content() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("mutable.txt");
+    let source_bytes = "source stays unchanged".as_bytes();
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    let original_hash = imported.content_hash.clone().unwrap();
+
+    let service = Arc::new(Mutex::new(service));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+    let monitor = ExternalChangeMonitor::start(
+        Arc::clone(&service),
+        Duration::from_millis(20),
+        Duration::from_millis(120),
+        move |event| callback_events.lock().unwrap().push(event),
+    )
+    .unwrap();
+
+    fs::write(&copy, "first external save").unwrap();
+    thread::sleep(Duration::from_millis(35));
+    fs::write(&copy, "second external save is searchable").unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let service = service.lock().unwrap();
+            let document = service
+                .list_documents()
+                .unwrap()
+                .into_iter()
+                .find(|document| document.id == imported.id)
+                .unwrap();
+            document.index_status == IndexStatus::Searchable
+                && document.content_hash.as_deref() != Some(original_hash.as_str())
+                && !search(
+                    &service,
+                    "second external save is searchable",
+                    DocumentSearchFilters::default(),
+                )
+                .is_empty()
+        }),
+        "monitor did not finish reindexing the externally modified document"
+    );
+
+    drop(monitor);
+
+    let service = service.lock().unwrap();
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+    assert!(search(
+        &service,
+        "source stays unchanged",
+        DocumentSearchFilters::default()
+    )
+    .is_empty());
+    let completed = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.phase == DocumentIndexPhase::Completed)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result.as_ref().unwrap().processed, 1);
+}
+
+#[test]
+fn startup_scan_finds_changes_made_while_the_application_was_closed() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("startup.txt");
+    let source_bytes = "旧正文只应在第一次索引中出现".as_bytes();
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    let old_hash = imported.content_hash.unwrap();
+    drop(service);
+
+    let replacement = "关闭期间写入的新正文";
+    fs::write(&copy, replacement).unwrap();
+
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    let processing = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(
+        processing.processing_status,
+        DocumentProcessingStatus::Processing
+    );
+    assert_eq!(processing.index_status, IndexStatus::Pending);
+    assert!(search(&restarted, "旧正文", DocumentSearchFilters::default()).is_empty());
+
+    let result = restarted.index_pending_documents().unwrap();
+    assert_eq!(result.processed, 1);
+    assert_eq!(result.searchable, 1);
+    let refreshed = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(refreshed.file_size, replacement.len() as i64);
+    assert_ne!(refreshed.content_hash.as_deref(), Some(old_hash.as_str()));
+    assert_eq!(
+        search(&restarted, replacement, DocumentSearchFilters::default()).len(),
+        1
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+}
+
+#[test]
+fn deleted_library_copy_stays_visible_fails_explicitly_and_can_be_retried() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("recover.txt");
+    let source_bytes = "删除前的可搜索正文".as_bytes();
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    drop(service);
+
+    fs::remove_file(&copy).unwrap();
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    let result = restarted.index_pending_documents().unwrap();
+    assert_eq!(result.failed, 1);
+    let failed = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(failed.processing_status, DocumentProcessingStatus::Failed);
+    assert_eq!(failed.index_status, IndexStatus::Failed);
+    assert!(failed
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("不存在"));
+    assert!(search(
+        &restarted,
+        "删除前的可搜索正文",
+        DocumentSearchFilters::default()
+    )
+    .is_empty());
+
+    let recovered_text = "重新放置后的恢复正文";
+    fs::write(&copy, recovered_text).unwrap();
+    let recovered = restarted.retry_document_index(&imported.id).unwrap();
+    assert_eq!(recovered.processing_status, DocumentProcessingStatus::Ready);
+    assert_eq!(recovered.index_status, IndexStatus::Searchable);
+    assert_eq!(
+        search(&restarted, recovered_text, DocumentSearchFilters::default()).len(),
+        1
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+}
+
+#[test]
+fn corrupt_replacement_keeps_the_document_and_marks_processing_failed() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("report.pdf");
+    fs::write(&source_path, b"%PDF-1.4\noriginal").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    drop(service);
+
+    fs::write(&copy, b"this is no longer a PDF").unwrap();
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    let result = restarted.index_pending_documents().unwrap();
+    assert_eq!(result.failed, 1);
+
+    let failed = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(failed.processing_status, DocumentProcessingStatus::Failed);
+    assert_eq!(failed.index_status, IndexStatus::Failed);
+    assert!(failed
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("不是有效"));
+}
+
+#[test]
+fn unsupported_external_replacement_keeps_the_document_and_fails_explicitly() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("replace-me.txt");
+    fs::write(&source_path, "original searchable text").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    drop(service);
+
+    fs::remove_file(&copy).unwrap();
+    fs::write(copy.with_file_name("replacement.exe"), b"not supported").unwrap();
+
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    let result = restarted.index_pending_documents().unwrap();
+    assert_eq!(result.failed, 1);
+
+    let failed = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(failed.processing_status, DocumentProcessingStatus::Failed);
+    assert_eq!(failed.index_status, IndexStatus::Failed);
+    assert!(failed
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("不支持"));
+}
+
+#[test]
 fn soft_deletes_restores_and_keeps_trash_across_restarts() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -1492,6 +1764,19 @@ fn push_u16(bytes: &mut Vec<u8>, value: u16) {
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn is_library(path: &Path) -> bool {

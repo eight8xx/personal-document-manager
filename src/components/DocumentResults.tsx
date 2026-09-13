@@ -51,7 +51,7 @@ export function documentStatusPresentation(
     return { label: "可搜索", tone: "success" };
   }
   if (document.indexStatus === "failed") {
-    return { label: "索引失败，可重试", tone: "danger" };
+    return { label: "处理失败，等待重试", tone: "danger" };
   }
   return { label: "等待索引", tone: "warning" };
 }

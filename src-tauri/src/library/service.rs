@@ -2,6 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -16,12 +22,12 @@ use uuid::Uuid;
 use super::error::{LibraryError, LibraryResult};
 use super::models::{
     BootstrapState, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
-    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
-    DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
-    DocumentThumbnail, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
-    ImportItemStatus, ImportProgress, IndexRunResult, IndexStatus, LibraryLocationInspection,
-    LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
-    SearchMatchKind, TagSummary, TrashDocumentSummary,
+    DocumentIndexChangedEvent, DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview,
+    DocumentProcessingStatus, DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse,
+    DocumentSearchResult, DocumentSummary, DocumentThumbnail, EmptyTrashResult, ImportBatch,
+    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, IndexRunResult,
+    IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
+    RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary, TrashDocumentSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -66,6 +72,134 @@ struct StoredDocumentFile {
     file_name: String,
     file_type: String,
     library_path: String,
+}
+
+struct StoredDocumentIndex {
+    id: String,
+    file_name: String,
+    file_type: String,
+    file_size: i64,
+    content_hash: Option<String>,
+    file_modified_at: Option<i64>,
+    library_path: String,
+    processing_status: DocumentProcessingStatus,
+    index_status: IndexStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    available: bool,
+    is_file: bool,
+    size: i64,
+    modified_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct ExternalChangeScan {
+    changed_document_ids: Vec<String>,
+    pending_count: i64,
+}
+
+pub struct ExternalChangeMonitor {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ExternalChangeMonitor {
+    pub fn start<F>(
+        service: Arc<Mutex<LibraryService>>,
+        poll_interval: Duration,
+        quiet_period: Duration,
+        on_event: F,
+    ) -> io::Result<Self>
+    where
+        F: Fn(DocumentIndexChangedEvent) + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("pdm-external-change-monitor".to_string())
+            .spawn(move || {
+                let mut previous_fingerprints = HashMap::new();
+                let mut quiet_deadline = None;
+
+                while !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(poll_interval);
+
+                    let scan = {
+                        let mut service = match service.lock() {
+                            Ok(service) => service,
+                            Err(_) => break,
+                        };
+                        let scan = match service.scan_external_changes() {
+                            Ok(scan) => scan,
+                            Err(_) => continue,
+                        };
+                        let fingerprints = service.external_file_fingerprints();
+                        (scan, fingerprints)
+                    };
+                    let (scan, fingerprints) = scan;
+
+                    let fingerprints_changed =
+                        !previous_fingerprints.is_empty() && fingerprints != previous_fingerprints;
+                    previous_fingerprints = fingerprints;
+
+                    if !scan.changed_document_ids.is_empty() || fingerprints_changed {
+                        quiet_deadline = Some(Instant::now() + quiet_period);
+                        if !scan.changed_document_ids.is_empty() {
+                            on_event(DocumentIndexChangedEvent {
+                                phase: DocumentIndexPhase::Processing,
+                                document_ids: scan.changed_document_ids,
+                                result: None,
+                            });
+                        }
+                    }
+
+                    if scan.pending_count == 0 {
+                        quiet_deadline = None;
+                        continue;
+                    }
+                    if quiet_deadline.is_none() {
+                        quiet_deadline = Some(Instant::now() + quiet_period);
+                    }
+                    if quiet_deadline.is_some_and(|deadline| Instant::now() < deadline) {
+                        continue;
+                    }
+
+                    let result = {
+                        let mut service = match service.lock() {
+                            Ok(service) => service,
+                            Err(_) => break,
+                        };
+                        service.process_pending_external_changes()
+                    };
+                    let Ok(result) = result else {
+                        quiet_deadline = None;
+                        continue;
+                    };
+                    quiet_deadline = None;
+                    on_event(DocumentIndexChangedEvent {
+                        phase: DocumentIndexPhase::Completed,
+                        document_ids: Vec::new(),
+                        result: Some(result),
+                    });
+                }
+            })?;
+
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ExternalChangeMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +419,7 @@ impl LibraryService {
             connection,
         });
         self.record_recent(&summary)?;
+        self.scan_external_changes()?;
         Ok(summary)
     }
 
@@ -351,6 +486,9 @@ impl LibraryService {
             .join(&file_name)
             .to_string_lossy()
             .replace('\\', "/");
+        let file_modified_at = fs::metadata(&destination_path)
+            .ok()
+            .and_then(|metadata| modified_at(&metadata));
         let hash_result = sha256_file(&destination_path);
         let (content_hash, processing_status, index_status, error_stage, error_message) =
             match hash_result {
@@ -396,10 +534,10 @@ impl LibraryService {
             INSERT INTO documents (
                 id, title, collection_id, file_name, file_type, file_size,
                 content_hash, library_path, processing_status, index_status,
-                error_stage, error_message, imported_at, created_at, updated_at
+                error_stage, error_message, file_modified_at, imported_at, created_at, updated_at
             )
             VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?14
             )
             ",
             params![
@@ -415,6 +553,7 @@ impl LibraryService {
                 document.index_status.as_str(),
                 document.error_stage,
                 document.error_message,
+                file_modified_at,
                 imported_at,
             ],
         )?;
@@ -930,6 +1069,9 @@ impl LibraryService {
             .join(&pending.file_name)
             .to_string_lossy()
             .replace('\\', "/");
+        let file_modified_at = fs::metadata(&destination_path)
+            .ok()
+            .and_then(|metadata| modified_at(&metadata));
         let document = DocumentSummary {
             id: document_id.clone(),
             title: pending
@@ -971,11 +1113,11 @@ impl LibraryService {
                     INSERT INTO documents (
                         id, title, collection_id, file_name, file_type, file_size,
                         content_hash, library_path, processing_status, index_status,
-                        error_stage, error_message, imported_at, created_at, updated_at
+                        error_stage, error_message, file_modified_at, imported_at, created_at, updated_at
                     )
                     VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                        NULL, NULL, ?11, ?11, ?11
+                        NULL, NULL, ?11, ?12, ?12, ?12
                     )
                     ",
                     params![
@@ -989,6 +1131,7 @@ impl LibraryService {
                         &library_path,
                         document.processing_status.as_str(),
                         document.index_status.as_str(),
+                        file_modified_at,
                         &imported_at,
                     ],
                 )
@@ -1261,6 +1404,9 @@ impl LibraryService {
             .join(&pending.file_name)
             .to_string_lossy()
             .replace('\\', "/");
+        let file_modified_at = fs::metadata(&destination_path)
+            .ok()
+            .and_then(|metadata| modified_at(&metadata));
         let database_result = (|| -> Result<(), (&'static str, String)> {
             let library = self
                 .current
@@ -1283,8 +1429,9 @@ impl LibraryService {
                         index_status = 'pending',
                         error_stage = NULL,
                         error_message = NULL,
-                        updated_at = ?6
-                    WHERE id = ?7 AND deleted_at IS NULL
+                        file_modified_at = ?6,
+                        updated_at = ?7
+                    WHERE id = ?8 AND deleted_at IS NULL
                     ",
                     params![
                         &pending.file_name,
@@ -1292,6 +1439,7 @@ impl LibraryService {
                         file_size,
                         &copied_hash,
                         &library_path,
+                        file_modified_at,
                         &last_imported_at,
                         &pending.existing_document_id,
                     ],
@@ -2234,6 +2382,152 @@ impl LibraryService {
         Ok(result)
     }
 
+    fn scan_external_changes(&mut self) -> LibraryResult<ExternalChangeScan> {
+        let Some(library) = self.current.as_ref() else {
+            return Ok(ExternalChangeScan::default());
+        };
+        let library_root = PathBuf::from(&library.summary.path);
+        let documents = load_external_document_indexes(&library.connection)?;
+        let mut changed_document_ids = Vec::new();
+        let mut metadata_updates = Vec::new();
+
+        for document in documents {
+            if document.processing_status == DocumentProcessingStatus::Processing
+                && document.index_status == IndexStatus::Pending
+            {
+                continue;
+            }
+            let path = match document_path(&library_root, &document.library_path) {
+                Ok(path) => path,
+                Err(_) => {
+                    if document.processing_status != DocumentProcessingStatus::Failed
+                        || document.index_status != IndexStatus::Failed
+                    {
+                        changed_document_ids.push(document.id);
+                    }
+                    continue;
+                }
+            };
+            let fingerprint = file_fingerprint(&path);
+            let mut changed = false;
+
+            if !fingerprint.available || !fingerprint.is_file {
+                changed = document.processing_status != DocumentProcessingStatus::Failed
+                    || document.index_status != IndexStatus::Failed;
+            } else if fingerprint.size != document.file_size
+                || fingerprint.modified_at != document.file_modified_at
+                || document.file_modified_at.is_none()
+            {
+                match sha256_file(&path) {
+                    Ok(hash) if Some(hash.as_str()) == document.content_hash.as_deref() => {
+                        if fingerprint.modified_at.is_some() {
+                            metadata_updates.push((document.id.clone(), fingerprint.modified_at));
+                        }
+                    }
+                    Ok(_) | Err(_) => changed = true,
+                }
+            }
+
+            if changed {
+                changed_document_ids.push(document.id);
+            }
+        }
+
+        let library = self
+            .current
+            .as_mut()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let transaction = library.connection.transaction()?;
+        let timestamp = now();
+        for document_id in &changed_document_ids {
+            transaction.execute(
+                "
+                UPDATE documents
+                SET processing_status = 'processing',
+                    index_status = 'pending',
+                    error_stage = NULL,
+                    error_message = NULL,
+                    updated_at = ?1
+                WHERE id = ?2 AND deleted_at IS NULL
+                ",
+                params![&timestamp, document_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM document_search WHERE document_id = ?1",
+                params![document_id],
+            )?;
+        }
+        for (document_id, modified_at) in metadata_updates {
+            if modified_at.is_none() {
+                continue;
+            }
+            transaction.execute(
+                "
+                UPDATE documents
+                SET file_modified_at = ?1, updated_at = ?2
+                WHERE id = ?3 AND deleted_at IS NULL
+                ",
+                params![modified_at, &timestamp, document_id],
+            )?;
+        }
+        transaction.commit()?;
+
+        let pending_count = library.connection.query_row(
+            "
+            SELECT COUNT(*)
+            FROM documents
+            WHERE deleted_at IS NULL
+              AND processing_status = 'processing'
+              AND index_status = 'pending'
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(ExternalChangeScan {
+            changed_document_ids,
+            pending_count,
+        })
+    }
+
+    fn process_pending_external_changes(&mut self) -> LibraryResult<IndexRunResult> {
+        let mut result = IndexRunResult::default();
+        loop {
+            let document_id = {
+                let library = self
+                    .current
+                    .as_ref()
+                    .ok_or(LibraryError::NoCurrentLibrary)?;
+                library
+                    .connection
+                    .query_row(
+                        "
+                        SELECT id
+                        FROM documents
+                        WHERE deleted_at IS NULL
+                          AND processing_status = 'processing'
+                          AND index_status = 'pending'
+                        ORDER BY imported_at, id
+                        LIMIT 1
+                        ",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+            };
+            let Some(document_id) = document_id else {
+                break;
+            };
+            let document = self.index_document(&document_id)?;
+            result.processed += 1;
+            match document.index_status {
+                IndexStatus::Searchable => result.searchable += 1,
+                IndexStatus::Failed => result.failed += 1,
+                IndexStatus::Pending => {}
+            }
+        }
+        Ok(result)
+    }
+
     pub fn index_next_pending_document(&mut self) -> LibraryResult<Option<DocumentSummary>> {
         let document_id = {
             let library = self
@@ -2270,7 +2564,8 @@ impl LibraryService {
             library.connection.execute(
                 "
                 UPDATE documents
-                SET index_status = 'pending',
+                SET processing_status = 'processing',
+                    index_status = 'pending',
                     error_stage = NULL,
                     error_message = NULL,
                     updated_at = ?1
@@ -2278,20 +2573,18 @@ impl LibraryService {
                 ",
                 params![now(), document_id],
             )?;
+            library.connection.execute(
+                "DELETE FROM document_search WHERE document_id = ?1",
+                params![document_id],
+            )?;
         }
         self.index_document(document_id)
     }
 
     fn index_document(&mut self, document_id: &str) -> LibraryResult<DocumentSummary> {
-        let stored = self.load_stored_document_file(document_id)?;
-        let path = self.document_copy_path(&stored)?;
-        let extraction = ensure_document_copy_exists(&path)
-            .and_then(|_| extract_search_text(&path, &stored.file_type));
-
-        let (index_status, extracted_text, error_message) = match extraction {
-            Ok(text) => (IndexStatus::Searchable, text, None),
-            Err(error) => (IndexStatus::Failed, String::new(), Some(error.to_string())),
-        };
+        let stored = self.load_stored_document_index(document_id)?;
+        let path = self.document_index_path(&stored)?;
+        let refresh = refresh_document_copy(&path, &stored.file_type);
 
         let library = self
             .current
@@ -2302,34 +2595,65 @@ impl LibraryService {
             "DELETE FROM document_search WHERE document_id = ?1",
             params![document_id],
         )?;
-        if index_status == IndexStatus::Searchable {
-            transaction.execute(
+        let updated = match refresh {
+            Ok(refreshed) => {
+                transaction.execute(
+                    "
+                    INSERT INTO document_search (
+                        document_id, title, description, extracted_text
+                    )
+                    SELECT id, title, description, ?1
+                    FROM documents
+                    WHERE id = ?2 AND deleted_at IS NULL
+                    ",
+                    params![&refreshed.extracted_text, document_id],
+                )?;
+                transaction.execute(
+                    "
+                    UPDATE documents
+                    SET file_size = ?1,
+                        content_hash = ?2,
+                        file_modified_at = ?3,
+                        processing_status = 'ready',
+                        index_status = 'searchable',
+                        error_stage = NULL,
+                        error_message = NULL,
+                        updated_at = ?4
+                    WHERE id = ?5 AND deleted_at IS NULL
+                    ",
+                    params![
+                        refreshed.file_size,
+                        &refreshed.content_hash,
+                        refreshed.file_modified_at,
+                        now(),
+                        document_id,
+                    ],
+                )?
+            }
+            Err(failure) => transaction.execute(
                 "
-                INSERT INTO document_search (document_id, title, description, extracted_text)
-                SELECT id, title, description, ?1
-                FROM documents
-                WHERE id = ?2 AND deleted_at IS NULL
+                UPDATE documents
+                SET file_size = COALESCE(?1, file_size),
+                    content_hash = COALESCE(?2, content_hash),
+                    file_modified_at = COALESCE(?3, file_modified_at),
+                    processing_status = 'failed',
+                    index_status = 'failed',
+                    error_stage = ?4,
+                    error_message = ?5,
+                    updated_at = ?6
+                WHERE id = ?7 AND deleted_at IS NULL
                 ",
-                params![&extracted_text, document_id],
-            )?;
-        }
-        let updated = transaction.execute(
-            "
-            UPDATE documents
-            SET index_status = ?1,
-                error_stage = ?2,
-                error_message = ?3,
-                updated_at = ?4
-            WHERE id = ?5 AND deleted_at IS NULL
-            ",
-            params![
-                index_status.as_str(),
-                error_message.as_ref().map(|_| "indexing"),
-                error_message.as_deref(),
-                now(),
-                document_id,
-            ],
-        )?;
+                params![
+                    failure.file_size,
+                    failure.content_hash.as_deref(),
+                    failure.file_modified_at,
+                    failure.stage,
+                    failure.message,
+                    now(),
+                    document_id,
+                ],
+            )?,
+        };
         if updated == 0 {
             return Err(LibraryError::DocumentNotFound(format!(
                 "文档不存在或已删除：{document_id}"
@@ -2501,25 +2825,321 @@ impl LibraryService {
             })
     }
 
+    fn load_stored_document_index(&self, document_id: &str) -> LibraryResult<StoredDocumentIndex> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        library
+            .connection
+            .query_row(
+                "
+                SELECT
+                    id,
+                    file_name,
+                    file_type,
+                    file_size,
+                    content_hash,
+                    file_modified_at,
+                    library_path,
+                    processing_status,
+                    index_status
+                FROM documents
+                WHERE id = ?1 AND deleted_at IS NULL
+                ",
+                params![document_id],
+                stored_document_index_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                LibraryError::DocumentNotFound(format!("文档不存在或已删除：{document_id}"))
+            })
+    }
+
+    fn external_file_fingerprints(&self) -> HashMap<String, FileFingerprint> {
+        let Some(library) = self.current.as_ref() else {
+            return HashMap::new();
+        };
+        let library_root = PathBuf::from(&library.summary.path);
+        load_external_document_indexes(&library.connection)
+            .map(|documents| {
+                documents
+                    .into_iter()
+                    .map(|document| {
+                        let path = document_path(&library_root, &document.library_path)
+                            .unwrap_or_else(|_| PathBuf::new());
+                        (document.id, file_fingerprint(&path))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn document_copy_path(&self, stored: &StoredDocumentFile) -> LibraryResult<PathBuf> {
         let library = self
             .current
             .as_ref()
             .ok_or(LibraryError::NoCurrentLibrary)?;
-        let mut path = PathBuf::from(&library.summary.path);
-        for component in Path::new(&stored.library_path).components() {
-            use std::path::Component;
-            match component {
-                Component::Normal(component) => path.push(component),
-                _ => {
-                    return Err(LibraryError::DocumentFileMissing(format!(
-                        "资料库副本路径无效：{}",
-                        stored.file_name
-                    )));
-                }
+        document_path(Path::new(&library.summary.path), &stored.library_path).map_err(|_| {
+            LibraryError::DocumentFileMissing(format!("资料库副本路径无效：{}", stored.file_name))
+        })
+    }
+
+    fn document_index_path(&self, stored: &StoredDocumentIndex) -> LibraryResult<PathBuf> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        document_path(Path::new(&library.summary.path), &stored.library_path).map_err(|_| {
+            LibraryError::DocumentFileMissing(format!("资料库副本路径无效：{}", stored.file_name))
+        })
+    }
+}
+
+struct RefreshedDocument {
+    file_size: i64,
+    content_hash: String,
+    file_modified_at: Option<i64>,
+    extracted_text: String,
+}
+
+struct DocumentRefreshFailure {
+    stage: &'static str,
+    message: String,
+    file_size: Option<i64>,
+    content_hash: Option<String>,
+    file_modified_at: Option<i64>,
+}
+
+fn refresh_document_copy(
+    path: &Path,
+    expected_file_type: &str,
+) -> Result<RefreshedDocument, DocumentRefreshFailure> {
+    if !path.exists() {
+        if let Some(replacement) = sole_replacement_file(path) {
+            if supported_file_type(&replacement).is_none() {
+                return Err(DocumentRefreshFailure {
+                    stage: "externalUnsupported",
+                    message: format!(
+                        "资料库副本已被替换为不支持的文件：{}",
+                        replacement
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| replacement.to_string_lossy().into_owned())
+                    ),
+                    file_size: fs::metadata(&replacement)
+                        .ok()
+                        .and_then(|metadata| i64::try_from(metadata.len()).ok()),
+                    content_hash: None,
+                    file_modified_at: fs::metadata(&replacement)
+                        .ok()
+                        .and_then(|metadata| modified_at(&metadata)),
+                });
             }
         }
-        Ok(path)
+        return Err(DocumentRefreshFailure {
+            stage: "externalRead",
+            message: format!(
+                "资料库副本不存在：{}",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned())
+            ),
+            file_size: None,
+            content_hash: None,
+            file_modified_at: None,
+        });
+    }
+    let metadata = fs::metadata(path).map_err(|error| DocumentRefreshFailure {
+        stage: "externalRead",
+        message: format!(
+            "无法读取资料库副本 {}：{error}",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        ),
+        file_size: None,
+        content_hash: None,
+        file_modified_at: None,
+    })?;
+    if !metadata.is_file() {
+        return Err(DocumentRefreshFailure {
+            stage: "externalRead",
+            message: "资料库副本路径不是文件，无法读取。".to_string(),
+            file_size: None,
+            content_hash: None,
+            file_modified_at: modified_at(&metadata),
+        });
+    }
+
+    let file_size = i64::try_from(metadata.len()).map_err(|_| DocumentRefreshFailure {
+        stage: "externalRead",
+        message: "资料库副本大小超出支持范围。".to_string(),
+        file_size: None,
+        content_hash: None,
+        file_modified_at: modified_at(&metadata),
+    })?;
+    let file_modified_at = modified_at(&metadata);
+    let Some(actual_file_type) = supported_file_type(path) else {
+        return Err(DocumentRefreshFailure {
+            stage: "externalUnsupported",
+            message: "资料库副本已被替换为不支持的文件类型。".to_string(),
+            file_size: Some(file_size),
+            content_hash: None,
+            file_modified_at,
+        });
+    };
+    if actual_file_type != expected_file_type {
+        return Err(DocumentRefreshFailure {
+            stage: "externalUnsupported",
+            message: format!(
+                "资料库副本文件类型已变为 {actual_file_type}，与文档记录的 {expected_file_type} 不一致。"
+            ),
+            file_size: Some(file_size),
+            content_hash: None,
+            file_modified_at,
+        });
+    }
+
+    let content_hash = sha256_file(path).map_err(|error| DocumentRefreshFailure {
+        stage: "externalHash",
+        message: format!("无法计算资料库副本哈希：{error}"),
+        file_size: Some(file_size),
+        content_hash: None,
+        file_modified_at,
+    })?;
+    if let Err(message) = validate_file_content(path, expected_file_type) {
+        return Err(DocumentRefreshFailure {
+            stage: "externalValidation",
+            message,
+            file_size: Some(file_size),
+            content_hash: Some(content_hash),
+            file_modified_at,
+        });
+    }
+
+    let extracted_text =
+        extract_search_text(path, expected_file_type).map_err(|error| DocumentRefreshFailure {
+            stage: "externalExtract",
+            message: error.to_string(),
+            file_size: Some(file_size),
+            content_hash: Some(content_hash.clone()),
+            file_modified_at,
+        })?;
+    Ok(RefreshedDocument {
+        file_size,
+        content_hash,
+        file_modified_at,
+        extracted_text,
+    })
+}
+
+fn sole_replacement_file(expected_path: &Path) -> Option<PathBuf> {
+    let directory = expected_path.parent()?;
+    let mut files = fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') || !entry.path().is_file() {
+                return None;
+            }
+            Some(entry.path())
+        });
+    let replacement = files.next()?;
+    files.next().is_none().then_some(replacement)
+}
+
+fn load_external_document_indexes(
+    connection: &Connection,
+) -> LibraryResult<Vec<StoredDocumentIndex>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            id,
+            file_name,
+            file_type,
+            file_size,
+            content_hash,
+            file_modified_at,
+            library_path,
+            processing_status,
+            index_status
+        FROM documents
+        WHERE deleted_at IS NULL
+        ORDER BY imported_at, id
+        ",
+    )?;
+    let documents = statement
+        .query_map([], stored_document_index_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(documents)
+}
+
+fn stored_document_index_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredDocumentIndex> {
+    let processing_status: String = row.get(7)?;
+    let processing_status = DocumentProcessingStatus::from_database(&processing_status)
+        .ok_or_else(|| invalid_status_error(7, "document processing status"))?;
+    let index_status: String = row.get(8)?;
+    let index_status = IndexStatus::from_database(&index_status)
+        .ok_or_else(|| invalid_status_error(8, "document index status"))?;
+
+    Ok(StoredDocumentIndex {
+        id: row.get(0)?,
+        file_name: row.get(1)?,
+        file_type: row.get(2)?,
+        file_size: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+        content_hash: row.get(4)?,
+        file_modified_at: row.get(5)?,
+        library_path: row.get(6)?,
+        processing_status,
+        index_status,
+    })
+}
+
+fn invalid_status_error(index: usize, label: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Text,
+        Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown {label}"),
+        )),
+    )
+}
+
+fn document_path(library_root: &Path, library_path: &str) -> LibraryResult<PathBuf> {
+    let mut path = library_root.to_path_buf();
+    for component in Path::new(library_path).components() {
+        use std::path::Component;
+        match component {
+            Component::Normal(component) => path.push(component),
+            _ => {
+                return Err(LibraryError::DocumentFileMissing(format!(
+                    "资料库副本路径无效：{library_path}"
+                )));
+            }
+        }
+    }
+    Ok(path)
+}
+
+fn file_fingerprint(path: &Path) -> FileFingerprint {
+    match fs::metadata(path) {
+        Ok(metadata) => FileFingerprint {
+            available: true,
+            is_file: metadata.is_file(),
+            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            modified_at: modified_at(&metadata),
+        },
+        Err(_) => FileFingerprint {
+            available: false,
+            is_file: false,
+            size: 0,
+            modified_at: None,
+        },
     }
 }
 
@@ -3085,6 +3705,7 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
             file_type TEXT NOT NULL,
             file_size INTEGER,
             content_hash TEXT,
+            file_modified_at INTEGER,
             library_path TEXT NOT NULL,
             processing_status TEXT NOT NULL,
             index_status TEXT NOT NULL,
@@ -3140,6 +3761,7 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
     )?;
 
     ensure_column(connection, "documents", "original_collection_id", "TEXT")?;
+    ensure_column(connection, "documents", "file_modified_at", "INTEGER")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS documents_deleted_at_idx ON documents(deleted_at)",
         [],
@@ -4021,6 +4643,12 @@ fn directory_name(path: &Path) -> String {
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn modified_at(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_nanos()).ok()
 }
 
 fn paths_equal(left: &str, right: &str) -> bool {

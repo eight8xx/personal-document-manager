@@ -146,6 +146,14 @@ export interface IndexRunResult {
   failed: number;
 }
 
+export type DocumentIndexPhase = "processing" | "completed";
+
+export interface DocumentIndexChangedEvent {
+  phase: DocumentIndexPhase;
+  documentIds: string[];
+  result: IndexRunResult | null;
+}
+
 export type ImportItemStatus =
   | "imported"
   | "duplicate"
@@ -215,6 +223,9 @@ export interface BackendErrorShape {
 
 export type FileDropHandler = (paths: string[]) => void;
 export type ImportProgressHandler = (progress: ImportProgress) => void;
+export type DocumentIndexChangedHandler = (
+  event: DocumentIndexChangedEvent
+) => void;
 
 export interface BackendClient {
   bootstrap(): Promise<BootstrapState>;
@@ -287,4 +298,7 @@ export interface BackendClient {
   ): Promise<DocumentSearchResponse>;
   indexPendingDocuments(): Promise<IndexRunResult>;
   retryDocumentIndex(documentId: string): Promise<DocumentSummary>;
+  subscribeToDocumentIndexChanges(
+    handler: DocumentIndexChangedHandler
+  ): Promise<() => void>;
 }

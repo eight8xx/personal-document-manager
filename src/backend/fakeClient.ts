@@ -4,6 +4,8 @@ import type {
   BootstrapState,
   CollectionDeleteResult,
   CollectionSummary,
+  DocumentIndexChangedEvent,
+  DocumentIndexChangedHandler,
   DocumentMetadataUpdate,
   DocumentPreview,
   DocumentSearchQuery,
@@ -220,6 +222,8 @@ export class FakeBackendClient implements BackendClient {
     | null;
   private fileDropHandlers = new Set<FileDropHandler>();
   private importProgressHandlers = new Set<ImportProgressHandler>();
+  private documentIndexChangedHandlers =
+    new Set<DocumentIndexChangedHandler>();
   private importBatches = new Map<string, ImportBatch>();
   private nextCollectionId = 1;
   private nextTagId = 1;
@@ -690,6 +694,28 @@ export class FakeBackendClient implements BackendClient {
     for (const handler of this.fileDropHandlers) {
       handler(paths);
     }
+  }
+
+  async subscribeToDocumentIndexChanges(
+    handler: DocumentIndexChangedHandler
+  ): Promise<() => void> {
+    this.calls.push("subscribeToDocumentIndexChanges");
+    this.documentIndexChangedHandlers.add(handler);
+    return () => {
+      this.documentIndexChangedHandlers.delete(handler);
+    };
+  }
+
+  emitDocumentIndexChanged(event: DocumentIndexChangedEvent) {
+    for (const handler of this.documentIndexChangedHandlers) {
+      handler(structuredClone(event));
+    }
+  }
+
+  setDocument(document: DocumentSummary) {
+    this.documents = this.documents.map((candidate) =>
+      candidate.id === document.id ? structuredClone(document) : candidate
+    );
   }
 
   async getDocumentPreview(documentId: string): Promise<DocumentPreview> {

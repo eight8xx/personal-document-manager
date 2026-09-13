@@ -1,9 +1,11 @@
 pub mod commands;
 pub mod library;
 
+use std::time::Duration;
+
 use commands::AppState;
-use library::LibraryService;
-use tauri::Manager;
+use library::{ExternalChangeMonitor, LibraryService};
+use tauri::{Emitter, Manager};
 
 pub fn run() {
     tauri::Builder::default()
@@ -11,7 +13,18 @@ pub fn run() {
         .setup(|app| {
             let state_dir = app.path().app_data_dir()?;
             let service = LibraryService::new(state_dir)?;
-            app.manage(AppState::new(service));
+            let state = AppState::new(service);
+            let app_handle = app.handle().clone();
+            let monitor = ExternalChangeMonitor::start(
+                state.service_handle(),
+                Duration::from_millis(350),
+                Duration::from_millis(500),
+                move |event| {
+                    let _ = app_handle.emit("document-index-changed", event);
+                },
+            )?;
+            state.set_external_change_monitor(monitor)?;
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

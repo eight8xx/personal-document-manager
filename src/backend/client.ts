@@ -8,6 +8,7 @@ import type {
   BootstrapState,
   CollectionDeleteResult,
   CollectionSummary,
+  DocumentIndexChangedEvent,
   DocumentMetadataUpdate,
   DocumentPreview,
   DocumentSearchQuery,
@@ -176,5 +177,9 @@ export const tauriBackendClient: BackendClient = {
   indexPendingDocuments: () =>
     invoke<IndexRunResult>("index_pending_documents"),
   retryDocumentIndex: (documentId) =>
-    invoke<DocumentSummary>("retry_document_index", { documentId })
+    invoke<DocumentSummary>("retry_document_index", { documentId }),
+  subscribeToDocumentIndexChanges: async (handler) =>
+    listen<DocumentIndexChangedEvent>("document-index-changed", (event) => {
+      handler(event.payload);
+    })
 };

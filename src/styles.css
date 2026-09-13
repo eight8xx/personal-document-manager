@@ -2006,6 +2006,7 @@ p {
 
 .details-status {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -2023,6 +2024,15 @@ p {
   align-items: center;
   justify-content: flex-end;
   gap: 7px;
+}
+
+.details-status-message {
+  flex: 1 0 100%;
+  margin-top: 2px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .detail-preview {

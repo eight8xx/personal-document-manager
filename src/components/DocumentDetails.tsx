@@ -331,6 +331,11 @@ export function DocumentDetails({
                 </button>
               ) : null}
             </div>
+            {document.errorMessage ? (
+              <p className="details-status-message" role="status">
+                {document.errorMessage}
+              </p>
+            ) : null}
           </section>
 
           <section className="detail-preview" aria-label="文档预览">

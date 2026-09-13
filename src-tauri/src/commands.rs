@@ -6,19 +6,21 @@ use tauri::{AppHandle, Emitter, State};
 use crate::library::{
     BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate,
     DocumentPreview, DocumentSearchQuery, DocumentSearchResponse, DocumentSummary,
-    DocumentThumbnail, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
-    ImportProgress, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
-    LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
+    DocumentThumbnail, EmptyTrashResult, ExternalChangeMonitor, ImportBatch, ImportDecision,
+    ImportItemResult, ImportProgress, IndexRunResult, IndexStatus, LibraryError, LibraryResult,
+    LibraryService, LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
     service: Arc<Mutex<LibraryService>>,
+    monitor: Mutex<Option<ExternalChangeMonitor>>,
 }
 
 impl AppState {
     pub fn new(service: LibraryService) -> Self {
         Self {
             service: Arc::new(Mutex::new(service)),
+            monitor: Mutex::new(None),
         }
     }
 
@@ -26,8 +28,25 @@ impl AppState {
         self.service.lock().map_err(|_| LibraryError::StateLock)
     }
 
-    fn service_handle(&self) -> Arc<Mutex<LibraryService>> {
+    pub(crate) fn service_handle(&self) -> Arc<Mutex<LibraryService>> {
         Arc::clone(&self.service)
+    }
+
+    pub(crate) fn set_external_change_monitor(
+        &self,
+        monitor: ExternalChangeMonitor,
+    ) -> LibraryResult<()> {
+        let mut current = self.monitor.lock().map_err(|_| LibraryError::StateLock)?;
+        *current = Some(monitor);
+        Ok(())
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Ok(monitor) = self.monitor.get_mut() {
+            monitor.take();
+        }
     }
 }
 

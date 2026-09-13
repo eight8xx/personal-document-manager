@@ -246,6 +246,21 @@ pub struct IndexRunResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum DocumentIndexPhase {
+    Processing,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentIndexChangedEvent {
+    pub phase: DocumentIndexPhase,
+    pub document_ids: Vec<String>,
+    pub result: Option<IndexRunResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ImportItemStatus {
     Imported,
     Duplicate,

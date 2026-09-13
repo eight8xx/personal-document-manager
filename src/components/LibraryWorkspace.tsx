@@ -317,10 +317,54 @@ export function LibraryWorkspace({
   }, [client, library.id]);
 
   useEffect(() => {
-    if (!loading && documents.some((document) => document.indexStatus === "pending")) {
+    if (
+      !loading &&
+      documents.some(
+        (document) =>
+          document.processingStatus === "ready" &&
+          document.indexStatus === "pending"
+      )
+    ) {
       void runPendingIndexing();
     }
   }, [documents, loading, runPendingIndexing]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    void client
+      .subscribeToDocumentIndexChanges(() => {
+        void refreshDocuments()
+          .then(() => {
+            if (active) {
+              setSearchRevision((value) => value + 1);
+            }
+          })
+          .catch((caught) => {
+            if (active) {
+              setError(toBackendError(caught).message);
+            }
+          });
+      })
+      .then((stopListening) => {
+        if (active) {
+          unlisten = stopListening;
+        } else {
+          stopListening();
+        }
+      })
+      .catch((caught) => {
+        if (active) {
+          setError(toBackendError(caught).message);
+        }
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [client, refreshDocuments]);
 
   useEffect(() => {
     const query = searchQuery.trim();
