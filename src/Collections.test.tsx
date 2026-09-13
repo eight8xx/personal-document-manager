@@ -70,16 +70,14 @@ const collections: CollectionSummary[] = [
   }
 ];
 
-async function clickCollectionAction(
+async function openCollectionMenu(
   user: ReturnType<typeof userEvent.setup>,
-  button: HTMLElement
+  collectionName: string
 ) {
-  const row = button.closest(".collection-row");
-  if (!row) {
-    throw new Error("无法找到集合操作行。");
-  }
-  await user.hover(row);
-  await user.click(button);
+  await user.click(
+    screen.getByRole("button", { name: `管理 ${collectionName}` })
+  );
+  return screen.getByRole("menu", { name: `管理 ${collectionName}` });
 }
 
 describe("集合管理流程", () => {
@@ -106,14 +104,16 @@ describe("集合管理流程", () => {
     });
     const name = within(button).getByText(longName);
     const row = button.closest(".collection-row");
-    const actions = row?.querySelector(".collection-actions");
+    const menu = row?.querySelector(".collection-menu");
+    const trigger = within(row as HTMLElement).getByRole("button", {
+      name: `管理 ${longName}`
+    });
 
     expect(button).toHaveAttribute("title", longName);
     expect(name).toHaveClass("collection-name");
-    expect(actions).not.toBeNull();
-    expect(window.getComputedStyle(actions as Element).position).toBe(
-      "absolute"
-    );
+    expect(menu).not.toBeNull();
+    expect(trigger).toHaveAttribute("title", `管理 ${longName}`);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
   it("creates nested collections, renames them, and moves them", async () => {
@@ -126,13 +126,13 @@ describe("集合管理流程", () => {
 
     render(<App client={client} />);
     await screen.findByRole("button", { name: /全部文档/ });
+    await screen.findByRole("button", { name: "管理 收件箱" });
 
+    const inboxMenu = await openCollectionMenu(user, "收件箱");
     expect(
-      screen.queryByRole("button", { name: "重命名收件箱" })
-    ).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: "删除收件箱" })
-    ).toBeNull();
+      within(inboxMenu).getAllByRole("menuitem").map((item) => item.textContent)
+    ).toEqual(["创建子集合"]);
+    await user.keyboard("{Escape}");
 
     await user.click(screen.getByRole("button", { name: "创建根集合" }));
     let dialog = screen.getByRole("dialog", { name: "创建根集合" });
@@ -143,17 +143,18 @@ describe("集合管理流程", () => {
       await screen.findByRole("button", { name: /资料 0/ })
     ).toBeInTheDocument();
 
-    await clickCollectionAction(
-      user,
-      screen.getByRole("button", { name: "在资料中创建子集合" })
+    let menu = await openCollectionMenu(user, "资料");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "创建子集合" })
     );
     dialog = screen.getByRole("dialog", { name: "创建子集合" });
     await user.type(within(dialog).getByLabelText("集合名称"), "合同");
     await user.click(within(dialog).getByRole("button", { name: "创建" }));
 
-    await clickCollectionAction(
-      user,
-      await screen.findByRole("button", { name: "重命名合同" })
+    await screen.findByRole("button", { name: /合同 0/ });
+    menu = await openCollectionMenu(user, "合同");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "重命名" })
     );
     dialog = screen.getByRole("dialog", { name: "重命名集合" });
     const renameInput = within(dialog).getByLabelText("集合名称");
@@ -161,9 +162,10 @@ describe("集合管理流程", () => {
     await user.type(renameInput, "已签合同");
     await user.click(within(dialog).getByRole("button", { name: "保存" }));
 
-    await clickCollectionAction(
-      user,
-      await screen.findByRole("button", { name: "移动已签合同" })
+    await screen.findByRole("button", { name: /已签合同 0/ });
+    menu = await openCollectionMenu(user, "已签合同");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "移动" })
     );
     dialog = screen.getByRole("dialog", { name: "移动集合" });
     await user.selectOptions(
@@ -196,9 +198,9 @@ describe("集合管理流程", () => {
 
     render(<App client={client} />);
     await screen.findByText("项目文档");
-    await clickCollectionAction(
-      user,
-      screen.getByRole("button", { name: "删除项目" })
+    const menu = await openCollectionMenu(user, "项目");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "删除" })
     );
 
     const dialog = screen.getByRole("dialog", { name: "删除集合" });
@@ -213,7 +215,7 @@ describe("集合管理流程", () => {
       expect(client.calls).toContain("deleteCollection:projects");
     });
     expect(
-      screen.queryByRole("button", { name: "删除项目" })
+      screen.queryByRole("button", { name: "管理 项目" })
     ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /收件箱 1/ })).toBeInTheDocument();
   });
@@ -234,9 +236,9 @@ describe("集合管理流程", () => {
 
     render(<App client={client} />);
     await screen.findByText("项目文档");
-    await clickCollectionAction(
-      user,
-      screen.getByRole("button", { name: "删除项目" })
+    const menu = await openCollectionMenu(user, "项目");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "删除" })
     );
     const dialog = screen.getByRole("dialog", { name: "删除集合" });
     await user.click(
@@ -293,9 +295,9 @@ describe("集合管理流程", () => {
 
     render(<App client={client} />);
     await screen.findByText("项目文档");
-    await clickCollectionAction(
-      user,
-      screen.getByRole("button", { name: "移动项目" })
+    const menu = await openCollectionMenu(user, "项目");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "移动" })
     );
 
     const dialog = screen.getByRole("dialog", { name: "移动集合" });
@@ -303,5 +305,104 @@ describe("集合管理流程", () => {
     expect(
       within(target).queryByRole("option", { name: "归档" })
     ).not.toBeInTheDocument();
+  });
+
+  it("selects collections from the row without opening its menu", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections,
+      documents: [projectDocument]
+    });
+
+    render(<App client={client} />);
+    const projects = await screen.findByRole("button", { name: /^项目 1$/ });
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    await user.click(projects);
+
+    expect(projects).toHaveAttribute("aria-current", "page");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("supports keyboard opening and closing with focus restoration", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections,
+      documents: [projectDocument]
+    });
+
+    render(<App client={client} />);
+    const trigger = await screen.findByRole("button", {
+      name: "管理 项目"
+    });
+
+    trigger.focus();
+    await user.keyboard("{Enter}");
+    expect(
+      screen.getByRole("menu", { name: "管理 项目" })
+    ).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+
+    await user.keyboard(" ");
+    expect(
+      screen.getByRole("menu", { name: "管理 项目" })
+    ).toBeInTheDocument();
+  });
+
+  it("closes the open menu on an outside click and only opens one at a time", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections,
+      documents: [projectDocument]
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("button", { name: "管理 项目" });
+
+    await user.click(screen.getByRole("button", { name: "管理 项目" }));
+    expect(
+      screen.getByRole("menu", { name: "管理 项目" })
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "管理 归档" }));
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+    expect(
+      screen.getByRole("menu", { name: "管理 归档" })
+    ).toBeInTheDocument();
+
+    await user.click(document.body);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("keeps the current collection selected when a menu action is chosen", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections,
+      documents: [projectDocument]
+    });
+
+    render(<App client={client} />);
+    const projects = await screen.findByRole("button", { name: /^项目 1$/ });
+    await user.click(projects);
+
+    const menu = await openCollectionMenu(user, "归档");
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "重命名" })
+    );
+
+    expect(
+      screen.getByRole("dialog", { name: "重命名集合" })
+    ).toBeInTheDocument();
+    expect(projects).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.getByRole("button", { name: /^归档 0$/ })
+    ).not.toHaveAttribute("aria-current");
   });
 });

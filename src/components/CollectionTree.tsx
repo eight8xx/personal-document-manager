@@ -5,10 +5,12 @@ import {
   FolderInput,
   FolderPlus,
   Inbox,
+  MoreHorizontal,
   Pencil,
   Trash2
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 
 import type { CollectionSummary } from "../backend/types";
 
@@ -25,12 +27,16 @@ interface CollectionTreeProps {
 interface CollectionNodeProps extends CollectionTreeProps {
   collection: CollectionSummary;
   depth: number;
+  openMenuId: string | null;
+  onOpenMenuChange: (collectionId: string | null) => void;
 }
 
 function CollectionNode({
   collection,
   collections,
   depth,
+  openMenuId,
+  onOpenMenuChange,
   selectedCollectionId,
   onSelect,
   onCreateChild,
@@ -45,6 +51,54 @@ function CollectionNode({
   const hasChildren = children.length > 0;
   const isSelected = selectedCollectionId === collection.id;
   const CollectionIcon = collection.isInbox ? Inbox : Folder;
+  const isMenuOpen = openMenuId === collection.id;
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!isMenuOpen) {
+      return;
+    }
+
+    function handlePointerDown(event: MouseEvent) {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        onOpenMenuChange(null);
+      }
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      onOpenMenuChange(null);
+      menuTriggerRef.current?.focus();
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isMenuOpen, onOpenMenuChange]);
+
+  function toggleMenu(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    onOpenMenuChange(isMenuOpen ? null : collection.id);
+  }
+
+  function chooseMenuAction(
+    event: ReactMouseEvent<HTMLButtonElement>,
+    action: () => void
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    onOpenMenuChange(null);
+    action();
+  }
 
   return (
     <li className="collection-node">
@@ -56,7 +110,11 @@ function CollectionNode({
           <button
             className="collection-toggle"
             type="button"
-            onClick={() => setExpanded((current) => !current)}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setExpanded((current) => !current);
+            }}
             aria-label={`${expanded ? "收起" : "展开"}${collection.name}`}
             title={expanded ? "收起" : "展开"}
           >
@@ -73,7 +131,11 @@ function CollectionNode({
         <button
           className="collection-select"
           type="button"
-          onClick={() => onSelect(collection.id)}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onSelect(collection.id);
+          }}
           aria-current={isSelected ? "page" : undefined}
           title={collection.name}
         >
@@ -82,46 +144,73 @@ function CollectionNode({
           <em>{collection.documentCount}</em>
         </button>
 
-        {!collection.isInbox ? (
-          <div className="collection-actions">
-            <button
-              className="icon-button compact"
-              type="button"
-              onClick={() => onCreateChild(collection)}
-              aria-label={`在${collection.name}中创建子集合`}
-              title="创建子集合"
+        <div className="collection-menu" ref={menuRef}>
+          <button
+            ref={menuTriggerRef}
+            className="icon-button compact collection-menu-trigger"
+            type="button"
+            onClick={toggleMenu}
+            aria-haspopup="menu"
+            aria-expanded={isMenuOpen}
+            aria-label={`管理 ${collection.name}`}
+            title={`管理 ${collection.name}`}
+          >
+            <MoreHorizontal size={15} aria-hidden="true" />
+          </button>
+          {isMenuOpen ? (
+            <div
+              className="collection-menu-popover"
+              role="menu"
+              aria-label={`管理 ${collection.name}`}
             >
-              <FolderPlus size={14} aria-hidden="true" />
-            </button>
-            <button
-              className="icon-button compact"
-              type="button"
-              onClick={() => onRename(collection)}
-              aria-label={`重命名${collection.name}`}
-              title="重命名"
-            >
-              <Pencil size={14} aria-hidden="true" />
-            </button>
-            <button
-              className="icon-button compact"
-              type="button"
-              onClick={() => onMove(collection)}
-              aria-label={`移动${collection.name}`}
-              title="移动到其它父集合"
-            >
-              <FolderInput size={14} aria-hidden="true" />
-            </button>
-            <button
-              className="icon-button compact danger"
-              type="button"
-              onClick={() => onDelete(collection)}
-              aria-label={`删除${collection.name}`}
-              title="删除集合"
-            >
-              <Trash2 size={14} aria-hidden="true" />
-            </button>
-          </div>
-        ) : null}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={(event) =>
+                  chooseMenuAction(event, () => onCreateChild(collection))
+                }
+              >
+                <FolderPlus size={14} aria-hidden="true" />
+                创建子集合
+              </button>
+              {!collection.isInbox ? (
+                <>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) =>
+                      chooseMenuAction(event, () => onRename(collection))
+                    }
+                  >
+                    <Pencil size={14} aria-hidden="true" />
+                    重命名
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) =>
+                      chooseMenuAction(event, () => onMove(collection))
+                    }
+                  >
+                    <FolderInput size={14} aria-hidden="true" />
+                    移动
+                  </button>
+                  <button
+                    className="danger"
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) =>
+                      chooseMenuAction(event, () => onDelete(collection))
+                    }
+                  >
+                    <Trash2 size={14} aria-hidden="true" />
+                    删除
+                  </button>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
       </div>
 
       {hasChildren && expanded ? (
@@ -133,6 +222,8 @@ function CollectionNode({
                 collection: child,
                 collections,
                 depth: depth + 1,
+                openMenuId,
+                onOpenMenuChange,
                 selectedCollectionId,
                 onSelect,
                 onCreateChild,
@@ -149,6 +240,7 @@ function CollectionNode({
 }
 
 export function CollectionTree(props: CollectionTreeProps) {
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const roots = props.collections.filter(
     (collection) => collection.parentId === null
   );
@@ -161,6 +253,8 @@ export function CollectionTree(props: CollectionTreeProps) {
           {...props}
           collection={collection}
           depth={0}
+          openMenuId={openMenuId}
+          onOpenMenuChange={setOpenMenuId}
         />
       ))}
     </ul>
