@@ -9,11 +9,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState,
-    CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate, DocumentPreview,
-    DocumentSearchQuery, DocumentSearchResponse, DocumentSummary, DocumentThumbnail,
-    EmptyTrashResult, ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult,
-    ImportProgress, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
-    LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
+    CollectionDeleteResult, CollectionSummary, DocumentIndexChangedEvent, DocumentIndexPhase,
+    DocumentMetadataUpdate, DocumentPreview, DocumentSearchQuery, DocumentSearchResponse,
+    DocumentSummary, DocumentThumbnail, EmptyTrashResult, ExternalChangeMonitor, ImportBatch,
+    ImportDecision, ImportItemResult, ImportProgress, IndexRunResult, IndexStatus, LibraryError,
+    LibraryResult, LibraryService, LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
@@ -622,6 +622,7 @@ pub async fn search_documents(
 
 #[tauri::command]
 pub async fn index_pending_documents(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<IndexRunResult, CommandError> {
     let service = state.service_handle();
@@ -642,7 +643,25 @@ pub async fn index_pending_documents(
                 IndexStatus::Failed => result.failed += 1,
                 IndexStatus::Pending => {}
             }
+            if result.processed % 100 == 0 {
+                let _ = app.emit(
+                    "document-index-changed",
+                    DocumentIndexChangedEvent {
+                        phase: DocumentIndexPhase::Processing,
+                        document_ids: Vec::new(),
+                        result: Some(result.clone()),
+                    },
+                );
+            }
         }
+        let _ = app.emit(
+            "document-index-changed",
+            DocumentIndexChangedEvent {
+                phase: DocumentIndexPhase::Completed,
+                document_ids: Vec::new(),
+                result: Some(result.clone()),
+            },
+        );
         Ok(result)
     })
     .await

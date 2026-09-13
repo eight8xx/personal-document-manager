@@ -2168,9 +2168,9 @@ impl LibraryService {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
+        let tags = load_all_document_tags(&library.connection)?;
         for document in &mut documents {
-            document.document.tags =
-                load_document_tags(&library.connection, &document.document.id)?;
+            document.document.tags = tags.get(&document.document.id).cloned().unwrap_or_default();
         }
         Ok(documents)
     }
@@ -2359,8 +2359,9 @@ impl LibraryService {
             .query_map([], document_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
+        let tags = load_all_document_tags(&library.connection)?;
         for document in &mut documents {
-            document.tags = load_document_tags(&library.connection, &document.id)?;
+            document.tags = tags.get(&document.id).cloned().unwrap_or_default();
         }
         Ok(documents)
     }
@@ -3622,6 +3623,47 @@ fn load_document_tags(
     Ok(tags)
 }
 
+fn load_all_document_tags(
+    connection: &Connection,
+) -> LibraryResult<HashMap<String, Vec<TagSummary>>> {
+    let mut statement = connection.prepare(
+        "
+        WITH tag_counts AS (
+            SELECT dt.tag_id, COUNT(*) AS document_count
+            FROM document_tags dt
+            JOIN documents d ON d.id = dt.document_id
+            WHERE d.deleted_at IS NULL
+            GROUP BY dt.tag_id
+        )
+        SELECT
+            dt.document_id,
+            t.id,
+            t.name,
+            COALESCE(tag_counts.document_count, 0)
+        FROM document_tags dt
+        JOIN tags t ON t.id = dt.tag_id
+        LEFT JOIN tag_counts ON tag_counts.tag_id = t.id
+        ORDER BY dt.document_id, LOWER(t.name), t.id
+        ",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            TagSummary {
+                id: row.get(1)?,
+                name: row.get(2)?,
+                document_count: row.get(3)?,
+            },
+        ))
+    })?;
+    let mut tags_by_document = HashMap::<String, Vec<TagSummary>>::new();
+    for row in rows {
+        let (document_id, tag) = row?;
+        tags_by_document.entry(document_id).or_default().push(tag);
+    }
+    Ok(tags_by_document)
+}
+
 fn collection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionSummary> {
     Ok(CollectionSummary {
         id: row.get(0)?,
@@ -3806,6 +3848,12 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
             ON documents(processing_status);
         CREATE INDEX IF NOT EXISTS documents_content_hash_idx
             ON documents(content_hash);
+        CREATE INDEX IF NOT EXISTS documents_active_import_order_idx
+            ON documents(imported_at DESC, id DESC)
+            WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS documents_pending_queue_idx
+            ON documents(index_status, processing_status, imported_at, id)
+            WHERE deleted_at IS NULL;
 
         CREATE TABLE IF NOT EXISTS tags (
             id TEXT PRIMARY KEY,
@@ -3818,6 +3866,8 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
             tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
             PRIMARY KEY (document_id, tag_id)
         );
+        CREATE INDEX IF NOT EXISTS document_tags_tag_idx
+            ON document_tags(tag_id, document_id);
 
         CREATE TABLE IF NOT EXISTS sources (
             id TEXT PRIMARY KEY,
@@ -4327,8 +4377,9 @@ fn load_filtered_documents(
         )?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
+    let tags = load_all_document_tags(connection)?;
     for document in &mut documents {
-        document.tags = load_document_tags(connection, &document.id)?;
+        document.tags = tags.get(&document.id).cloned().unwrap_or_default();
     }
     Ok(documents)
 }

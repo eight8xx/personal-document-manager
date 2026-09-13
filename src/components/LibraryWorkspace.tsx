@@ -27,6 +27,7 @@ import type {
   BatchDocumentOperationResult,
   CollectionDeleteResult,
   CollectionSummary,
+  DocumentIndexChangedEvent,
   DocumentMetadataUpdate,
   DocumentSearchResponse,
   DocumentSummary,
@@ -179,6 +180,10 @@ export function LibraryWorkspace({
   const [searchError, setSearchError] = useState("");
   const [searchRevision, setSearchRevision] = useState(0);
   const [indexing, setIndexing] = useState(false);
+  const [indexProgress, setIndexProgress] = useState<{
+    processed: number;
+    total: number;
+  } | null>(null);
   const indexingRef = useRef(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<
     string | null
@@ -286,6 +291,12 @@ export function LibraryWorkspace({
       return;
     }
     indexingRef.current = true;
+    const pendingCount = documents.filter(
+      (document) =>
+        document.processingStatus === "ready" &&
+        document.indexStatus === "pending"
+    ).length;
+    setIndexProgress({ processed: 0, total: pendingCount });
     setIndexing(true);
     try {
       const result = await client.indexPendingDocuments();
@@ -298,8 +309,9 @@ export function LibraryWorkspace({
     } finally {
       indexingRef.current = false;
       setIndexing(false);
+      setIndexProgress(null);
     }
-  }, [client, refreshDocuments]);
+  }, [client, documents, refreshDocuments]);
 
   useEffect(() => {
     let active = true;
@@ -367,7 +379,19 @@ export function LibraryWorkspace({
     let unlisten: (() => void) | undefined;
 
     void client
-      .subscribeToDocumentIndexChanges(() => {
+      .subscribeToDocumentIndexChanges((event: DocumentIndexChangedEvent) => {
+        if (event.phase === "processing") {
+          if (event.result) {
+            const processed = event.result.processed;
+            setIndexProgress((current) => {
+              const total =
+                current && current.total > 0 ? current.total : processed;
+              return { processed, total };
+            });
+          }
+          return;
+        }
+
         void refreshDocuments()
           .then(() => {
             if (active) {
@@ -1456,7 +1480,9 @@ export function LibraryWorkspace({
                       size={15}
                       aria-hidden="true"
                     />
-                    正在建立索引
+                    {indexProgress
+                      ? `正在建立索引 ${indexProgress.processed}/${indexProgress.total}`
+                      : "正在建立索引"}
                   </span>
                 ) : null}
                 <button

@@ -7,6 +7,7 @@ import {
   Trash2
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import type { UIEvent } from "react";
 
 import type {
   BackendClient,
@@ -19,6 +20,61 @@ import type {
 export interface StatusPresentation {
   label: string;
   tone: "neutral" | "success" | "warning" | "danger";
+}
+
+const INITIAL_RENDERED_DOCUMENTS = 200;
+const DOCUMENT_RENDER_BATCH = 200;
+const REVEAL_THRESHOLD_PX = 600;
+
+function useIncrementalDocuments(
+  documents: DocumentSummary[],
+  highlightedDocumentId: string | null
+) {
+  const [renderedCount, setRenderedCount] = useState(() =>
+    Math.min(documents.length, INITIAL_RENDERED_DOCUMENTS)
+  );
+  const resetKey = `${documents.length}:${documents[0]?.id ?? ""}:${
+    documents.at(-1)?.id ?? ""
+  }`;
+
+  useEffect(() => {
+    setRenderedCount(Math.min(documents.length, INITIAL_RENDERED_DOCUMENTS));
+  }, [documents.length, resetKey]);
+
+  useEffect(() => {
+    if (!highlightedDocumentId) {
+      return;
+    }
+    const highlightedIndex = documents.findIndex(
+      (document) => document.id === highlightedDocumentId
+    );
+    if (highlightedIndex >= renderedCount) {
+      setRenderedCount(
+        Math.min(documents.length, highlightedIndex + 1)
+      );
+    }
+  }, [documents, highlightedDocumentId, renderedCount]);
+
+  return {
+    visibleDocuments: documents.slice(0, renderedCount),
+    revealMore() {
+      setRenderedCount((current) =>
+        Math.min(documents.length, current + DOCUMENT_RENDER_BATCH)
+      );
+    }
+  };
+}
+
+function revealMoreOnApproach(
+  event: UIEvent<HTMLElement>,
+  revealMore: () => void
+) {
+  const element = event.currentTarget;
+  const distanceToBottom =
+    element.scrollHeight - element.scrollTop - element.clientHeight;
+  if (distanceToBottom <= REVEAL_THRESHOLD_PX) {
+    revealMore();
+  }
 }
 
 interface DocumentResultsProps {
@@ -341,6 +397,14 @@ export function DocumentList({
   onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps) {
+  const { visibleDocuments, revealMore } = useIncrementalDocuments(
+    documents,
+    highlightedDocumentId
+  );
+  const searchResultsById = new Map(
+    searchResults.map((result) => [result.document.id, result])
+  );
+
   return (
     <main className="document-area" aria-label="文档列表">
       <div
@@ -349,6 +413,7 @@ export function DocumentList({
         aria-label="文档结果"
         aria-rowcount={documents.length + 1}
         aria-colcount={7}
+        onScroll={(event) => revealMoreOnApproach(event, revealMore)}
       >
         <div
           className="document-list-header collection-aware"
@@ -365,7 +430,7 @@ export function DocumentList({
           </span>
         </div>
         <div className="document-list" role="rowgroup">
-          {documents.map((document) => (
+          {visibleDocuments.map((document) => (
             <DocumentRow
               key={document.id}
               document={document}
@@ -373,11 +438,7 @@ export function DocumentList({
               selected={selectedDocumentIds.has(document.id)}
               selectionDisabled={selectionDisabled}
               highlighted={document.id === highlightedDocumentId}
-              searchResult={
-                searchResults.find(
-                  (result) => result.document.id === document.id
-                ) ?? null
-              }
+              searchResult={searchResultsById.get(document.id) ?? null}
               retryingIndex={retryingIndexIds.has(document.id)}
               onSelect={() => onSelectDocument(document.id)}
               onMove={(collectionId) =>
@@ -408,19 +469,32 @@ export function DocumentGrid({
   onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps & { client: BackendClient }) {
+  const { visibleDocuments, revealMore } = useIncrementalDocuments(
+    documents,
+    highlightedDocumentId
+  );
+  const searchResultsById = new Map(
+    searchResults.map((result) => [result.document.id, result])
+  );
+  const collectionsById = new Map(
+    collections.map((collection) => [collection.id, collection])
+  );
+
   return (
     <main className="document-area" aria-label="文档网格">
-      <div className="document-grid" role="list" aria-label="文档结果">
-        {documents.map((document) => {
+      <div
+        className="document-grid"
+        role="list"
+        aria-label="文档结果"
+        onScroll={(event) => revealMoreOnApproach(event, revealMore)}
+      >
+        {visibleDocuments.map((document) => {
           const status = documentStatusPresentation(document);
-          const collection = collections.find(
-            (candidate) => candidate.id === document.collectionId
-          );
+          const collection = collectionsById.get(document.collectionId);
           const selected = selectedDocumentIds.has(document.id);
           const highlighted = document.id === highlightedDocumentId;
           const searchResult =
-            searchResults.find((result) => result.document.id === document.id) ??
-            null;
+            searchResultsById.get(document.id) ?? null;
           const resultCopy =
             searchResult?.snippet && searchResult.matchKind === "content"
               ? searchResult.snippet

@@ -81,18 +81,25 @@ describe("外部变化重索引状态", () => {
         document("pending", "等待资料", {
           indexStatus: "pending"
         })
-      ]
+      ],
+      indexPendingDocuments: () => new Promise(() => {})
     });
 
     render(<App client={client} />);
     const results = await screen.findByRole("main", { name: "文档列表" });
+    const statusFor = (title: string) =>
+      within(
+        within(results).getByRole("row", {
+          name: new RegExp(title)
+        })
+      );
 
-    expect(within(results).getByText("处理中")).toBeInTheDocument();
-    expect(within(results).getByText("可搜索")).toBeInTheDocument();
+    expect(statusFor("处理中资料").getByText("处理中")).toBeInTheDocument();
+    expect(statusFor("可搜索资料").getByText("可搜索")).toBeInTheDocument();
     expect(
-      within(results).getByText("处理失败，等待重试")
+      statusFor("失败资料").getByText("处理失败，等待重试")
     ).toBeInTheDocument();
-    expect(within(results).getByText("等待索引")).toBeInTheDocument();
+    expect(statusFor("等待资料").getByText("等待索引")).toBeInTheDocument();
   });
 
   it("refreshes the document list when indexing completes", async () => {
