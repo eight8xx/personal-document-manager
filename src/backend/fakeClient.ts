@@ -31,6 +31,7 @@ import type {
   ImportItemResult,
   ImportProgress,
   ImportProgressHandler,
+  ImportSource,
   IndexRunResult,
   LibraryLocationInspection,
   LibrarySummary,
@@ -54,7 +55,8 @@ export interface FakeBackendOptions {
   importDocument?: (path: string) => Promise<DocumentSummary>;
   startImport?: (
     paths: string[],
-    targetCollectionId?: string | null
+    targetCollectionId?: string | null,
+    source?: ImportSource
   ) => Promise<ImportBatch>;
   resolveImportItem?: (
     itemId: string,
@@ -182,7 +184,8 @@ export class FakeBackendClient implements BackendClient {
   private readonly startImportImpl:
     | ((
         paths: string[],
-        targetCollectionId?: string | null
+        targetCollectionId?: string | null,
+        source?: ImportSource
       ) => Promise<ImportBatch>)
     | null;
   private readonly resolveImportItemImpl:
@@ -390,15 +393,20 @@ export class FakeBackendClient implements BackendClient {
 
   async startImport(
     paths: string[],
-    targetCollectionId: string | null = null
+    targetCollectionId: string | null = null,
+    source: ImportSource = "filePicker"
   ): Promise<ImportBatch> {
     this.calls.push(
       `startImport:${paths.join("|")}${
         targetCollectionId ? `:${targetCollectionId}` : ""
-      }`
+      }${source === "collectionDrop" ? `:${source}` : ""}`
     );
     if (this.startImportImpl) {
-      const resolved = await this.startImportImpl(paths, targetCollectionId);
+      const resolved = await this.startImportImpl(
+        paths,
+        targetCollectionId,
+        source
+      );
       const batch = {
         ...resolved,
         targetCollectionId:

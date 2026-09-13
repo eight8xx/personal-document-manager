@@ -335,7 +335,7 @@ describe("App", () => {
     ).toBeGreaterThan(0);
     expect(screen.getAllByText("第二份.md").length).toBeGreaterThan(0);
     expect(client.calls).toContain(
-      `startImport:${importedDocument.sourcePath}|C:\\Documents\\第二份.md`
+      `startImport:${importedDocument.sourcePath}|C:\\Documents\\第二份.md:collectionDrop`
     );
   });
 });

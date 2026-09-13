@@ -24,6 +24,7 @@ import type {
   ImportDecision,
   ImportItemResult,
   ImportProgress,
+  ImportSource,
   IndexRunResult,
   LibraryLocationInspection,
   LibrarySummary,
@@ -84,8 +85,8 @@ export const tauriBackendClient: BackendClient = {
   },
   importDocument: (path) =>
     invoke<DocumentSummary>("import_document", { path }),
-  startImport: (paths, targetCollectionId = null) =>
-    invoke<ImportBatch>("start_import", { paths, targetCollectionId }),
+  startImport: (paths, targetCollectionId = null, source = "filePicker") =>
+    invoke<ImportBatch>("start_import", { paths, targetCollectionId, source }),
   resolveImportItem: (itemId, decision) =>
     invoke<ImportItemResult>("resolve_import_item", { itemId, decision }),
   retryImportItem: (itemId) =>

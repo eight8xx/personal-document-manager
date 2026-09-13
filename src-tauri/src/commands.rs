@@ -13,8 +13,8 @@ use crate::library::{
     DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentSearchQuery,
     DocumentSearchResponse, DocumentSummary, DocumentThumbnail, EmptyTrashResult,
     ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult, ImportProgress,
-    IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService, LibrarySummary,
-    RecentLibrary, TagSummary, TrashDocumentSummary,
+    ImportSource, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
+    LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
@@ -196,12 +196,19 @@ fn import_document_contract(
 pub async fn start_import(
     paths: Vec<String>,
     target_collection_id: Option<String>,
+    source: Option<ImportSource>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportBatch, CommandError> {
-    spawn_import_task(&state, paths, target_collection_id, move |progress| {
-        let _ = app.emit("import-progress", progress);
-    })
+    spawn_import_task(
+        &state,
+        paths,
+        target_collection_id,
+        source.unwrap_or(ImportSource::FilePicker),
+        move |progress| {
+            let _ = app.emit("import-progress", progress);
+        },
+    )
     .await
     .map_err(|error| CommandError {
         code: "importTask".to_string(),
@@ -213,6 +220,7 @@ fn spawn_import_task<F>(
     state: &AppState,
     paths: Vec<String>,
     target_collection_id: Option<String>,
+    source: ImportSource,
     on_progress: F,
 ) -> tauri::async_runtime::JoinHandle<Result<ImportBatch, CommandError>>
 where
@@ -222,7 +230,12 @@ where
     tauri::async_runtime::spawn_blocking(move || {
         let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
         service
-            .start_import_to_collection_with_progress(paths, target_collection_id, on_progress)
+            .start_import_to_collection_with_progress(
+                paths,
+                target_collection_id,
+                source,
+                on_progress,
+            )
             .map_err(CommandError::from)
     })
 }
@@ -251,7 +264,12 @@ where
 {
     let mut service = state.service()?;
     service
-        .start_import_to_collection_with_progress(paths, target_collection_id, on_progress)
+        .start_import_to_collection_with_progress(
+            paths,
+            target_collection_id,
+            ImportSource::FilePicker,
+            on_progress,
+        )
         .map_err(CommandError::from)
 }
 
@@ -892,7 +910,8 @@ mod tests {
     use crate::library::{
         BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
         DocumentPreview, DocumentSearchFilters, DocumentSearchQuery, DocumentThumbnail,
-        ImportDecision, ImportItemStatus, LibraryService, LibrarySummary, LocationStatus,
+        ImportDecision, ImportItemStatus, ImportSource, LibraryService, LibrarySummary,
+        LocationStatus,
     };
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -1209,6 +1228,7 @@ mod tests {
             &state,
             vec![source_path.to_string_lossy().into_owned()],
             None,
+            ImportSource::FilePicker,
             {
                 let progress = Arc::clone(&progress);
                 move |event| progress.lock().unwrap().push(event)

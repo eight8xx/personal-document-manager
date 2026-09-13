@@ -11,8 +11,8 @@ use personal_document_manager_lib::library::{
     BatchDocumentItemStatus, BatchDocumentOperation, BatchDocumentOperationRequest,
     DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus,
     DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail,
-    EmptyTrashItemStatus, ExternalChangeMonitor, ImportDecision, ImportItemStatus, IndexStatus,
-    LibraryService, LocationStatus, SearchMatchKind,
+    EmptyTrashItemStatus, ExternalChangeMonitor, ImportDecision, ImportItemStatus, ImportSource,
+    IndexStatus, LibraryService, LocationStatus, SearchMatchKind,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -722,6 +722,7 @@ fn target_collection_imports_keep_partial_success_and_fall_back_when_deleted() {
                 missing_path.to_string_lossy().into_owned(),
             ],
             Some(target.id.clone()),
+            ImportSource::CollectionDrop,
         )
         .unwrap();
     assert_eq!(
@@ -768,6 +769,7 @@ fn target_collection_imports_keep_partial_success_and_fall_back_when_deleted() {
         .start_import_to_collection(
             vec![source_path.to_string_lossy().into_owned()],
             Some(target.id.clone()),
+            ImportSource::CollectionDrop,
         )
         .unwrap()
         .items
@@ -803,6 +805,65 @@ fn target_collection_imports_keep_partial_success_and_fall_back_when_deleted() {
             .collection_id,
         "inbox"
     );
+}
+
+#[test]
+fn collection_drop_ignores_unsupported_files_without_creating_documents() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_dir = root.path().join("source");
+    let direct_unsupported = root.path().join("direct.exe");
+    let folder_unsupported = source_dir.join("unsupported.bin");
+    let supported = source_dir.join("notes.txt");
+
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::write(&direct_unsupported, "direct unsupported").unwrap();
+    fs::write(&folder_unsupported, "folder unsupported").unwrap();
+    fs::write(&supported, "supported contents").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let target = service
+        .create_collection("目标集合".to_string(), None)
+        .unwrap();
+
+    let batch = service
+        .start_import_to_collection(
+            vec![
+                direct_unsupported.to_string_lossy().into_owned(),
+                source_dir.to_string_lossy().into_owned(),
+            ],
+            Some(target.id.clone()),
+            ImportSource::CollectionDrop,
+        )
+        .unwrap();
+
+    assert_eq!(batch.imported_count, 1);
+    assert_eq!(batch.ignored_count, 2);
+    assert_eq!(batch.failed_count, 0);
+    assert_eq!(batch.items.len(), 3);
+
+    let ignored = batch
+        .items
+        .iter()
+        .filter(|item| item.status == ImportItemStatus::Ignored)
+        .collect::<Vec<_>>();
+    assert_eq!(ignored.len(), 2);
+    assert!(ignored.iter().any(|item| item.file_name == "direct.exe"));
+    assert!(ignored
+        .iter()
+        .any(|item| item.file_name == "unsupported.bin"));
+    assert!(ignored.iter().all(|item| {
+        item.document_id.is_none()
+            && !item.retryable
+            && item.target_collection_id.as_deref() == Some(target.id.as_str())
+    }));
+
+    let documents = service.list_documents().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].file_name, "notes.txt");
+    assert_eq!(documents[0].collection_id, target.id);
 }
 
 #[test]

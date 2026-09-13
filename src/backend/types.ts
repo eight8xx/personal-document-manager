@@ -283,6 +283,8 @@ export type ImportItemStatus =
   | "ignored"
   | "skipped";
 
+export type ImportSource = "filePicker" | "collectionDrop";
+
 export type ImportDecision =
   | "useExisting"
   | "importAnyway"
@@ -375,7 +377,8 @@ export interface BackendClient {
   importDocument(path: string): Promise<DocumentSummary>;
   startImport(
     paths: string[],
-    targetCollectionId?: string | null
+    targetCollectionId?: string | null,
+    source?: ImportSource
   ): Promise<ImportBatch>;
   resolveImportItem(
     itemId: string,

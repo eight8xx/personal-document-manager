@@ -332,7 +332,7 @@ describe("资料库拖放", () => {
 
     await waitFor(() => {
       expect(client.calls).toContain(
-        "startImport:C:\\Sources\\新增文件.md|C:\\Sources\\待导入文件夹:projects"
+        "startImport:C:\\Sources\\新增文件.md|C:\\Sources\\待导入文件夹:projects:collectionDrop"
       );
     });
     Object.defineProperty(document, "elementFromPoint", {

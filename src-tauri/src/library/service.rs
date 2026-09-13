@@ -32,9 +32,10 @@ use super::models::{
     DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
     DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
     DocumentThumbnail, EmptyTrashItemResult, EmptyTrashItemStatus, EmptyTrashResult, ImportBatch,
-    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, IndexRunResult,
-    IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
-    RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary, TrashDocumentSummary,
+    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, ImportSource,
+    IndexRunResult, IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary,
+    LocationStatus, RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary,
+    TrashDocumentSummary,
 };
 use super::{ooxml, thumbnail};
 
@@ -639,21 +640,28 @@ impl LibraryService {
     where
         F: FnMut(ImportProgress),
     {
-        self.start_import_to_collection_with_progress(paths, None, on_progress)
+        self.start_import_to_collection_with_progress(
+            paths,
+            None,
+            ImportSource::FilePicker,
+            on_progress,
+        )
     }
 
     pub fn start_import_to_collection(
         &mut self,
         paths: Vec<String>,
         target_collection_id: Option<String>,
+        source: ImportSource,
     ) -> LibraryResult<ImportBatch> {
-        self.start_import_to_collection_with_progress(paths, target_collection_id, |_| {})
+        self.start_import_to_collection_with_progress(paths, target_collection_id, source, |_| {})
     }
 
     pub fn start_import_to_collection_with_progress<F>(
         &mut self,
         paths: Vec<String>,
         target_collection_id: Option<String>,
+        source: ImportSource,
         mut on_progress: F,
     ) -> LibraryResult<ImportBatch>
     where
@@ -671,7 +679,7 @@ impl LibraryService {
         }
 
         let batch_id = Uuid::new_v4().to_string();
-        let entries = scan_import_paths(&paths);
+        let entries = scan_import_paths(&paths, source);
         let total = entries.len();
         let first = entries.first();
         on_progress(ImportProgress {
@@ -3733,15 +3741,15 @@ fn file_fingerprint(path: &Path) -> FileFingerprint {
     }
 }
 
-fn scan_import_paths(paths: &[String]) -> Vec<ScanEntry> {
+fn scan_import_paths(paths: &[String], source: ImportSource) -> Vec<ScanEntry> {
     let mut entries = Vec::new();
     for path in paths {
-        scan_explicit_path(path, &mut entries);
+        scan_explicit_path(path, source, &mut entries);
     }
     entries
 }
 
-fn scan_explicit_path(input: &str, entries: &mut Vec<ScanEntry>) {
+fn scan_explicit_path(input: &str, source: ImportSource, entries: &mut Vec<ScanEntry>) {
     if input.trim().is_empty() {
         entries.push(ScanEntry::Failed {
             source_path: input.to_string(),
@@ -3771,6 +3779,10 @@ fn scan_explicit_path(input: &str, entries: &mut Vec<ScanEntry>) {
     } else if metadata.is_file() {
         if supported_file_type(Path::new(&display_path)).is_some() {
             entries.push(ScanEntry::File(PathBuf::from(display_path)));
+        } else if source == ImportSource::CollectionDrop {
+            entries.push(ScanEntry::Ignored {
+                source_path: display_path,
+            });
         } else {
             entries.push(ScanEntry::Failed {
                 source_path: display_path,

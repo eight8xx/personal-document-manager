@@ -346,6 +346,13 @@ pub struct DocumentIndexChangedEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum ImportSource {
+    FilePicker,
+    CollectionDrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ImportItemStatus {
     Imported,
     Duplicate,

@@ -43,6 +43,7 @@ import type {
   ImportDecision,
   ImportItemResult,
   ImportProgress,
+  ImportSource,
   LibrarySummary,
   TagSummary,
   TrashDocumentSummary
@@ -654,7 +655,8 @@ export function LibraryWorkspace({
   const importPaths = useCallback(
     async (
       paths: string[],
-      targetCollectionId: string | null = null
+      targetCollectionId: string | null = null,
+      source: ImportSource = "filePicker"
     ) => {
       const uniquePaths = [...new Set(paths.filter(Boolean))];
       if (uniquePaths.length === 0) {
@@ -682,7 +684,8 @@ export function LibraryWorkspace({
       try {
         const batch = await client.startImport(
           uniquePaths,
-          targetCollectionId
+          targetCollectionId,
+          source
         );
         setImportRun((current) => {
           if (current?.batchId && current.batchId !== batch.batchId) {
@@ -735,7 +738,7 @@ export function LibraryWorkspace({
         }
 
         setExternalFileDrag(null);
-        void importPaths(event.paths, hit.collectionId);
+        void importPaths(event.paths, hit.collectionId, "collectionDrop");
       })
       .then((stopListening) => {
         if (active) {
