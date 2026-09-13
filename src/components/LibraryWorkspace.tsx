@@ -948,6 +948,7 @@ export function LibraryWorkspace({
                   />
                 ) : (
                   <DocumentGrid
+                    client={client}
                     documents={visibleDocuments}
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
@@ -966,6 +967,7 @@ export function LibraryWorkspace({
       </section>
 
       <DocumentDetails
+        client={client}
         document={selectedDocument}
         collections={collections}
         onEditDocument={setMetadataTarget}

@@ -128,6 +128,44 @@ pub struct DocumentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DocumentPreview {
+    Pdf {
+        data_url: String,
+        page_count: Option<u32>,
+    },
+    Image {
+        data_url: String,
+    },
+    Text {
+        text: String,
+    },
+    Docx {
+        text: String,
+        notice: String,
+    },
+    Unsupported {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DocumentThumbnail {
+    Pdf { data_url: String },
+    Image { data_url: String },
+    Fallback { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagSummary {
     pub id: String,

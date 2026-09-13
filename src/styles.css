@@ -1398,11 +1398,13 @@ p {
 }
 
 .document-grid-visual {
+  position: relative;
   height: 62px;
   min-height: 62px;
   display: grid;
   place-items: center;
   gap: 5px;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-subtle);
@@ -1412,8 +1414,37 @@ p {
 }
 
 .document-grid-visual > svg {
+  position: relative;
+  z-index: 1;
   width: 24px;
   height: 24px;
+}
+
+.document-grid-visual > span {
+  position: absolute;
+  right: 5px;
+  bottom: 4px;
+  z-index: 2;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.document-grid-thumbnail {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #ffffff;
+  object-fit: cover;
+}
+
+.document-grid-pdf-thumbnail {
+  pointer-events: none;
 }
 
 .document-grid-select > strong {
@@ -1552,6 +1583,27 @@ p {
   width: 100%;
 }
 
+.details-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.details-inline-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.details-inline-error svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
 .details-metadata {
   display: flex;
   flex-direction: column;
@@ -1633,9 +1685,8 @@ p {
 }
 
 .detail-preview {
-  min-height: 150px;
-  display: grid;
-  place-items: center;
+  min-height: 240px;
+  overflow: hidden;
   margin: 18px;
   border: 1px dashed var(--border-strong);
   border-radius: 7px;
@@ -1643,12 +1694,110 @@ p {
   color: var(--text-muted);
 }
 
-.detail-preview > div {
+.preview-loading,
+.preview-error,
+.preview-fallback {
+  min-height: 240px;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 8px;
+  padding: 22px;
+  text-align: center;
   font-size: 12px;
+}
+
+.preview-error {
+  color: var(--danger);
+}
+
+.preview-error strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.preview-error span {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.pdf-preview {
+  display: flex;
+  flex-direction: column;
+}
+
+.preview-toolbar {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 7px 5px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.preview-toolbar > div {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.pdf-preview-frame {
+  width: 100%;
+  aspect-ratio: 1 / 1.414;
+  min-height: 360px;
+  display: block;
+  border: 0;
+  background: var(--surface-muted);
+}
+
+.image-preview {
+  min-height: 300px;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  background: var(--surface-subtle);
+}
+
+.image-preview img {
+  width: 100%;
+  max-height: 520px;
+  display: block;
+  object-fit: contain;
+}
+
+.text-preview {
+  max-height: 560px;
+  overflow: auto;
+  background: var(--surface);
+}
+
+.preview-notice {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--border);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.text-preview pre {
+  margin: 0;
+  padding: 13px;
+  color: var(--text);
+  font-family:
+    "Cascadia Mono", "Microsoft YaHei UI", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .details-empty {

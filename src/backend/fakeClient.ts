@@ -5,7 +5,9 @@ import type {
   CollectionDeleteResult,
   CollectionSummary,
   DocumentMetadataUpdate,
+  DocumentPreview,
   DocumentSummary,
+  DocumentThumbnail,
   FileDropHandler,
   ImportBatch,
   ImportDecision,
@@ -36,6 +38,11 @@ export interface FakeBackendOptions {
     decision: ImportDecision
   ) => Promise<ImportItemResult>;
   retryImportItem?: (itemId: string) => Promise<ImportItemResult>;
+  documentPreviews?: Record<string, DocumentPreview>;
+  documentThumbnails?: Record<string, DocumentThumbnail>;
+  getDocumentPreview?: (documentId: string) => Promise<DocumentPreview>;
+  getDocumentThumbnail?: (documentId: string) => Promise<DocumentThumbnail>;
+  openDocument?: (documentId: string) => Promise<void>;
 }
 
 const emptyBootstrap: BootstrapState = {
@@ -157,6 +164,17 @@ export class FakeBackendClient implements BackendClient {
   private readonly retryImportItemImpl:
     | ((itemId: string) => Promise<ImportItemResult>)
     | null;
+  private readonly documentPreviews: Record<string, DocumentPreview>;
+  private readonly documentThumbnails: Record<string, DocumentThumbnail>;
+  private readonly getDocumentPreviewImpl:
+    | ((documentId: string) => Promise<DocumentPreview>)
+    | null;
+  private readonly getDocumentThumbnailImpl:
+    | ((documentId: string) => Promise<DocumentThumbnail>)
+    | null;
+  private readonly openDocumentImpl:
+    | ((documentId: string) => Promise<void>)
+    | null;
   private fileDropHandlers = new Set<FileDropHandler>();
   private importProgressHandlers = new Set<ImportProgressHandler>();
   private importBatches = new Map<string, ImportBatch>();
@@ -182,6 +200,13 @@ export class FakeBackendClient implements BackendClient {
     this.startImportImpl = options.startImport ?? null;
     this.resolveImportItemImpl = options.resolveImportItem ?? null;
     this.retryImportItemImpl = options.retryImportItem ?? null;
+    this.documentPreviews = structuredClone(options.documentPreviews ?? {});
+    this.documentThumbnails = structuredClone(
+      options.documentThumbnails ?? {}
+    );
+    this.getDocumentPreviewImpl = options.getDocumentPreview ?? null;
+    this.getDocumentThumbnailImpl = options.getDocumentThumbnail ?? null;
+    this.openDocumentImpl = options.openDocument ?? null;
     this.refreshCollectionCounts();
     this.refreshTagCounts();
   }
@@ -455,6 +480,85 @@ export class FakeBackendClient implements BackendClient {
     for (const handler of this.fileDropHandlers) {
       handler(paths);
     }
+  }
+
+  async getDocumentPreview(documentId: string): Promise<DocumentPreview> {
+    this.calls.push(`getDocumentPreview:${documentId}`);
+    if (this.getDocumentPreviewImpl) {
+      return this.getDocumentPreviewImpl(documentId);
+    }
+    if (this.documentPreviews[documentId]) {
+      return structuredClone(this.documentPreviews[documentId]);
+    }
+
+    const document = this.requireDocument(documentId);
+    if (document.fileType === "PDF") {
+      return {
+        kind: "pdf",
+        dataUrl: "data:application/pdf;base64,JVBERi0xLjQ=",
+        pageCount: null
+      };
+    }
+    if (document.fileType === "JPG" || document.fileType === "PNG") {
+      return {
+        kind: "image",
+        dataUrl: "data:image/png;base64,iVBORw0KGgo="
+      };
+    }
+    if (document.fileType === "DOCX") {
+      return {
+        kind: "docx",
+        text: `${document.title} 的提取文本`,
+        notice: "DOCX 预览仅显示提取文本，不是完整版式预览。"
+      };
+    }
+    if (document.fileType === "TXT" || document.fileType === "Markdown") {
+      return {
+        kind: "text",
+        text: `${document.title} 的只读预览文本`
+      };
+    }
+    return {
+      kind: "unsupported",
+      message: `暂不支持预览 ${document.fileType} 格式。`
+    };
+  }
+
+  async getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail> {
+    this.calls.push(`getDocumentThumbnail:${documentId}`);
+    if (this.getDocumentThumbnailImpl) {
+      return this.getDocumentThumbnailImpl(documentId);
+    }
+    if (this.documentThumbnails[documentId]) {
+      return structuredClone(this.documentThumbnails[documentId]);
+    }
+
+    const document = this.requireDocument(documentId);
+    if (document.fileType === "PDF") {
+      return {
+        kind: "pdf",
+        dataUrl: "data:application/pdf;base64,JVBERi0xLjQ="
+      };
+    }
+    if (document.fileType === "JPG" || document.fileType === "PNG") {
+      return {
+        kind: "image",
+        dataUrl: "data:image/png;base64,iVBORw0KGgo="
+      };
+    }
+    return {
+      kind: "fallback",
+      reason: `${document.fileType} 使用类型图标。`
+    };
+  }
+
+  async openDocument(documentId: string): Promise<void> {
+    this.calls.push(`openDocument:${documentId}`);
+    if (this.openDocumentImpl) {
+      await this.openDocumentImpl(documentId);
+      return;
+    }
+    this.requireDocument(documentId);
   }
 
   async listRecentLibraries(): Promise<RecentLibrary[]> {

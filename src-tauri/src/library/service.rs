@@ -1,9 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use chrono::{NaiveDate, SecondsFormat, Utc};
+use flate2::read::DeflateDecoder;
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -11,10 +16,10 @@ use uuid::Uuid;
 use super::error::{LibraryError, LibraryResult};
 use super::models::{
     BootstrapState, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
-    DocumentMetadataUpdate, DocumentProcessingStatus, DocumentSummary, ImportBatch, ImportDecision,
-    ImportItemResult, ImportItemStatus, ImportProgress, IndexStatus, LibraryLocationInspection,
-    LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
-    TagSummary,
+    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSummary,
+    DocumentThumbnail, ImportBatch, ImportDecision, ImportItemResult, ImportItemStatus,
+    ImportProgress, IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary,
+    LocationStatus, RecentLibrary, RecentLibraryRecord, TagSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -53,6 +58,12 @@ struct PendingImport {
     source_identifier: String,
     content_hash: String,
     existing_document_id: String,
+}
+
+struct StoredDocumentFile {
+    file_name: String,
+    file_type: String,
+    library_path: String,
 }
 
 #[derive(Clone)]
@@ -1887,6 +1898,69 @@ impl LibraryService {
         Ok(documents)
     }
 
+    pub fn get_document_preview(&self, document_id: &str) -> LibraryResult<DocumentPreview> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let path = self.document_copy_path(&stored)?;
+        ensure_document_copy_exists(&path)?;
+
+        match stored.file_type.as_str() {
+            "PDF" => {
+                let bytes = fs::read(&path)?;
+                Ok(DocumentPreview::Pdf {
+                    data_url: data_url("application/pdf", &bytes),
+                    page_count: estimate_pdf_page_count(&bytes),
+                })
+            }
+            "JPG" | "PNG" => {
+                let bytes = fs::read(&path)?;
+                Ok(DocumentPreview::Image {
+                    data_url: data_url(image_media_type(&stored.file_type), &bytes),
+                })
+            }
+            "TXT" | "Markdown" => Ok(DocumentPreview::Text {
+                text: read_utf8_text(&path)?,
+            }),
+            "DOCX" => Ok(DocumentPreview::Docx {
+                text: extract_docx_text(&path)?,
+                notice: "DOCX 预览仅显示提取文本，不是完整版式预览。".to_string(),
+            }),
+            _ => Ok(DocumentPreview::Unsupported {
+                message: format!("暂不支持预览 {} 格式。", stored.file_type),
+            }),
+        }
+    }
+
+    pub fn get_document_thumbnail(&self, document_id: &str) -> LibraryResult<DocumentThumbnail> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let path = self.document_copy_path(&stored)?;
+
+        let result = match stored.file_type.as_str() {
+            "PDF" => fs::read(&path).map(|bytes| DocumentThumbnail::Pdf {
+                data_url: data_url("application/pdf", &bytes),
+            }),
+            "JPG" | "PNG" => fs::read(&path).map(|bytes| DocumentThumbnail::Image {
+                data_url: data_url(image_media_type(&stored.file_type), &bytes),
+            }),
+            _ => {
+                return Ok(DocumentThumbnail::Fallback {
+                    reason: format!("{} 使用类型图标。", stored.file_type),
+                });
+            }
+        };
+
+        Ok(result.unwrap_or_else(|error| DocumentThumbnail::Fallback {
+            reason: format!("无法生成缩略图：{error}"),
+        }))
+    }
+
+    pub fn open_document(&self, document_id: &str) -> LibraryResult<()> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let path = self.document_copy_path(&stored)?;
+        ensure_document_copy_exists(&path)?;
+
+        open::that(&path).map_err(|error| LibraryError::OpenDocument(error.to_string()))
+    }
+
     pub fn list_recent_libraries(&self) -> Vec<RecentLibrary> {
         self.recent
             .iter()
@@ -1956,6 +2030,55 @@ impl LibraryService {
             current_library: self.current_library().cloned(),
             recent_libraries: self.list_recent_libraries(),
         }
+    }
+
+    fn load_stored_document_file(&self, document_id: &str) -> LibraryResult<StoredDocumentFile> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        library
+            .connection
+            .query_row(
+                "
+                SELECT file_name, file_type, library_path
+                FROM documents
+                WHERE id = ?1 AND deleted_at IS NULL
+                ",
+                params![document_id],
+                |row| {
+                    Ok(StoredDocumentFile {
+                        file_name: row.get(0)?,
+                        file_type: row.get(1)?,
+                        library_path: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                LibraryError::DocumentNotFound(format!("文档不存在或已删除：{document_id}"))
+            })
+    }
+
+    fn document_copy_path(&self, stored: &StoredDocumentFile) -> LibraryResult<PathBuf> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let mut path = PathBuf::from(&library.summary.path);
+        for component in Path::new(&stored.library_path).components() {
+            use std::path::Component;
+            match component {
+                Component::Normal(component) => path.push(component),
+                _ => {
+                    return Err(LibraryError::DocumentFileMissing(format!(
+                        "资料库副本路径无效：{}",
+                        stored.file_name
+                    )));
+                }
+            }
+        }
+        Ok(path)
     }
 }
 
@@ -2679,6 +2802,244 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn image_media_type(file_type: &str) -> &'static str {
+    match file_type {
+        "JPG" => "image/jpeg",
+        "PNG" => "image/png",
+        _ => "application/octet-stream",
+    }
+}
+
+fn data_url(media_type: &str, bytes: &[u8]) -> String {
+    format!("data:{media_type};base64,{}", BASE64.encode(bytes))
+}
+
+fn read_utf8_text(path: &Path) -> LibraryResult<String> {
+    let bytes = fs::read(path)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn ensure_document_copy_exists(path: &Path) -> LibraryResult<()> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(LibraryError::DocumentFileMissing(format!(
+            "资料库副本不存在：{}",
+            path.display()
+        )))
+    }
+}
+
+fn estimate_pdf_page_count(bytes: &[u8]) -> Option<u32> {
+    let mut maximum = 0_u32;
+    for index in memchr_indices(bytes, b"/Count") {
+        let mut cursor = index + b"/Count".len();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > start {
+            if let Ok(value) = std::str::from_utf8(&bytes[start..cursor])
+                .unwrap_or_default()
+                .parse::<u32>()
+            {
+                maximum = maximum.max(value);
+            }
+        }
+    }
+
+    (maximum > 0).then_some(maximum)
+}
+
+fn memchr_indices(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return Vec::new();
+    }
+
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == needle).then_some(index))
+        .collect()
+}
+
+fn extract_docx_text(path: &Path) -> LibraryResult<String> {
+    let archive = fs::read(path)?;
+    let xml = read_zip_entry(&archive, "word/document.xml")?;
+    let text = extract_wordprocessing_text(&xml)?;
+    if text.trim().is_empty() {
+        Ok("文档中没有可提取的文本。".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
+    let eocd = find_zip_eocd(archive).ok_or_else(|| {
+        LibraryError::Preview("DOCX 文件结构无效：找不到 ZIP 中央目录。".to_string())
+    })?;
+    let entry_count = read_u16(archive, eocd + 10)? as usize;
+    let mut cursor = read_u32(archive, eocd + 16)? as usize;
+
+    for _ in 0..entry_count {
+        if read_u32(archive, cursor)? != 0x0201_4b50 {
+            return Err(LibraryError::Preview(
+                "DOCX 文件结构无效：中央目录项损坏。".to_string(),
+            ));
+        }
+        let flags = read_u16(archive, cursor + 8)?;
+        let compression = read_u16(archive, cursor + 10)?;
+        let compressed_size = read_u32(archive, cursor + 20)? as usize;
+        let uncompressed_size = read_u32(archive, cursor + 24)? as usize;
+        let name_length = read_u16(archive, cursor + 28)? as usize;
+        let extra_length = read_u16(archive, cursor + 30)? as usize;
+        let comment_length = read_u16(archive, cursor + 32)? as usize;
+        let local_header_offset = read_u32(archive, cursor + 42)? as usize;
+        let name_start = cursor + 46;
+        let name_end = name_start.checked_add(name_length).ok_or_else(|| {
+            LibraryError::Preview("DOCX 文件结构无效：文件名长度溢出。".to_string())
+        })?;
+        let name = archive.get(name_start..name_end).ok_or_else(|| {
+            LibraryError::Preview("DOCX 文件结构无效：文件名超出文件范围。".to_string())
+        })?;
+
+        if name == target_name.as_bytes() {
+            if flags & 0x0001 != 0 {
+                return Err(LibraryError::Preview(
+                    "DOCX 中的正文内容已加密，无法提取。".to_string(),
+                ));
+            }
+            if compressed_size == u32::MAX as usize || uncompressed_size == u32::MAX as usize {
+                return Err(LibraryError::Preview(
+                    "暂不支持 ZIP64 格式的 DOCX 文件。".to_string(),
+                ));
+            }
+
+            let data_start = zip_local_data_start(archive, local_header_offset)?;
+            let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
+                LibraryError::Preview("DOCX 文件结构无效：正文长度溢出。".to_string())
+            })?;
+            let compressed = archive.get(data_start..data_end).ok_or_else(|| {
+                LibraryError::Preview("DOCX 文件结构无效：正文超出文件范围。".to_string())
+            })?;
+            return match compression {
+                0 => Ok(compressed.to_vec()),
+                8 => {
+                    let mut decoder = DeflateDecoder::new(Cursor::new(compressed));
+                    let mut output = Vec::with_capacity(uncompressed_size);
+                    decoder.read_to_end(&mut output)?;
+                    Ok(output)
+                }
+                method => Err(LibraryError::Preview(format!(
+                    "DOCX 使用了不支持的压缩方式：{method}。"
+                ))),
+            };
+        }
+
+        cursor = name_end
+            .checked_add(extra_length)
+            .and_then(|value| value.checked_add(comment_length))
+            .ok_or_else(|| {
+                LibraryError::Preview("DOCX 文件结构无效：目录项长度溢出。".to_string())
+            })?;
+    }
+
+    Err(LibraryError::Preview(
+        "DOCX 文件缺少 word/document.xml。".to_string(),
+    ))
+}
+
+fn find_zip_eocd(archive: &[u8]) -> Option<usize> {
+    let search_start = archive.len().saturating_sub(65_557);
+    archive[search_start..]
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .map(|index| search_start + index)
+}
+
+fn zip_local_data_start(archive: &[u8], local_header_offset: usize) -> LibraryResult<usize> {
+    if read_u32(archive, local_header_offset)? != 0x0403_4b50 {
+        return Err(LibraryError::Preview(
+            "DOCX 文件结构无效：本地文件头损坏。".to_string(),
+        ));
+    }
+    let name_length = read_u16(archive, local_header_offset + 26)? as usize;
+    let extra_length = read_u16(archive, local_header_offset + 28)? as usize;
+    local_header_offset
+        .checked_add(30)
+        .and_then(|value| value.checked_add(name_length))
+        .and_then(|value| value.checked_add(extra_length))
+        .ok_or_else(|| LibraryError::Preview("DOCX 文件结构无效：本地头长度溢出。".to_string()))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> LibraryResult<u16> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| LibraryError::Preview("DOCX 文件结构无效：文件意外结束。".to_string()))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> LibraryResult<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| LibraryError::Preview("DOCX 文件结构无效：文件意外结束。".to_string()))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn extract_wordprocessing_text(xml: &[u8]) -> LibraryResult<String> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut text = String::new();
+    let mut in_text_node = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) => match element.local_name().as_ref() {
+                "t" => in_text_node = true,
+                "tab" => text.push('\t'),
+                "br" | "cr" => text.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Empty(element)) => match element.local_name().as_ref() {
+                "tab" => text.push('\t'),
+                "br" | "cr" => text.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Text(value)) if in_text_node => {
+                text.push_str(&value.xml_content(quick_xml::XmlVersion::Implicit1_0));
+            }
+            Ok(Event::CData(value)) if in_text_node => {
+                text.push_str(&value);
+            }
+            Ok(Event::End(element)) => match element.local_name().as_ref() {
+                "t" => in_text_node = false,
+                "p" if !text.ends_with('\n') => text.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                return Err(LibraryError::Preview(format!(
+                    "无法解析 DOCX 文本：{error}"
+                )));
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    Ok(text
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string())
 }
 
 fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentSummary> {

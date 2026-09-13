@@ -9,7 +9,9 @@ import type {
   CollectionDeleteResult,
   CollectionSummary,
   DocumentMetadataUpdate,
+  DocumentPreview,
   DocumentSummary,
+  DocumentThumbnail,
   ImportBatch,
   ImportDecision,
   ImportItemResult,
@@ -106,6 +108,12 @@ export const tauriBackendClient: BackendClient = {
         handler(event.payload.paths);
       }
     }),
+  getDocumentPreview: (documentId) =>
+    invoke<DocumentPreview>("get_document_preview", { documentId }),
+  getDocumentThumbnail: (documentId) =>
+    invoke<DocumentThumbnail>("get_document_thumbnail", { documentId }),
+  openDocument: (documentId) =>
+    invoke<void>("open_document", { documentId }),
   listRecentLibraries: () =>
     invoke<RecentLibrary[]>("list_recent_libraries"),
   forgetRecentLibrary: (path) =>

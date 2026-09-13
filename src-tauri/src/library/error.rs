@@ -46,8 +46,14 @@ pub enum LibraryError {
     InvalidDocumentMetadata(String),
     #[error("{0}")]
     DocumentNotFound(String),
+    #[error("{0}")]
+    DocumentFileMissing(String),
+    #[error("{0}")]
+    Preview(String),
     #[error("无法打开目录：{0}")]
     OpenDirectory(String),
+    #[error("无法打开文档：{0}")]
+    OpenDocument(String),
     #[error("资料库状态锁已损坏")]
     StateLock,
 }
@@ -75,7 +81,10 @@ impl LibraryError {
             Self::TagAlreadyExists(_) => "tagAlreadyExists",
             Self::InvalidDocumentMetadata(_) => "invalidDocumentMetadata",
             Self::DocumentNotFound(_) => "documentNotFound",
+            Self::DocumentFileMissing(_) => "documentFileMissing",
+            Self::Preview(_) => "preview",
             Self::OpenDirectory(_) => "openDirectory",
+            Self::OpenDocument(_) => "openDocument",
             Self::StateLock => "stateLock",
         }
     }

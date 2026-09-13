@@ -56,6 +56,40 @@ export interface DocumentSummary {
   lastImportedAt: string;
 }
 
+export type DocumentPreview =
+  | {
+      kind: "pdf";
+      dataUrl: string;
+      pageCount: number | null;
+    }
+  | {
+      kind: "image";
+      dataUrl: string;
+    }
+  | {
+      kind: "text";
+      text: string;
+    }
+  | {
+      kind: "docx";
+      text: string;
+      notice: string;
+    }
+  | {
+      kind: "unsupported";
+      message: string;
+    };
+
+export type DocumentThumbnail =
+  | {
+      kind: "pdf" | "image";
+      dataUrl: string;
+    }
+  | {
+      kind: "fallback";
+      reason: string;
+    };
+
 export interface TagSummary {
   id: string;
   name: string;
@@ -161,6 +195,9 @@ export interface BackendClient {
   ): Promise<() => void>;
   listDocuments(): Promise<DocumentSummary[]>;
   subscribeToFileDrops(handler: FileDropHandler): Promise<() => void>;
+  getDocumentPreview(documentId: string): Promise<DocumentPreview>;
+  getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail>;
+  openDocument(documentId: string): Promise<void>;
   listRecentLibraries(): Promise<RecentLibrary[]>;
   forgetRecentLibrary(path: string): Promise<RecentLibrary[]>;
   openLibraryDirectory(path: string): Promise<void>;

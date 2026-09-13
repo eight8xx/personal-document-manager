@@ -1,12 +1,15 @@
 import {
+  FileText,
   Image as ImageIcon,
-  Pencil,
-  ScanText
+  Pencil
 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import type {
+  BackendClient,
   CollectionSummary,
-  DocumentSummary
+  DocumentSummary,
+  DocumentThumbnail
 } from "../backend/types";
 
 export interface StatusPresentation {
@@ -48,6 +51,78 @@ export function documentStatusPresentation(
 function DocumentIcon({ document }: { document: DocumentSummary }) {
   const Icon = documentTypeIcon(document);
   return <Icon size={18} aria-hidden="true" />;
+}
+
+function DocumentThumbnailVisual({
+  client,
+  document
+}: {
+  client: BackendClient;
+  document: DocumentSummary;
+}) {
+  const [thumbnail, setThumbnail] = useState<DocumentThumbnail | null>(null);
+  const usesGeneratedThumbnail = isImageDocument(document) || isPdfDocument(
+    document
+  );
+
+  useEffect(() => {
+    let active = true;
+    setThumbnail(null);
+    if (!usesGeneratedThumbnail) {
+      return () => {
+        active = false;
+      };
+    }
+
+    void client
+      .getDocumentThumbnail(document.id)
+      .then((result) => {
+        if (active) {
+          setThumbnail(result);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setThumbnail({
+            kind: "fallback",
+            reason: "无法加载缩略图。"
+          });
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [client, document.id, usesGeneratedThumbnail]);
+
+  if (thumbnail?.kind === "image") {
+    return (
+      <img
+        className="document-grid-thumbnail"
+        src={thumbnail.dataUrl}
+        alt=""
+        onError={() =>
+          setThumbnail({ kind: "fallback", reason: "无法显示缩略图。" })
+        }
+      />
+    );
+  }
+
+  if (thumbnail?.kind === "pdf") {
+    return (
+      <iframe
+        className="document-grid-thumbnail document-grid-pdf-thumbnail"
+        title=""
+        tabIndex={-1}
+        src={`${thumbnail.dataUrl.split("#", 1)[0]}#page=1&zoom=page-width&toolbar=0&navpanes=0`}
+        onError={() =>
+          setThumbnail({ kind: "fallback", reason: "无法显示缩略图。" })
+        }
+      />
+    );
+  }
+
+  return <DocumentIcon document={document} />;
 }
 
 function DocumentTags({
@@ -242,12 +317,13 @@ export function DocumentList({
 }
 
 export function DocumentGrid({
+  client,
   documents,
   collections,
   selectedDocumentId,
   highlightedDocumentId,
   onSelectDocument
-}: DocumentResultsProps) {
+}: DocumentResultsProps & { client: BackendClient }) {
   return (
     <main className="document-area" aria-label="文档网格">
       <div className="document-grid" role="list" aria-label="文档结果">
@@ -277,7 +353,10 @@ export function DocumentGrid({
                 aria-label={`选择文档 ${document.title}`}
               >
                 <span className="document-grid-visual" aria-hidden="true">
-                  <DocumentIcon document={document} />
+                  <DocumentThumbnailVisual
+                    client={client}
+                    document={document}
+                  />
                   <span>{document.fileType}</span>
                 </span>
                 <strong title={document.title}>{document.title}</strong>
@@ -316,8 +395,16 @@ export function findCollectionName(
 }
 
 export function documentTypeIcon(document: DocumentSummary) {
-  const isImage = ["JPG", "JPEG", "PNG"].includes(
-    document.fileType.toUpperCase()
-  );
-  return isImage ? ImageIcon : ScanText;
+  if (isImageDocument(document)) {
+    return ImageIcon;
+  }
+  return FileText;
+}
+
+export function isImageDocument(document: DocumentSummary) {
+  return ["JPG", "JPEG", "PNG"].includes(document.fileType.toUpperCase());
+}
+
+export function isPdfDocument(document: DocumentSummary) {
+  return document.fileType.toUpperCase() === "PDF";
 }

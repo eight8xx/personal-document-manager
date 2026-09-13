@@ -5,8 +5,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
     BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate,
-    DocumentSummary, ImportBatch, ImportDecision, ImportItemResult, ImportProgress, LibraryError,
-    LibraryResult, LibraryService, LibrarySummary, RecentLibrary, TagSummary,
+    DocumentPreview, DocumentSummary, DocumentThumbnail, ImportBatch, ImportDecision,
+    ImportItemResult, ImportProgress, LibraryError, LibraryResult, LibraryService, LibrarySummary,
+    RecentLibrary, TagSummary,
 };
 
 pub struct AppState {
@@ -430,6 +431,54 @@ fn list_documents_contract(state: &AppState) -> Result<Vec<DocumentSummary>, Com
 }
 
 #[tauri::command]
+pub fn get_document_preview(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentPreview, CommandError> {
+    get_document_preview_contract(&state, document_id)
+}
+
+fn get_document_preview_contract(
+    state: &AppState,
+    document_id: String,
+) -> Result<DocumentPreview, CommandError> {
+    state
+        .service()?
+        .get_document_preview(&document_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn get_document_thumbnail(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentThumbnail, CommandError> {
+    get_document_thumbnail_contract(&state, document_id)
+}
+
+fn get_document_thumbnail_contract(
+    state: &AppState,
+    document_id: String,
+) -> Result<DocumentThumbnail, CommandError> {
+    state
+        .service()?
+        .get_document_thumbnail(&document_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn open_document(document_id: String, state: State<'_, AppState>) -> Result<(), CommandError> {
+    open_document_contract(&state, document_id)
+}
+
+fn open_document_contract(state: &AppState, document_id: String) -> Result<(), CommandError> {
+    state
+        .service()?
+        .open_document(&document_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
 pub fn list_recent_libraries(
     state: State<'_, AppState>,
 ) -> Result<Vec<RecentLibrary>, CommandError> {
@@ -487,8 +536,8 @@ mod tests {
         update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
     };
     use crate::library::{
-        DocumentMetadataUpdate, ImportDecision, ImportItemStatus, LibraryService, LibrarySummary,
-        LocationStatus,
+        DocumentMetadataUpdate, DocumentPreview, DocumentThumbnail, ImportDecision,
+        ImportItemStatus, LibraryService, LibrarySummary, LocationStatus,
     };
     use tempfile::tempdir;
 
@@ -524,6 +573,26 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["library"]["createdAt"], "2026-09-13T00:00:00Z");
         assert_eq!(value["action"], "created");
+    }
+
+    #[test]
+    fn preview_and_thumbnail_responses_use_camel_case() {
+        let preview = serde_json::to_value(DocumentPreview::Pdf {
+            data_url: "data:application/pdf;base64,AA==".to_string(),
+            page_count: Some(3),
+        })
+        .unwrap();
+        assert_eq!(preview["kind"], "pdf");
+        assert!(preview.get("dataUrl").is_some());
+        assert!(preview.get("pageCount").is_some());
+        assert!(preview.get("data_url").is_none());
+
+        let thumbnail = serde_json::to_value(DocumentThumbnail::Fallback {
+            reason: "使用类型图标。".to_string(),
+        })
+        .unwrap();
+        assert_eq!(thumbnail["kind"], "fallback");
+        assert!(thumbnail.get("reason").is_some());
     }
 
     #[test]

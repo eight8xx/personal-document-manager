@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use personal_document_manager_lib::library::{
-    DocumentMetadataUpdate, DocumentProcessingStatus, ImportDecision, ImportItemStatus,
-    IndexStatus, LibraryService, LocationStatus,
+    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentThumbnail,
+    ImportDecision, ImportItemStatus, IndexStatus, LibraryService, LocationStatus,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -851,6 +851,191 @@ fn updates_all_document_metadata_and_allows_an_empty_document_date() {
         )
         .unwrap_err();
     assert_eq!(empty_title.code(), "invalidDocumentMetadata");
+}
+
+#[test]
+fn previews_real_library_text_docx_and_pdf_contents() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let text_path = root.path().join("notes.txt");
+    let markdown_path = root.path().join("readme.md");
+    let docx_path = root.path().join("meeting.docx");
+    let pdf_path = root.path().join("report.pdf");
+    fs::write(&text_path, "纯文本预览内容").unwrap();
+    fs::write(&markdown_path, "# Markdown\n\n只读文本内容").unwrap();
+    let docx_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>会议</w:t></w:r><w:r><w:t>记录</w:t></w:r></w:p>
+    <w:p><w:r><w:t>第二段</w:t><w:br/><w:t>续行</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+    fs::write(
+        &docx_path,
+        stored_zip(&[("word/document.xml", docx_xml.as_bytes())]),
+    )
+    .unwrap();
+    fs::write(
+        &pdf_path,
+        b"%PDF-1.4\n1 0 obj << /Type /Pages /Count 2 >> endobj\n%%EOF",
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let text = service.import_document(&text_path).unwrap();
+    let markdown = service.import_document(&markdown_path).unwrap();
+    let docx = service.import_document(&docx_path).unwrap();
+    let pdf = service.import_document(&pdf_path).unwrap();
+
+    assert_eq!(
+        service.get_document_preview(&text.id).unwrap(),
+        DocumentPreview::Text {
+            text: "纯文本预览内容".to_string()
+        }
+    );
+    assert_eq!(
+        service.get_document_preview(&markdown.id).unwrap(),
+        DocumentPreview::Text {
+            text: "# Markdown\n\n只读文本内容".to_string()
+        }
+    );
+    let DocumentPreview::Docx { text, notice } = service.get_document_preview(&docx.id).unwrap()
+    else {
+        panic!("DOCX should return extracted text");
+    };
+    assert_eq!(text, "会议记录\n第二段\n续行");
+    assert!(notice.contains("不是完整版式预览"));
+
+    let DocumentPreview::Pdf {
+        data_url,
+        page_count,
+    } = service.get_document_preview(&pdf.id).unwrap()
+    else {
+        panic!("PDF should return an inline document preview");
+    };
+    assert!(data_url.starts_with("data:application/pdf;base64,"));
+    assert_eq!(page_count, Some(2));
+}
+
+#[test]
+fn generates_thumbnails_and_reports_missing_library_copies_without_changing_state() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let image_path = root.path().join("pixel.png");
+    let pdf_path = root.path().join("report.pdf");
+    fs::write(
+        &image_path,
+        [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89,
+        ],
+    )
+    .unwrap();
+    fs::write(&pdf_path, b"%PDF-1.4\n%%EOF").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let image = service.import_document(&image_path).unwrap();
+    let pdf = service.import_document(&pdf_path).unwrap();
+
+    let DocumentThumbnail::Image { data_url } = service.get_document_thumbnail(&image.id).unwrap()
+    else {
+        panic!("image thumbnail should be available");
+    };
+    assert!(data_url.starts_with("data:image/png;base64,"));
+    assert!(matches!(
+        service.get_document_thumbnail(&pdf.id).unwrap(),
+        DocumentThumbnail::Pdf { .. }
+    ));
+
+    let documents_before = service.list_documents().unwrap();
+    let image_copy = library_dir
+        .join("documents")
+        .join(&image.id)
+        .join(&image.file_name);
+    fs::remove_file(&image_copy).unwrap();
+
+    assert!(matches!(
+        service.get_document_thumbnail(&image.id).unwrap(),
+        DocumentThumbnail::Fallback { .. }
+    ));
+    let preview_error = service.get_document_preview(&image.id).unwrap_err();
+    assert_eq!(preview_error.code(), "documentFileMissing");
+    assert!(preview_error.to_string().contains("资料库副本不存在"));
+    let open_error = service.open_document(&image.id).unwrap_err();
+    assert_eq!(open_error.code(), "documentFileMissing");
+    assert_eq!(service.list_documents().unwrap(), documents_before);
+}
+
+fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    let mut central_entries = Vec::new();
+
+    for (name, contents) in entries {
+        let local_offset = archive.len() as u32;
+        push_u32(&mut archive, 0x0403_4b50);
+        push_u16(&mut archive, 20);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u32(&mut archive, 0);
+        push_u32(&mut archive, contents.len() as u32);
+        push_u32(&mut archive, contents.len() as u32);
+        push_u16(&mut archive, name.len() as u16);
+        push_u16(&mut archive, 0);
+        archive.extend_from_slice(name.as_bytes());
+        archive.extend_from_slice(contents);
+
+        let mut central = Vec::new();
+        push_u32(&mut central, 0x0201_4b50);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, 0);
+        push_u32(&mut central, contents.len() as u32);
+        push_u32(&mut central, contents.len() as u32);
+        push_u16(&mut central, name.len() as u16);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, 0);
+        push_u32(&mut central, local_offset);
+        central.extend_from_slice(name.as_bytes());
+        central_entries.push(central);
+    }
+
+    let central_offset = archive.len() as u32;
+    for entry in &central_entries {
+        archive.extend_from_slice(entry);
+    }
+    let central_size = archive.len() as u32 - central_offset;
+
+    push_u32(&mut archive, 0x0605_4b50);
+    push_u16(&mut archive, 0);
+    push_u16(&mut archive, 0);
+    push_u16(&mut archive, entries.len() as u16);
+    push_u16(&mut archive, entries.len() as u16);
+    push_u32(&mut archive, central_size);
+    push_u32(&mut archive, central_offset);
+    push_u16(&mut archive, 0);
+    archive
+}
+
+fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
 }
 
 fn is_library(path: &Path) -> bool {
