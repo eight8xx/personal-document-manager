@@ -7,7 +7,7 @@ import {
   Trash2
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { UIEvent } from "react";
+import type { MouseEvent as ReactMouseEvent, UIEvent } from "react";
 
 import type {
   BackendClient,
@@ -86,7 +86,10 @@ interface DocumentResultsProps {
   highlightedDocumentId: string | null;
   searchResults: DocumentSearchResult[];
   retryingIndexIds: Set<string>;
-  onSelectDocument: (documentId: string) => void;
+  onSelectDocument: (
+    documentId: string,
+    event: ReactMouseEvent<HTMLButtonElement>
+  ) => void;
   onMoveDocument: (
     document: DocumentSummary,
     collectionId: string
@@ -249,7 +252,7 @@ function DocumentRow({
   highlighted: boolean;
   searchResult: DocumentSearchResult | null;
   retryingIndex: boolean;
-  onSelect: () => void;
+  onSelect: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   onMove: (collectionId: string) => void;
   onEdit: () => void;
   onMoveToTrash: () => void;
@@ -435,7 +438,7 @@ export function DocumentList({
               highlighted={document.id === highlightedDocumentId}
               searchResult={searchResultsById.get(document.id) ?? null}
               retryingIndex={retryingIndexIds.has(document.id)}
-              onSelect={() => onSelectDocument(document.id)}
+              onSelect={(event) => onSelectDocument(document.id, event)}
               onMove={(collectionId) =>
                 onMoveDocument(document, collectionId)
               }
@@ -508,7 +511,7 @@ export function DocumentGrid({
               <button
                 className="document-grid-select"
                 type="button"
-                onClick={() => onSelectDocument(document.id)}
+                onClick={(event) => onSelectDocument(document.id, event)}
                 disabled={selectionDisabled}
                 aria-pressed={selected}
                 aria-label={`选择文档 ${document.title}`}

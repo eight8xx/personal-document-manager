@@ -75,9 +75,10 @@ function CollectionNode({
           type="button"
           onClick={() => onSelect(collection.id)}
           aria-current={isSelected ? "page" : undefined}
+          title={collection.name}
         >
           <CollectionIcon size={16} aria-hidden="true" />
-          <span>{collection.name}</span>
+          <span className="collection-name">{collection.name}</span>
           <em>{collection.documentCount}</em>
         </button>
 

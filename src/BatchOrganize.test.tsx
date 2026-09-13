@@ -1,4 +1,5 @@
 import {
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -53,7 +54,11 @@ const collections: CollectionSummary[] = [
   }
 ];
 
-function documentFor(id: string, title: string): DocumentSummary {
+function documentFor(
+  id: string,
+  title: string,
+  overrides: Partial<DocumentSummary> = {}
+): DocumentSummary {
   return {
     id,
     title,
@@ -72,7 +77,8 @@ function documentFor(id: string, title: string): DocumentSummary {
     importedAt: "2026-09-13T08:10:00Z",
     sourcePath: `C:\\Sources\\${title}.txt`,
     sourceIdentifier: `c:\\sources\\${title}.txt`,
-    lastImportedAt: "2026-09-13T08:10:00Z"
+    lastImportedAt: "2026-09-13T08:10:00Z",
+    ...overrides
   };
 }
 
@@ -101,8 +107,9 @@ describe("批量整理操作", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 第一份文档" })
     );
-    await user.click(
-      screen.getByRole("button", { name: "选择文档 第二份文档" })
+    fireEvent.click(
+      screen.getByRole("button", { name: "选择文档 第二份文档" }),
+      { ctrlKey: true }
     );
     expect(screen.getByText("已选择 2 项")).toBeInTheDocument();
 
@@ -110,8 +117,9 @@ describe("批量整理操作", () => {
     expect(
       screen.getByRole("button", { name: "选择文档 第一份文档" })
     ).toHaveAttribute("aria-pressed", "true");
-    await user.click(
-      screen.getByRole("button", { name: "选择文档 第三份文档" })
+    fireEvent.click(
+      screen.getByRole("button", { name: "选择文档 第三份文档" }),
+      { ctrlKey: true }
     );
     expect(screen.getByText("已选择 3 项")).toBeInTheDocument();
 
@@ -119,6 +127,98 @@ describe("批量整理操作", () => {
     expect(screen.getByText("已选择 0 项")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "全选当前结果" }));
     expect(screen.getByText("已选择 3 项")).toBeInTheDocument();
+  });
+
+  it("supports Ctrl and Meta toggling while preserving the latest selection anchor", async () => {
+    const user = userEvent.setup();
+    render(<App client={createClient()} />);
+    await screen.findByText("第一份文档");
+
+    const first = screen.getByRole("button", {
+      name: "选择文档 第一份文档"
+    });
+    const second = screen.getByRole("button", {
+      name: "选择文档 第二份文档"
+    });
+    const third = screen.getByRole("button", {
+      name: "选择文档 第三份文档"
+    });
+
+    await user.click(first);
+    fireEvent.click(third, { ctrlKey: true });
+    expect(screen.getByText("已选择 2 项")).toBeInTheDocument();
+
+    fireEvent.click(second, { metaKey: true });
+    fireEvent.click(second, { metaKey: true });
+    expect(screen.getByText("已选择 2 项")).toBeInTheDocument();
+    expect(second).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(third, { shiftKey: true });
+    expect(screen.getByText("已选择 2 项")).toBeInTheDocument();
+    expect(first).toHaveAttribute("aria-pressed", "false");
+    expect(second).toHaveAttribute("aria-pressed", "true");
+    expect(third).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(first);
+    expect(screen.getByText("已选择 1 项")).toBeInTheDocument();
+    expect(second).toHaveAttribute("aria-pressed", "false");
+    expect(third).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(third, { shiftKey: true });
+    expect(screen.getByText("已选择 3 项")).toBeInTheDocument();
+  });
+
+  it("uses the filtered visible order for Shift selection in list and grid", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: [
+        documentFor("first", "第一份文档"),
+        documentFor("second", "第二份文档", {
+          fileName: "第二份文档.pdf",
+          fileType: "PDF"
+        }),
+        documentFor("third", "第三份文档")
+      ],
+      collections,
+      tags
+    });
+    render(<App client={client} />);
+    await screen.findByText("第一份文档");
+
+    await user.click(screen.getByRole("button", { name: /^筛选/ }));
+    await user.selectOptions(screen.getByLabelText("文件类型"), "TXT");
+    expect(screen.queryByText("第二份文档")).not.toBeInTheDocument();
+
+    const first = screen.getByRole("button", {
+      name: "选择文档 第一份文档"
+    });
+    const third = screen.getByRole("button", {
+      name: "选择文档 第三份文档"
+    });
+    await user.click(first);
+    fireEvent.click(third, { shiftKey: true });
+    expect(screen.getByText("已选择 2 项")).toBeInTheDocument();
+    expect(first).toHaveAttribute("aria-pressed", "true");
+    expect(third).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(screen.getByRole("button", { name: "清空选择" }));
+    await user.click(screen.getByRole("button", { name: "网格视图" }));
+    const gridFirst = screen.getByRole("button", {
+      name: "选择文档 第一份文档"
+    });
+    const gridThird = screen.getByRole("button", {
+      name: "选择文档 第三份文档"
+    });
+    await user.click(gridFirst);
+    fireEvent.click(gridThird, { shiftKey: true });
+
+    expect(screen.getByText("已选择 2 项")).toBeInTheDocument();
+    expect(gridFirst).toHaveAttribute("aria-pressed", "true");
+    expect(gridThird).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.queryByRole("button", { name: "选择文档 第二份文档" })
+    ).not.toBeInTheDocument();
   });
 
   it("opens the batch menu and moves selected documents to a collection", async () => {
@@ -130,8 +230,9 @@ describe("批量整理操作", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 第一份文档" })
     );
-    await user.click(
-      screen.getByRole("button", { name: "选择文档 第二份文档" })
+    fireEvent.click(
+      screen.getByRole("button", { name: "选择文档 第二份文档" }),
+      { ctrlKey: true }
     );
     await user.click(screen.getByRole("button", { name: "批量操作" }));
     await user.click(
@@ -169,8 +270,9 @@ describe("批量整理操作", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 第一份文档" })
     );
-    await user.click(
-      screen.getByRole("button", { name: "选择文档 第二份文档" })
+    fireEvent.click(
+      screen.getByRole("button", { name: "选择文档 第二份文档" }),
+      { ctrlKey: true }
     );
     await user.click(screen.getByRole("button", { name: "批量操作" }));
     await user.click(
@@ -236,8 +338,9 @@ describe("批量整理操作", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 第一份文档" })
     );
-    await user.click(
-      screen.getByRole("button", { name: "选择文档 第二份文档" })
+    fireEvent.click(
+      screen.getByRole("button", { name: "选择文档 第二份文档" }),
+      { ctrlKey: true }
     );
     await user.click(screen.getByRole("button", { name: "批量操作" }));
     await user.click(
@@ -311,8 +414,9 @@ describe("批量整理操作", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 第一份文档" })
     );
-    await user.click(
-      screen.getByRole("button", { name: "选择文档 第二份文档" })
+    fireEvent.click(
+      screen.getByRole("button", { name: "选择文档 第二份文档" }),
+      { ctrlKey: true }
     );
     await user.click(screen.getByRole("button", { name: "批量操作" }));
     await user.click(

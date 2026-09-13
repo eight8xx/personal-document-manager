@@ -19,6 +19,7 @@ import {
   X
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 
 import { BackendError, toBackendError } from "../backend/error";
 import type {
@@ -29,6 +30,7 @@ import type {
   CollectionSummary,
   DocumentIndexChangedEvent,
   DocumentMetadataUpdate,
+  DocumentSearchFilters,
   DocumentSearchResponse,
   DocumentSummary,
   ImportBatch,
@@ -156,6 +158,45 @@ function progressFromBatch(batch: ImportBatch): ImportProgress {
   };
 }
 
+function documentMatchesFilters(
+  document: DocumentSummary,
+  filters: DocumentSearchFilters
+) {
+  if (
+    filters.collectionId &&
+    document.collectionId !== filters.collectionId
+  ) {
+    return false;
+  }
+  if (
+    filters.tagId &&
+    !document.tags.some((tag) => tag.id === filters.tagId)
+  ) {
+    return false;
+  }
+  if (
+    filters.fileType &&
+    document.fileType.toUpperCase() !== filters.fileType.toUpperCase()
+  ) {
+    return false;
+  }
+  if (
+    filters.documentDateFrom &&
+    (!document.documentDate ||
+      document.documentDate < filters.documentDateFrom)
+  ) {
+    return false;
+  }
+  if (
+    filters.documentDateTo &&
+    (!document.documentDate ||
+      document.documentDate > filters.documentDateTo)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function LibraryWorkspace({
   client,
   library,
@@ -195,6 +236,7 @@ export function LibraryWorkspace({
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<Set<string>>(
     new Set()
   );
+  const selectionAnchorIdRef = useRef<string | null>(null);
   const [showingTrash, setShowingTrash] = useState(false);
   const [documentView, setDocumentView] =
     useState<DocumentView>(storedDocumentView);
@@ -1127,47 +1169,20 @@ export function LibraryWorkspace({
     : null;
   const normalizedQuery = searchQuery.trim();
   const searchActive = normalizedQuery.length > 0;
-  const hasActiveFilters = Boolean(
-    selectedCollectionId ||
-      selectedTagId ||
-      fileTypeFilter ||
-      documentDateFrom ||
-      documentDateTo
+  const activeFilters: DocumentSearchFilters = {
+    collectionId: selectedCollectionId,
+    tagId: selectedTagId,
+    fileType: fileTypeFilter,
+    documentDateFrom,
+    documentDateTo
+  };
+  const hasActiveFilters = Object.values(activeFilters).some(Boolean);
+  const filteredDocuments = documents.filter((document) =>
+    documentMatchesFilters(document, activeFilters)
   );
-  const filteredDocuments = documents.filter((document) => {
-    if (
-      selectedCollectionId &&
-      document.collectionId !== selectedCollectionId
-    ) {
-      return false;
-    }
-    if (
-      selectedTagId &&
-      !document.tags.some((tag) => tag.id === selectedTagId)
-    ) {
-      return false;
-    }
-    if (
-      fileTypeFilter &&
-      document.fileType.toUpperCase() !== fileTypeFilter.toUpperCase()
-    ) {
-      return false;
-    }
-    if (
-      documentDateFrom &&
-      (!document.documentDate || document.documentDate < documentDateFrom)
-    ) {
-      return false;
-    }
-    if (
-      documentDateTo &&
-      (!document.documentDate || document.documentDate > documentDateTo)
-    ) {
-      return false;
-    }
-    return true;
-  });
-  const searchResults = searchResponse?.results ?? [];
+  const searchResults = (searchResponse?.results ?? []).filter((result) =>
+    documentMatchesFilters(result.document, activeFilters)
+  );
   const visibleDocuments = searchActive
     ? searchResults.map((result) => result.document)
     : filteredDocuments;
@@ -1205,22 +1220,58 @@ export function LibraryWorkspace({
     ) ?? null;
 
   function clearDocumentSelection() {
+    selectionAnchorIdRef.current = null;
     setSelectedDocumentIds(new Set());
   }
 
-  function toggleDocumentSelection(documentId: string) {
+  function selectDocument(
+    documentId: string,
+    event: ReactMouseEvent<HTMLButtonElement>
+  ) {
     if (batchRunningRef.current) {
       return;
     }
-    setSelectedDocumentIds((current) => {
-      const next = new Set(current);
-      if (next.has(documentId)) {
-        next.delete(documentId);
-      } else {
-        next.add(documentId);
+
+    if (event.shiftKey) {
+      const anchorId = selectionAnchorIdRef.current;
+      const anchorIndex = anchorId
+        ? visibleDocuments.findIndex((document) => document.id === anchorId)
+        : -1;
+      const targetIndex = visibleDocuments.findIndex(
+        (document) => document.id === documentId
+      );
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const start = Math.min(anchorIndex, targetIndex);
+        const end = Math.max(anchorIndex, targetIndex);
+        setSelectedDocumentIds(
+          new Set(
+            visibleDocuments
+              .slice(start, end + 1)
+              .map((document) => document.id)
+          )
+        );
+        setSelectedDocumentId(documentId);
+        return;
       }
-      return next;
-    });
+    }
+
+    if (event.ctrlKey || event.metaKey) {
+      selectionAnchorIdRef.current = documentId;
+      setSelectedDocumentIds((current) => {
+        const next = new Set(current);
+        if (next.has(documentId)) {
+          next.delete(documentId);
+        } else {
+          next.add(documentId);
+        }
+        return next;
+      });
+      setSelectedDocumentId(documentId);
+      return;
+    }
+
+    selectionAnchorIdRef.current = documentId;
+    setSelectedDocumentIds(new Set([documentId]));
     setSelectedDocumentId(documentId);
   }
 
@@ -1758,7 +1809,7 @@ export function LibraryWorkspace({
                     highlightedDocumentId={highlightedDocumentId}
                     searchResults={searchResults}
                     retryingIndexIds={retryingIndexIds}
-                    onSelectDocument={toggleDocumentSelection}
+                    onSelectDocument={selectDocument}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
@@ -1779,7 +1830,7 @@ export function LibraryWorkspace({
                     highlightedDocumentId={highlightedDocumentId}
                     searchResults={searchResults}
                     retryingIndexIds={retryingIndexIds}
-                    onSelectDocument={toggleDocumentSelection}
+                    onSelectDocument={selectDocument}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }

@@ -523,6 +523,7 @@ p {
 }
 
 .collection-row {
+  position: relative;
   min-width: 0;
   min-height: 34px;
   display: flex;
@@ -581,8 +582,9 @@ p {
   flex: 0 0 auto;
 }
 
-.collection-select span {
+.collection-name {
   min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   font-size: 13px;
   font-weight: 570;
@@ -591,17 +593,30 @@ p {
 }
 
 .collection-select em {
-  margin-left: auto;
+  flex: 0 0 auto;
+  min-width: 1.2em;
+  margin-left: 3px;
+  text-align: right;
   font-size: 10px;
   font-style: normal;
+  font-variant-numeric: tabular-nums;
   opacity: 0.7;
 }
 
 .collection-actions {
+  position: absolute;
+  top: 3px;
+  right: 2px;
+  bottom: 3px;
   display: flex;
   align-items: center;
   gap: 1px;
-  padding-right: 2px;
+  padding-left: 18px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--surface-muted) 18px
+  );
   opacity: 0;
   transition: opacity 120ms ease;
 }
@@ -609,6 +624,14 @@ p {
 .collection-row:hover .collection-actions,
 .collection-row:focus-within .collection-actions {
   opacity: 1;
+}
+
+.collection-row.active .collection-actions {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--accent-soft) 18px
+  );
 }
 
 .tag-section {

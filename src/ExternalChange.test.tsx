@@ -84,6 +84,7 @@ describe("外部变化重索引状态", () => {
       ],
       indexPendingDocuments: () => new Promise(() => {})
     });
+    client.pendingIndexCount = async () => 0;
 
     render(<App client={client} />);
     const results = await screen.findByRole("main", { name: "文档列表" });
