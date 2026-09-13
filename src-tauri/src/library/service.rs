@@ -98,6 +98,17 @@ struct StoredDocumentIndex {
     index_status: IndexStatus,
 }
 
+#[derive(Default)]
+struct PptxExtraction {
+    text: String,
+    degraded_features: Vec<String>,
+}
+
+struct CachedImageThumbnail {
+    bytes: Vec<u8>,
+    media_type: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
     available: bool,
@@ -2763,8 +2774,11 @@ impl LibraryService {
             "DELETE FROM document_search WHERE document_id = ?1",
             params![document_id],
         )?;
+        let mut invalidate_thumbnail = false;
         let updated = match refresh {
             Ok(refreshed) => {
+                invalidate_thumbnail =
+                    stored.content_hash.as_deref() != Some(refreshed.content_hash.as_str());
                 transaction.execute(
                     "
                     INSERT INTO document_search (
@@ -2828,6 +2842,9 @@ impl LibraryService {
             )));
         }
         transaction.commit()?;
+        if invalidate_thumbnail {
+            remove_thumbnail_versions(Path::new(&library.summary.path), document_id);
+        }
         load_document_summary(&library.connection, document_id)
     }
 
@@ -2864,7 +2881,13 @@ impl LibraryService {
                         data_url: data_url("image/png", &bytes),
                     })
             }
-            ThumbnailStrategy::TypeIcon | ThumbnailStrategy::PptxFirstPageReserved => {
+            ThumbnailStrategy::PptxFirstPage => {
+                self.pptx_thumbnail(&stored, &path)
+                    .map(|thumbnail| DocumentThumbnail::Pptx {
+                        data_url: data_url(thumbnail.media_type, &thumbnail.bytes),
+                    })
+            }
+            ThumbnailStrategy::TypeIcon => {
                 return Ok(DocumentThumbnail::Fallback {
                     reason: format!("{} 使用类型图标。", stored.file_type),
                 });
@@ -2874,6 +2897,55 @@ impl LibraryService {
         Ok(result.unwrap_or_else(|error| DocumentThumbnail::Fallback {
             reason: format!("无法生成缩略图：{error}"),
         }))
+    }
+
+    pub fn save_document_thumbnail(
+        &self,
+        document_id: &str,
+        thumbnail_data_url: &str,
+    ) -> LibraryResult<DocumentThumbnail> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let capability = require_capability_for_file_type(&stored.file_type)?;
+        if capability.thumbnail != ThumbnailStrategy::PptxFirstPage {
+            return Err(LibraryError::Preview(format!(
+                "{} 不接受前端生成缩略图。",
+                stored.file_type
+            )));
+        }
+
+        let path = self.document_copy_path(&stored)?;
+        ensure_document_copy_exists(&path)?;
+        let (media_type, bytes) = decode_validated_thumbnail_data_url(thumbnail_data_url)?;
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let thumbnail_dir = Path::new(&library.summary.path).join(THUMBNAILS_DIR);
+        let version = stored
+            .content_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+            .map(str::to_string)
+            .unwrap_or(sha256_file(&path)?);
+        let extension = if media_type == "image/png" {
+            "png"
+        } else {
+            "jpg"
+        };
+        let cache_path = thumbnail_cache_path_for(&thumbnail_dir, &stored.id, &version, extension);
+
+        fs::create_dir_all(&thumbnail_dir)?;
+        let temporary_path = cache_path.with_extension(format!("{extension}.tmp"));
+        fs::write(&temporary_path, &bytes)?;
+        if let Err(error) = fs::rename(&temporary_path, &cache_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error.into());
+        }
+        remove_other_thumbnail_versions(&thumbnail_dir, &stored.id, &cache_path);
+
+        Ok(DocumentThumbnail::Pptx {
+            data_url: data_url(media_type, &bytes),
+        })
     }
 
     fn preview_document(
@@ -2930,9 +3002,25 @@ impl LibraryService {
                     degraded_features,
                 })
             }
-            PreviewStrategy::PptxPagesReserved => Ok(DocumentPreview::Unsupported {
-                message: "PPTX 版式预览将在后续功能中启用。".to_string(),
-            }),
+            PreviewStrategy::PptxPages => {
+                let bytes = fs::read(&path)?;
+                let extraction = extract_pptx_text_from_bytes(&bytes)?;
+                let mut degraded_features = inspect_pptx_degradations(&bytes);
+                merge_features(&mut degraded_features, extraction.degraded_features);
+                Ok(DocumentPreview::Pptx {
+                    data_url: data_url(
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        &bytes,
+                    ),
+                    text: extraction.text,
+                    notice: if degraded_features.is_empty() {
+                        "PPTX 版式预览为本地只读近似呈现。".to_string()
+                    } else {
+                        "PPTX 版式预览已呈现，部分复杂内容需要降级。".to_string()
+                    },
+                    degraded_features,
+                })
+            }
         }
     }
 
@@ -3033,6 +3121,40 @@ impl LibraryService {
         }
         remove_other_thumbnail_versions(&thumbnail_dir, &stored.id, &cache_path);
         Ok(generated)
+    }
+
+    fn pptx_thumbnail(
+        &self,
+        stored: &StoredDocumentFile,
+        path: &Path,
+    ) -> LibraryResult<CachedImageThumbnail> {
+        ensure_document_copy_exists(path)?;
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let thumbnail_dir = Path::new(&library.summary.path).join(THUMBNAILS_DIR);
+        let version = stored
+            .content_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+            .map(str::to_string)
+            .unwrap_or(sha256_file(path)?);
+
+        for (extension, media_type) in [("jpg", "image/jpeg"), ("png", "image/png")] {
+            let cache_path =
+                thumbnail_cache_path_for(&thumbnail_dir, &stored.id, &version, extension);
+            if let Ok(bytes) = fs::read(&cache_path) {
+                if is_supported_thumbnail_image(&bytes) {
+                    remove_other_thumbnail_versions(&thumbnail_dir, &stored.id, &cache_path);
+                    return Ok(CachedImageThumbnail { bytes, media_type });
+                }
+                let _ = fs::remove_file(cache_path);
+            }
+        }
+
+        remove_thumbnail_versions(Path::new(&library.summary.path), &stored.id);
+        Err(LibraryError::Preview("PPTX 缩略图尚未生成。".to_string()))
     }
 
     pub fn open_document(&self, document_id: &str) -> LibraryResult<()> {
@@ -3525,8 +3647,7 @@ fn scan_explicit_path(input: &str, entries: &mut Vec<ScanEntry>) {
         } else {
             entries.push(ScanEntry::Failed {
                 source_path: display_path,
-                message: "不支持该文件格式。仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG 文件。"
-                    .to_string(),
+                message: unsupported_message(),
             });
         }
     } else {
@@ -4366,9 +4487,141 @@ fn validate_file_content(
         ),
         ValidationStrategy::DocxPackage => expect_prefix(path, b"PK", "文件内容不是有效的 DOCX。"),
         ValidationStrategy::PlainText => Ok(()),
-        ValidationStrategy::OfficeOpenXmlReserved => {
-            Err(format!("{} 尚未启用导入。", capability.display_type))
+        ValidationStrategy::PptxPackage => validate_pptx_package(path),
+    }
+}
+
+fn validate_pptx_package(path: &Path) -> Result<(), String> {
+    let archive = fs::read(path).map_err(|error| format!("无法读取文件内容：{error}"))?;
+    validate_pptx_bytes(&archive).map_err(|error| error.to_string())
+}
+
+fn validate_pptx_bytes(archive: &[u8]) -> LibraryResult<()> {
+    if archive.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+        return Err(LibraryError::ImportFile(
+            "PPTX 已加密或使用受保护容器，无法导入。".to_string(),
+        ));
+    }
+    if !archive.starts_with(b"PK\x03\x04") {
+        return Err(LibraryError::ImportFile(
+            "文件内容不是有效的 PPTX：缺少 OOXML 压缩包结构。".to_string(),
+        ));
+    }
+    ensure_zip_entries_not_encrypted(archive, "PPTX")?;
+
+    let content_types = read_zip_entry_for(archive, "[Content_Types].xml", "PPTX")?;
+    let content_type_root = xml_root_local_name(&content_types, "PPTX")?;
+    if content_type_root != "Types" {
+        return Err(LibraryError::ImportFile(
+            "PPTX 结构无效：[Content_Types].xml 根节点不是 Types。".to_string(),
+        ));
+    }
+    if !content_types_declare_presentation(&content_types)? {
+        return Err(LibraryError::ImportFile(
+            "PPTX 结构无效：未声明 PowerPoint presentation 主内容类型。".to_string(),
+        ));
+    }
+
+    let presentation = read_zip_entry_for(archive, "ppt/presentation.xml", "PPTX")?;
+    if xml_root_local_name(&presentation, "PPTX")? != "presentation" {
+        return Err(LibraryError::ImportFile(
+            "PPTX 结构无效：ppt/presentation.xml 不是演示文稿定义。".to_string(),
+        ));
+    }
+
+    let entry_names = zip_entry_names_for(archive, "PPTX")?;
+    let slide_names = entry_names
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("ppt/slides/") && name.ends_with(".xml") && !name.contains("/_rels/")
+        })
+        .collect::<Vec<_>>();
+    if slide_names.is_empty() {
+        return Err(LibraryError::ImportFile(
+            "PPTX 结构无效：没有找到幻灯片内容。".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn content_types_declare_presentation(xml: &[u8]) -> LibraryResult<bool> {
+    let expected =
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                if element.local_name().as_ref() != "Override" {
+                    buffer.clear();
+                    continue;
+                }
+                let mut part_name = None;
+                let mut content_type = None;
+                for attribute in element.attributes().with_checks(false) {
+                    let attribute = attribute.map_err(|error| {
+                        LibraryError::ImportFile(format!(
+                            "PPTX [Content_Types].xml 属性无效：{error}"
+                        ))
+                    })?;
+                    let value = attribute
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .map_err(|error| {
+                            LibraryError::ImportFile(format!(
+                                "PPTX [Content_Types].xml 属性编码无效：{error}"
+                            ))
+                        })?
+                        .into_owned();
+                    match attribute.key.local_name().as_ref() {
+                        "PartName" => part_name = Some(value),
+                        "ContentType" => content_type = Some(value),
+                        _ => {}
+                    }
+                }
+                if part_name.as_deref() == Some("/ppt/presentation.xml")
+                    && content_type.as_deref() == Some(expected)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(Event::Eof) => return Ok(false),
+            Err(error) => {
+                return Err(LibraryError::ImportFile(format!(
+                    "无法解析 PPTX [Content_Types].xml：{error}"
+                )));
+            }
+            _ => {}
         }
+        buffer.clear();
+    }
+}
+
+fn xml_root_local_name(xml: &[u8], format: &str) -> LibraryResult<String> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                return Ok(element.local_name().as_ref().to_string());
+            }
+            Ok(Event::Eof) => {
+                return Err(LibraryError::ImportFile(format!(
+                    "{format} XML 为空或缺少根节点。"
+                )));
+            }
+            Err(error) => {
+                return Err(LibraryError::ImportFile(format!(
+                    "无法解析 {format} XML：{error}"
+                )));
+            }
+            _ => {}
+        }
+        buffer.clear();
     }
 }
 
@@ -4431,13 +4684,127 @@ fn is_png(bytes: &[u8]) -> bool {
         && u32::from_be_bytes(bytes[20..24].try_into().unwrap_or_default()) > 0
 }
 
+fn is_supported_thumbnail_image(bytes: &[u8]) -> bool {
+    image_dimensions(bytes).is_some_and(|(width, height)| {
+        (160..=4096).contains(&width)
+            && (90..=4096).contains(&height)
+            && (0.5..=3.0).contains(&(width as f64 / height as f64))
+    })
+}
+
+fn decode_validated_thumbnail_data_url(
+    thumbnail_data_url: &str,
+) -> LibraryResult<(&'static str, Vec<u8>)> {
+    let (media_type, encoded) =
+        if let Some(encoded) = thumbnail_data_url.strip_prefix("data:image/jpeg;base64,") {
+            ("image/jpeg", encoded)
+        } else if let Some(encoded) = thumbnail_data_url.strip_prefix("data:image/jpg;base64,") {
+            ("image/jpeg", encoded)
+        } else if let Some(encoded) = thumbnail_data_url.strip_prefix("data:image/png;base64,") {
+            ("image/png", encoded)
+        } else {
+            return Err(LibraryError::Preview(
+                "缩略图必须是 PNG 或 JPEG 图片。".to_string(),
+            ));
+        };
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| LibraryError::Preview("缩略图图片数据无效。".to_string()))?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err(LibraryError::Preview(
+            "缩略图图片超过 2 MB 限制。".to_string(),
+        ));
+    }
+    if !is_supported_thumbnail_image(&bytes) {
+        return Err(LibraryError::Preview(
+            "缩略图必须是尺寸合理的真实 PNG 或 JPEG 图片，不能使用类型图标。".to_string(),
+        ));
+    }
+    Ok((media_type, bytes))
+}
+
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+            return None;
+        }
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return (width > 0 && height > 0).then_some((width, height));
+    }
+    jpeg_dimensions(bytes)
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut cursor = 2_usize;
+    while cursor + 4 <= bytes.len() {
+        if bytes[cursor] != 0xFF {
+            cursor += 1;
+            continue;
+        }
+        while cursor < bytes.len() && bytes[cursor] == 0xFF {
+            cursor += 1;
+        }
+        let marker = *bytes.get(cursor)?;
+        cursor += 1;
+        if marker == 0xD9 || marker == 0xDA {
+            return None;
+        }
+        if matches!(marker, 0x01 | 0xD0..=0xD7) {
+            continue;
+        }
+        let segment_length =
+            u16::from_be_bytes(bytes.get(cursor..cursor + 2)?.try_into().ok()?) as usize;
+        if segment_length < 2 || cursor + segment_length > bytes.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xC0 | 0xC1
+                | 0xC2
+                | 0xC3
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xC9
+                | 0xCA
+                | 0xCB
+                | 0xCD
+                | 0xCE
+                | 0xCF
+        ) {
+            let dimensions = bytes.get(cursor + 2..cursor + segment_length)?;
+            if dimensions.len() < 5 {
+                return None;
+            }
+            let height = u16::from_be_bytes([dimensions[1], dimensions[2]]) as u32;
+            let width = u16::from_be_bytes([dimensions[3], dimensions[4]]) as u32;
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        cursor += segment_length;
+    }
+    None
+}
+
 fn thumbnail_cache_path(thumbnail_dir: &Path, document_id: &str, version: &str) -> PathBuf {
+    thumbnail_cache_path_for(thumbnail_dir, document_id, version, "png")
+}
+
+fn thumbnail_cache_path_for(
+    thumbnail_dir: &Path,
+    document_id: &str,
+    version: &str,
+    extension: &str,
+) -> PathBuf {
     let safe_version = version
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .take(64)
         .collect::<String>();
-    thumbnail_dir.join(format!("{document_id}-{safe_version}.png"))
+    thumbnail_dir.join(format!("{document_id}-{safe_version}.{extension}"))
 }
 
 fn remove_other_thumbnail_versions(thumbnail_dir: &Path, document_id: &str, keep: &Path) {
@@ -4450,7 +4817,10 @@ fn remove_other_thumbnail_versions(thumbnail_dir: &Path, document_id: &str, keep
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if path != keep && name.starts_with(&prefix) && name.ends_with(".png") {
+        if path != keep
+            && name.starts_with(&prefix)
+            && (name.ends_with(".png") || name.ends_with(".jpg"))
+        {
             let _ = fs::remove_file(path);
         }
     }
@@ -4467,7 +4837,7 @@ fn remove_thumbnail_versions(library_root: &Path, document_id: &str) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.starts_with(&prefix) && name.ends_with(".png") {
+        if name.starts_with(&prefix) && (name.ends_with(".png") || name.ends_with(".jpg")) {
             let _ = fs::remove_file(path);
         }
     }
@@ -4656,9 +5026,231 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
     features
 }
 
+fn extract_pptx_text(path: &Path) -> LibraryResult<String> {
+    let archive = fs::read(path)?;
+    extract_pptx_text_from_bytes(&archive).map(|extraction| extraction.text)
+}
+
+fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction> {
+    let mut extraction = PptxExtraction::default();
+    let entry_names = zip_entry_names_for(archive, "PPTX")?;
+    let mut slide_names = entry_names
+        .iter()
+        .filter(|name| {
+            name.starts_with("ppt/slides/") && name.ends_with(".xml") && !name.contains("/_rels/")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    slide_names.sort_by_key(|name| pptx_slide_number(name));
+
+    if slide_names.is_empty() {
+        return Err(LibraryError::Preview(
+            "PPTX 中没有可提取的幻灯片。".to_string(),
+        ));
+    }
+
+    let mut slide_text = Vec::new();
+    for (index, entry_name) in slide_names.iter().enumerate() {
+        match read_zip_entry_for(archive, entry_name, "PPTX")
+            .and_then(|xml| extract_powerpoint_text(&xml, false))
+        {
+            Ok(text) if !text.trim().is_empty() => slide_text.push(text),
+            Ok(_) => {}
+            Err(_) => push_unique_feature(
+                &mut extraction.degraded_features,
+                format!("第 {} 页 XML", index + 1),
+            ),
+        }
+    }
+
+    let mut chart_names = entry_names
+        .iter()
+        .filter(|name| name.starts_with("ppt/charts/") && name.ends_with(".xml"))
+        .cloned()
+        .collect::<Vec<_>>();
+    chart_names.sort();
+    for entry_name in chart_names {
+        match read_zip_entry_for(archive, &entry_name, "PPTX")
+            .and_then(|xml| extract_powerpoint_text(&xml, true))
+        {
+            Ok(text) if !text.trim().is_empty() => slide_text.push(text),
+            Ok(_) => {}
+            Err(_) => push_unique_feature(
+                &mut extraction.degraded_features,
+                "图表标签 XML".to_string(),
+            ),
+        }
+    }
+
+    extraction.text = normalize_extracted_text(&slide_text.join("\n"));
+    if extraction.text.is_empty() {
+        extraction.text = "演示文稿中没有可提取的文本。".to_string();
+    }
+    Ok(extraction)
+}
+
+fn extract_powerpoint_text(xml: &[u8], chart_values: bool) -> LibraryResult<String> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut text = String::new();
+    let mut in_text_node = false;
+    let mut in_chart_value = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) => match element.local_name().as_ref() {
+                "t" => in_text_node = true,
+                "v" if chart_values => in_chart_value = true,
+                "br" => text.push('\n'),
+                "tab" => text.push('\t'),
+                _ => {}
+            },
+            Ok(Event::Empty(element)) => match element.local_name().as_ref() {
+                "br" => text.push('\n'),
+                "tab" => text.push('\t'),
+                _ => {}
+            },
+            Ok(Event::Text(value)) if in_text_node || in_chart_value => {
+                text.push_str(&value.xml_content(quick_xml::XmlVersion::Implicit1_0));
+            }
+            Ok(Event::CData(value)) if in_text_node || in_chart_value => {
+                text.push_str(&value);
+            }
+            Ok(Event::End(element)) => match element.local_name().as_ref() {
+                "t" => in_text_node = false,
+                "v" if chart_values => {
+                    in_chart_value = false;
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                }
+                "p" if !text.ends_with('\n') => text.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                return Err(LibraryError::Preview(format!(
+                    "无法解析 PPTX 文本：{error}"
+                )));
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    Ok(text
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string())
+}
+
+fn pptx_slide_number(name: &str) -> usize {
+    name.rsplit('/')
+        .next()
+        .and_then(|file_name| file_name.strip_prefix("slide"))
+        .and_then(|value| value.strip_suffix(".xml"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn inspect_pptx_degradations(archive: &[u8]) -> Vec<String> {
+    let Ok(entry_names) = zip_entry_names_for(archive, "PPTX") else {
+        return Vec::new();
+    };
+    let mut features = Vec::new();
+
+    for entry_name in entry_names {
+        let lowercase_name = entry_name.to_ascii_lowercase();
+        if lowercase_name.contains("ppt/diagrams/") {
+            push_unique_feature(&mut features, "SmartArt".to_string());
+        }
+        if lowercase_name.contains("ppt/charts/") {
+            push_unique_feature(&mut features, "复杂图表".to_string());
+        }
+        if lowercase_name.contains("ppt/embeddings/") {
+            push_unique_feature(&mut features, "嵌入对象".to_string());
+        }
+        if lowercase_name.ends_with("vbaproject.bin") || lowercase_name.contains("activex") {
+            push_unique_feature(&mut features, "宏或 ActiveX".to_string());
+        }
+
+        if !lowercase_name.ends_with(".rels") {
+            continue;
+        }
+        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "PPTX") else {
+            continue;
+        };
+        let xml_text = String::from_utf8_lossy(&xml);
+        for relationship in xml_text.split("<Relationship").skip(1) {
+            if relationship.contains("TargetMode=\"External\"")
+                && !relationship.contains("/hyperlink\"")
+            {
+                push_unique_feature(&mut features, "远程资源".to_string());
+                break;
+            }
+        }
+    }
+
+    features
+}
+
+fn merge_features(features: &mut Vec<String>, additional: Vec<String>) {
+    for feature in additional {
+        push_unique_feature(features, feature);
+    }
+}
+
+fn push_unique_feature(features: &mut Vec<String>, feature: String) {
+    if !features.iter().any(|candidate| candidate == &feature) {
+        features.push(feature);
+    }
+}
+
 fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
+    zip_entry_names_for(archive, "DOCX")
+}
+
+fn ensure_zip_entries_not_encrypted(archive: &[u8], format: &str) -> LibraryResult<()> {
     let eocd = find_zip_eocd(archive).ok_or_else(|| {
-        LibraryError::Preview("DOCX 文件结构无效：找不到 ZIP 中央目录。".to_string())
+        LibraryError::ImportFile(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
+    })?;
+    let entry_count = read_u16(archive, eocd + 10)? as usize;
+    let mut cursor = read_u32(archive, eocd + 16)? as usize;
+
+    for _ in 0..entry_count {
+        if read_u32(archive, cursor)? != 0x0201_4b50 {
+            return Err(LibraryError::ImportFile(format!(
+                "{format} 文件结构无效：中央目录项损坏。"
+            )));
+        }
+        let flags = read_u16(archive, cursor + 8)?;
+        if flags & 0x0001 != 0 {
+            return Err(LibraryError::ImportFile(format!(
+                "{format} 已加密，无法导入。"
+            )));
+        }
+        let name_length = read_u16(archive, cursor + 28)? as usize;
+        let extra_length = read_u16(archive, cursor + 30)? as usize;
+        let comment_length = read_u16(archive, cursor + 32)? as usize;
+        cursor = cursor
+            .checked_add(46)
+            .and_then(|value| value.checked_add(name_length))
+            .and_then(|value| value.checked_add(extra_length))
+            .and_then(|value| value.checked_add(comment_length))
+            .ok_or_else(|| {
+                LibraryError::ImportFile(format!("{format} 文件结构无效：目录项长度溢出。"))
+            })?;
+    }
+    Ok(())
+}
+
+fn zip_entry_names_for(archive: &[u8], format: &str) -> LibraryResult<Vec<String>> {
+    let eocd = find_zip_eocd(archive).ok_or_else(|| {
+        LibraryError::Preview(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
     })?;
     let entry_count = read_u16(archive, eocd + 10)? as usize;
     let mut cursor = read_u32(archive, eocd + 16)? as usize;
@@ -4666,26 +5258,26 @@ fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
 
     for _ in 0..entry_count {
         if read_u32(archive, cursor)? != 0x0201_4b50 {
-            return Err(LibraryError::Preview(
-                "DOCX 文件结构无效：中央目录项损坏。".to_string(),
-            ));
+            return Err(LibraryError::Preview(format!(
+                "{format} 文件结构无效：中央目录项损坏。"
+            )));
         }
         let name_length = read_u16(archive, cursor + 28)? as usize;
         let extra_length = read_u16(archive, cursor + 30)? as usize;
         let comment_length = read_u16(archive, cursor + 32)? as usize;
         let name_start = cursor + 46;
         let name_end = name_start.checked_add(name_length).ok_or_else(|| {
-            LibraryError::Preview("DOCX 文件结构无效：文件名长度溢出。".to_string())
+            LibraryError::Preview(format!("{format} 文件结构无效：文件名长度溢出。"))
         })?;
         let name = archive.get(name_start..name_end).ok_or_else(|| {
-            LibraryError::Preview("DOCX 文件结构无效：文件名超出文件范围。".to_string())
+            LibraryError::Preview(format!("{format} 文件结构无效：文件名超出文件范围。"))
         })?;
         names.push(String::from_utf8_lossy(name).into_owned());
         cursor = name_end
             .checked_add(extra_length)
             .and_then(|value| value.checked_add(comment_length))
             .ok_or_else(|| {
-                LibraryError::Preview("DOCX 文件结构无效：目录项长度溢出。".to_string())
+                LibraryError::Preview(format!("{format} 文件结构无效：目录项长度溢出。"))
             })?;
     }
 
@@ -4693,17 +5285,21 @@ fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
 }
 
 fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
+    read_zip_entry_for(archive, target_name, "DOCX")
+}
+
+fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> LibraryResult<Vec<u8>> {
     let eocd = find_zip_eocd(archive).ok_or_else(|| {
-        LibraryError::Preview("DOCX 文件结构无效：找不到 ZIP 中央目录。".to_string())
+        LibraryError::Preview(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
     })?;
     let entry_count = read_u16(archive, eocd + 10)? as usize;
     let mut cursor = read_u32(archive, eocd + 16)? as usize;
 
     for _ in 0..entry_count {
         if read_u32(archive, cursor)? != 0x0201_4b50 {
-            return Err(LibraryError::Preview(
-                "DOCX 文件结构无效：中央目录项损坏。".to_string(),
-            ));
+            return Err(LibraryError::Preview(format!(
+                "{format} 文件结构无效：中央目录项损坏。"
+            )));
         }
         let flags = read_u16(archive, cursor + 8)?;
         let compression = read_u16(archive, cursor + 10)?;
@@ -4715,30 +5311,30 @@ fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
         let local_header_offset = read_u32(archive, cursor + 42)? as usize;
         let name_start = cursor + 46;
         let name_end = name_start.checked_add(name_length).ok_or_else(|| {
-            LibraryError::Preview("DOCX 文件结构无效：文件名长度溢出。".to_string())
+            LibraryError::Preview(format!("{format} 文件结构无效：文件名长度溢出。"))
         })?;
         let name = archive.get(name_start..name_end).ok_or_else(|| {
-            LibraryError::Preview("DOCX 文件结构无效：文件名超出文件范围。".to_string())
+            LibraryError::Preview(format!("{format} 文件结构无效：文件名超出文件范围。"))
         })?;
 
         if name == target_name.as_bytes() {
             if flags & 0x0001 != 0 {
-                return Err(LibraryError::Preview(
-                    "DOCX 中的正文内容已加密，无法提取。".to_string(),
-                ));
+                return Err(LibraryError::Preview(format!(
+                    "{format} 中的内容已加密，无法提取。"
+                )));
             }
             if compressed_size == u32::MAX as usize || uncompressed_size == u32::MAX as usize {
-                return Err(LibraryError::Preview(
-                    "暂不支持 ZIP64 格式的 DOCX 文件。".to_string(),
-                ));
+                return Err(LibraryError::Preview(format!(
+                    "暂不支持 ZIP64 格式的 {format} 文件。"
+                )));
             }
 
-            let data_start = zip_local_data_start(archive, local_header_offset)?;
+            let data_start = zip_local_data_start(archive, local_header_offset, format)?;
             let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
-                LibraryError::Preview("DOCX 文件结构无效：正文长度溢出。".to_string())
+                LibraryError::Preview(format!("{format} 文件结构无效：正文长度溢出。"))
             })?;
             let compressed = archive.get(data_start..data_end).ok_or_else(|| {
-                LibraryError::Preview("DOCX 文件结构无效：正文超出文件范围。".to_string())
+                LibraryError::Preview(format!("{format} 文件结构无效：正文超出文件范围。"))
             })?;
             return match compression {
                 0 => Ok(compressed.to_vec()),
@@ -4749,7 +5345,7 @@ fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
                     Ok(output)
                 }
                 method => Err(LibraryError::Preview(format!(
-                    "DOCX 使用了不支持的压缩方式：{method}。"
+                    "{format} 使用了不支持的压缩方式：{method}。"
                 ))),
             };
         }
@@ -4758,13 +5354,13 @@ fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
             .checked_add(extra_length)
             .and_then(|value| value.checked_add(comment_length))
             .ok_or_else(|| {
-                LibraryError::Preview("DOCX 文件结构无效：目录项长度溢出。".to_string())
+                LibraryError::Preview(format!("{format} 文件结构无效：目录项长度溢出。"))
             })?;
     }
 
-    Err(LibraryError::Preview(
-        "DOCX 文件缺少 word/document.xml。".to_string(),
-    ))
+    Err(LibraryError::Preview(format!(
+        "{format} 文件缺少 {target_name}。"
+    )))
 }
 
 fn find_zip_eocd(archive: &[u8]) -> Option<usize> {
@@ -4775,11 +5371,15 @@ fn find_zip_eocd(archive: &[u8]) -> Option<usize> {
         .map(|index| search_start + index)
 }
 
-fn zip_local_data_start(archive: &[u8], local_header_offset: usize) -> LibraryResult<usize> {
+fn zip_local_data_start(
+    archive: &[u8],
+    local_header_offset: usize,
+    format: &str,
+) -> LibraryResult<usize> {
     if read_u32(archive, local_header_offset)? != 0x0403_4b50 {
-        return Err(LibraryError::Preview(
-            "DOCX 文件结构无效：本地文件头损坏。".to_string(),
-        ));
+        return Err(LibraryError::Preview(format!(
+            "{format} 文件结构无效：本地文件头损坏。"
+        )));
     }
     let name_length = read_u16(archive, local_header_offset + 26)? as usize;
     let extra_length = read_u16(archive, local_header_offset + 28)? as usize;
@@ -4787,7 +5387,7 @@ fn zip_local_data_start(archive: &[u8], local_header_offset: usize) -> LibraryRe
         .checked_add(30)
         .and_then(|value| value.checked_add(name_length))
         .and_then(|value| value.checked_add(extra_length))
-        .ok_or_else(|| LibraryError::Preview("DOCX 文件结构无效：本地头长度溢出。".to_string()))
+        .ok_or_else(|| LibraryError::Preview(format!("{format} 文件结构无效：本地头长度溢出。")))
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> LibraryResult<u16> {
@@ -4999,9 +5599,7 @@ fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
         TextExtractionStrategy::DocxText => extract_docx_text(path),
         TextExtractionStrategy::PlainText => read_utf8_text(path),
         TextExtractionStrategy::None => Ok(String::new()),
-        TextExtractionStrategy::PptxTextReserved => Err(LibraryError::UnsupportedFile(
-            "PPTX 正文提取将在后续功能中启用。".to_string(),
-        )),
+        TextExtractionStrategy::PptxText => extract_pptx_text(path),
     }
 }
 

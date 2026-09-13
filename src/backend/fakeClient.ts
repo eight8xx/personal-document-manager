@@ -65,6 +65,10 @@ export interface FakeBackendOptions {
     page?: number
   ) => Promise<DocumentPreview>;
   getDocumentThumbnail?: (documentId: string) => Promise<DocumentThumbnail>;
+  saveDocumentThumbnail?: (
+    documentId: string,
+    thumbnailDataUrl: string
+  ) => Promise<DocumentThumbnail>;
   openDocument?: (documentId: string) => Promise<void>;
   openExternalUrl?: (url: string) => Promise<void>;
   documentContents?: Record<string, string>;
@@ -192,6 +196,12 @@ export class FakeBackendClient implements BackendClient {
   private readonly getDocumentThumbnailImpl:
     | ((documentId: string) => Promise<DocumentThumbnail>)
     | null;
+  private readonly saveDocumentThumbnailImpl:
+    | ((
+        documentId: string,
+        thumbnailDataUrl: string
+      ) => Promise<DocumentThumbnail>)
+    | null;
   private readonly openDocumentImpl:
     | ((documentId: string) => Promise<void>)
     | null;
@@ -255,6 +265,8 @@ export class FakeBackendClient implements BackendClient {
     );
     this.getDocumentPreviewImpl = options.getDocumentPreview ?? null;
     this.getDocumentThumbnailImpl = options.getDocumentThumbnail ?? null;
+    this.saveDocumentThumbnailImpl =
+      options.saveDocumentThumbnail ?? null;
     this.openDocumentImpl = options.openDocument ?? null;
     this.openExternalUrlImpl = options.openExternalUrl ?? null;
     this.documentContents = structuredClone(options.documentContents ?? {});
@@ -768,6 +780,16 @@ export class FakeBackendClient implements BackendClient {
         degradedFeatures: []
       };
     }
+    if (capability.preview === "pptxPages") {
+      return {
+        kind: "pptx",
+        dataUrl:
+          "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==",
+        text: `${document.title} 的提取文本`,
+        notice: "PPTX 版式预览为本地只读近似呈现。",
+        degradedFeatures: []
+      };
+    }
     if (capability.preview === "safeMarkdown") {
       return {
         kind: "markdown",
@@ -811,10 +833,45 @@ export class FakeBackendClient implements BackendClient {
           "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
       };
     }
+    if (capability?.thumbnail === "pptxFirstPage") {
+      return {
+        kind: "fallback",
+        reason: "PPTX 缩略图尚未生成。"
+      };
+    }
     return {
       kind: "fallback",
       reason: `${document.fileType} 使用类型图标。`
     };
+  }
+
+  async saveDocumentThumbnail(
+    documentId: string,
+    thumbnailDataUrl: string
+  ): Promise<DocumentThumbnail> {
+    this.calls.push(`saveDocumentThumbnail:${documentId}`);
+    if (this.saveDocumentThumbnailImpl) {
+      const thumbnail = await this.saveDocumentThumbnailImpl(
+        documentId,
+        thumbnailDataUrl
+      );
+      this.documentThumbnails[documentId] = structuredClone(thumbnail);
+      return structuredClone(thumbnail);
+    }
+
+    this.requireDocument(documentId);
+    if (!/^data:image\/(?:png|jpeg|jpg);base64,/i.test(thumbnailDataUrl)) {
+      throw new BackendError({
+        code: "preview",
+        message: "缩略图必须是 PNG 或 JPEG 图片。"
+      });
+    }
+    const thumbnail: DocumentThumbnail = {
+      kind: "pptx",
+      dataUrl: thumbnailDataUrl
+    };
+    this.documentThumbnails[documentId] = structuredClone(thumbnail);
+    return structuredClone(thumbnail);
   }
 
   async openDocument(documentId: string): Promise<void> {

@@ -768,6 +768,27 @@ pub async fn get_document_thumbnail(
 }
 
 #[tauri::command]
+pub async fn save_document_thumbnail(
+    document_id: String,
+    thumbnail_data_url: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentThumbnail, CommandError> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?
+            .save_document_thumbnail(&document_id, &thumbnail_data_url)
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "thumbnailTask".to_string(),
+        message: format!("缩略图保存任务无法完成：{error}"),
+    })?
+}
+
+#[tauri::command]
 pub fn open_document(document_id: String, state: State<'_, AppState>) -> Result<(), CommandError> {
     open_document_contract(&state, document_id)
 }
@@ -909,6 +930,18 @@ mod tests {
         assert!(preview.get("page").is_some());
         assert!(preview.get("data_url").is_none());
 
+        let pptx = serde_json::to_value(DocumentPreview::Pptx {
+            data_url: "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,AA==".to_string(),
+            text: "幻灯片正文".to_string(),
+            notice: "只读".to_string(),
+            degraded_features: vec!["复杂图表".to_string()],
+        })
+        .unwrap();
+        assert_eq!(pptx["kind"], "pptx");
+        assert!(pptx.get("dataUrl").is_some());
+        assert!(pptx.get("degradedFeatures").is_some());
+        assert!(pptx.get("data_url").is_none());
+
         let thumbnail = serde_json::to_value(DocumentThumbnail::Fallback {
             reason: "使用类型图标。".to_string(),
         })
@@ -928,7 +961,11 @@ mod tests {
         assert_eq!(value[0]["security"]["remoteResources"], "blocked");
         assert_eq!(value[0]["security"]["sourceMutation"], "blocked");
         assert_eq!(value[6]["id"], "pptx");
-        assert_eq!(value[6]["importEnabled"], false);
+        assert_eq!(value[6]["importEnabled"], true);
+        assert_eq!(value[6]["validation"], "pptxPackage");
+        assert_eq!(value[6]["preview"], "pptxPages");
+        assert_eq!(value[6]["thumbnail"], "pptxFirstPage");
+        assert_eq!(value[6]["textExtraction"], "pptxText");
     }
 
     #[test]

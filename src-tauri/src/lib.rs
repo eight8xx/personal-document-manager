@@ -63,6 +63,7 @@ pub fn run() {
             commands::retry_document_index,
             commands::get_document_preview,
             commands::get_document_thumbnail,
+            commands::save_document_thumbnail,
             commands::open_document,
             commands::open_external_url,
             commands::list_document_format_capabilities,

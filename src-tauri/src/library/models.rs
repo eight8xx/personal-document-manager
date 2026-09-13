@@ -188,6 +188,12 @@ pub enum DocumentPreview {
         notice: String,
         degraded_features: Vec<String>,
     },
+    Pptx {
+        data_url: String,
+        text: String,
+        notice: String,
+        degraded_features: Vec<String>,
+    },
     Failure {
         code: String,
         message: String,
@@ -206,6 +212,7 @@ pub enum DocumentPreview {
 pub enum DocumentThumbnail {
     Pdf { data_url: String },
     Image { data_url: String },
+    Pptx { data_url: String },
     Fallback { reason: String },
 }
 

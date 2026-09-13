@@ -106,6 +106,13 @@ export type DocumentPreview =
       degradedFeatures: string[];
     }
   | {
+      kind: "pptx";
+      dataUrl: string;
+      text: string;
+      notice: string;
+      degradedFeatures: string[];
+    }
+  | {
       kind: "failure";
       code: string;
       message: string;
@@ -117,7 +124,7 @@ export type DocumentPreview =
 
 export type DocumentThumbnail =
   | {
-      kind: "pdf" | "image";
+      kind: "pdf" | "image" | "pptx";
       dataUrl: string;
     }
   | {
@@ -157,25 +164,25 @@ export interface DocumentFormatCapability {
     | "plainText"
     | "jpegSignature"
     | "pngSignature"
-    | "officeOpenXmlReserved";
+    | "pptxPackage";
   preview:
     | "pdfPages"
     | "docxLayout"
     | "plainText"
     | "safeMarkdown"
     | "localImage"
-    | "pptxPagesReserved";
+    | "pptxPages";
   thumbnail:
     | "pdfFirstPage"
     | "localImage"
     | "typeIcon"
-    | "pptxFirstPageReserved";
+    | "pptxFirstPage";
   textExtraction:
     | "pdfText"
     | "docxText"
     | "plainText"
     | "none"
-    | "pptxTextReserved";
+    | "pptxText";
   searchable: boolean;
   mediaType: string | null;
   renderer: string;
@@ -367,6 +374,10 @@ export interface BackendClient {
     page?: number
   ): Promise<DocumentPreview>;
   getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail>;
+  saveDocumentThumbnail(
+    documentId: string,
+    thumbnailDataUrl: string
+  ): Promise<DocumentThumbnail>;
   openDocument(documentId: string): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
   listDocumentFormatCapabilities(): Promise<DocumentFormatCapability[]>;

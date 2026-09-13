@@ -22,7 +22,7 @@ pub fn generate_png_thumbnail(
         ThumbnailStrategy::PdfFirstPage => {
             Ok(platform::pdf_page_png(path, 0, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)?.png)
         }
-        ThumbnailStrategy::TypeIcon | ThumbnailStrategy::PptxFirstPageReserved => Err(
+        ThumbnailStrategy::TypeIcon | ThumbnailStrategy::PptxFirstPage => Err(
             LibraryError::Preview(format!("{} 使用类型图标。", capability.display_type)),
         ),
     }

@@ -26,7 +26,7 @@ pub enum ValidationStrategy {
     PlainText,
     JpegSignature,
     PngSignature,
-    OfficeOpenXmlReserved,
+    PptxPackage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub enum PreviewStrategy {
     PlainText,
     SafeMarkdown,
     LocalImage,
-    PptxPagesReserved,
+    PptxPages,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ pub enum ThumbnailStrategy {
     PdfFirstPage,
     LocalImage,
     TypeIcon,
-    PptxFirstPageReserved,
+    PptxFirstPage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +56,7 @@ pub enum TextExtractionStrategy {
     DocxText,
     PlainText,
     None,
-    PptxTextReserved,
+    PptxText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,7 +157,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capability_table_is_complete_unique_and_future_ready() {
+    fn capability_table_is_complete_unique_and_fully_enabled() {
         let capabilities = document_format_capabilities();
         assert_eq!(
             capabilities
@@ -187,8 +187,12 @@ mod tests {
         }
 
         let pptx = capability_for_file_type("PPTX").unwrap();
-        assert!(!pptx.import_enabled);
-        assert_eq!(importable_display_types().len(), 6);
-        assert!(!unsupported_message().contains("PPTX"));
+        assert!(pptx.import_enabled);
+        assert_eq!(pptx.validation, ValidationStrategy::PptxPackage);
+        assert_eq!(pptx.preview, PreviewStrategy::PptxPages);
+        assert_eq!(pptx.thumbnail, ThumbnailStrategy::PptxFirstPage);
+        assert_eq!(pptx.text_extraction, TextExtractionStrategy::PptxText);
+        assert_eq!(importable_display_types().len(), 7);
+        assert!(unsupported_message().contains("PPTX"));
     }
 }

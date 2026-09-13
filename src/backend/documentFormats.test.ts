@@ -20,7 +20,8 @@ describe("文档格式能力表", () => {
       "TXT",
       "Markdown",
       "JPG",
-      "PNG"
+      "PNG",
+      "PPTX"
     ]);
     expect(importableDocumentExtensions).toEqual([
       "pdf",
@@ -30,7 +31,8 @@ describe("文档格式能力表", () => {
       "markdown",
       "jpg",
       "jpeg",
-      "png"
+      "png",
+      "pptx"
     ]);
 
     for (const capability of documentFormatCapabilities) {
@@ -48,8 +50,10 @@ describe("文档格式能力表", () => {
     expect(documentFormatForPath("C:\\Docs\\photo.jpeg")?.displayType).toBe(
       "JPG"
     );
-    expect(documentFormatForPath("C:\\Docs\\slides.pptx")).toBeNull();
+    expect(documentFormatForPath("C:\\Docs\\slides.pptx")?.id).toBe("pptx");
+    expect(documentFormatForPath("C:\\Docs\\legacy.ppt")).toBeNull();
+    expect(documentFormatForPath("C:\\Docs\\macro.pptm")).toBeNull();
     expect(documentFormatForPath("C:\\Docs\\macro.docm")).toBeNull();
-    expect(unsupportedDocumentMessage()).not.toContain("PPTX");
+    expect(unsupportedDocumentMessage()).toContain("PPTX");
   });
 });

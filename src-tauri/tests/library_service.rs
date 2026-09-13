@@ -211,22 +211,62 @@ fn rejects_an_unsupported_file_before_copying_it() {
 }
 
 #[test]
-fn reserves_pptx_without_enabling_import_and_rejects_unsafe_external_urls() {
+fn validates_pptx_packages_and_rejects_encrypted_or_legacy_presentations() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
     let library_dir = root.path().join("Library");
-    let source_path = root.path().join("slides.pptx");
-    fs::write(&source_path, b"PK\x03\x04future presentation").unwrap();
+    let valid_path = root.path().join("slides.pptx");
+    let invalid_path = root.path().join("not-a-presentation.pptx");
+    let encrypted_path = root.path().join("encrypted.pptx");
+    let legacy_path = root.path().join("legacy.ppt");
+    let macro_path = root.path().join("macro.pptm");
+    fs::write(&valid_path, pptx_fixture()).unwrap();
+    fs::write(
+        &invalid_path,
+        stored_zip(&[(
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+        )]),
+    )
+    .unwrap();
+    fs::write(
+        &encrypted_path,
+        [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00],
+    )
+    .unwrap();
+    fs::write(&legacy_path, b"legacy presentation").unwrap();
+    fs::write(&macro_path, b"macro presentation").unwrap();
 
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
 
-    let error = service.import_document(&source_path).unwrap_err();
-    assert_eq!(error.code(), "unsupportedFile");
-    assert!(fs::read_dir(library_dir.join("documents"))
-        .unwrap()
-        .next()
-        .is_none());
+    let imported = service.import_document(&valid_path).unwrap();
+    assert_eq!(imported.file_type, "PPTX");
+
+    let failure = service.import_document(&invalid_path).unwrap_err();
+    assert_eq!(failure.code(), "importFile");
+    assert!(failure.to_string().contains("presentation"));
+
+    let encrypted = service.import_document(&encrypted_path).unwrap_err();
+    assert_eq!(encrypted.code(), "importFile");
+    assert!(encrypted.to_string().contains("加密"));
+
+    let batch = service
+        .start_import(vec![
+            legacy_path.to_string_lossy().into_owned(),
+            macro_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+    assert_eq!(batch.failed_count, 2);
+    assert!(batch.items.iter().all(|item| {
+        item.status == ImportItemStatus::Failed
+            && item.file_type.is_none()
+            && item
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("仅支持"))
+    }));
+    assert_eq!(service.list_documents().unwrap().len(), 1);
 
     let error = service
         .open_external_url("javascript:alert('blocked')")
@@ -243,18 +283,23 @@ fn imports_every_supported_file_type() {
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
 
-    let supported: [(&str, &str, &[u8]); 6] = [
+    let supported: [(&str, &str, &[u8]); 7] = [
         ("report.pdf", "PDF", b"%PDF-1.4\nannual report"),
         ("report.docx", "DOCX", b"PK\x03\x04meeting notes"),
         ("notes.txt", "TXT", b"plain text"),
         ("readme.md", "Markdown", b"project readme"),
         ("scan.jpg", "JPG", b"\xff\xd8\xffscanned page"),
         ("photo.png", "PNG", b"\x89PNG\r\n\x1a\nproject photo"),
+        ("slides.pptx", "PPTX", &[]),
     ];
 
     for (file_name, expected_type, contents) in supported {
         let source_path = root.path().join(file_name);
-        fs::write(&source_path, contents).unwrap();
+        if file_name == "slides.pptx" {
+            fs::write(&source_path, pptx_fixture()).unwrap();
+        } else {
+            fs::write(&source_path, contents).unwrap();
+        }
         let batch = service
             .start_import(vec![source_path.to_string_lossy().into_owned()])
             .unwrap();
@@ -265,6 +310,187 @@ fn imports_every_supported_file_type() {
     }
 
     assert_eq!(service.list_documents().unwrap().len(), supported.len());
+}
+
+#[test]
+fn pptx_extracts_slide_table_group_and_chart_text_without_notes_or_comments() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("quarterly.pptx");
+    let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld
+  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:sp><p:txBody><a:p><a:r><a:t>幻灯片正文</a:t></a:r></a:p></p:txBody></p:sp>
+      <p:graphicFrame><a:graphic><a:graphicData><a:tbl>
+        <a:tr><a:tc><a:txBody><a:p><a:r><a:t>表格文本</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+      </a:tbl></a:graphicData></a:graphic></p:graphicFrame>
+      <p:grpSp><p:sp><p:txBody><a:p><a:r><a:t>组合形状文本</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>"#;
+    let chart_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache>
+    <c:pt><c:v>季度图表标签</c:v></c:pt>
+  </c:strCache></c:strRef></c:tx></c:ser></c:barChart></c:plotArea></c:chart>
+</c:chartSpace>"#;
+    let notes_xml = r#"<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>备注中不应索引的文本</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#;
+    let comments_xml = r#"<p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cm><p:text>批注中不应索引的文本</p:text></p:cm></p:cmLst>"#;
+    fs::write(
+        &source_path,
+        pptx_fixture_with_entries(
+            slide_xml,
+            &[
+                ("ppt/charts/chart1.xml", chart_xml.as_bytes()),
+                ("ppt/notesSlides/notesSlide1.xml", notes_xml.as_bytes()),
+                ("ppt/comments/comment1.xml", comments_xml.as_bytes()),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+
+    let indexed = service.index_pending_documents().unwrap();
+    assert_eq!(indexed.processed, 1);
+    assert_eq!(indexed.searchable, 1);
+    for expected in ["幻灯片正文", "表格文本", "组合形状文本", "季度图表标签"]
+    {
+        let results = search(&service, expected, DocumentSearchFilters::default());
+        assert_eq!(results.len(), 1, "missing indexed PPTX text: {expected}");
+        assert_eq!(results[0].document.id, imported.id);
+        assert_eq!(results[0].match_kind, SearchMatchKind::Content);
+    }
+    assert!(search(
+        &service,
+        "备注中不应索引的文本",
+        DocumentSearchFilters::default()
+    )
+    .is_empty());
+    assert!(search(
+        &service,
+        "批注中不应索引的文本",
+        DocumentSearchFilters::default()
+    )
+    .is_empty());
+}
+
+#[test]
+fn pptx_preview_degrades_a_corrupt_slide_without_losing_the_document() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("damaged-slide.pptx");
+    fs::write(
+        &source_path,
+        pptx_fixture_with_slide(
+            r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld></p:not-slide></p:sld>"#,
+        ),
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+
+    let DocumentPreview::Pptx {
+        text,
+        degraded_features,
+        ..
+    } = service.get_document_preview(&imported.id, None).unwrap()
+    else {
+        panic!("damaged slide should still return a PPTX preview");
+    };
+    assert_eq!(text, "演示文稿中没有可提取的文本。");
+    assert!(degraded_features
+        .iter()
+        .any(|feature| feature.contains("第 1 页")));
+
+    let indexed = service.index_pending_documents().unwrap();
+    assert_eq!(indexed.searchable, 1);
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+}
+
+#[test]
+fn pptx_thumbnail_accepts_only_real_images_and_invalidates_on_hash_change() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("slides.pptx");
+    fs::write(&source_path, pptx_fixture()).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    assert!(matches!(
+        service.get_document_thumbnail(&imported.id).unwrap(),
+        DocumentThumbnail::Fallback { .. }
+    ));
+
+    let invalid = service
+        .save_document_thumbnail(
+            &imported.id,
+            &format!(
+                "data:image/png;base64,{}",
+                BASE64.encode(png_fixture(32, 32))
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(invalid.code(), "preview");
+    assert!(invalid.to_string().contains("类型图标"));
+
+    let thumbnail_data_url = format!(
+        "data:image/png;base64,{}",
+        BASE64.encode(png_fixture(320, 180))
+    );
+    let DocumentThumbnail::Pptx { data_url } = service
+        .save_document_thumbnail(&imported.id, &thumbnail_data_url)
+        .unwrap()
+    else {
+        panic!("valid PPTX thumbnail should be cached as an image");
+    };
+    assert_eq!(data_url, thumbnail_data_url);
+    assert_eq!(
+        png_dimensions(&png_bytes_from_data_url(&data_url)),
+        (320, 180)
+    );
+    let cache_file = only_thumbnail_for(&library_dir.join("thumbnails"), &imported.id);
+    assert!(cache_file.is_file());
+
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    fs::write(
+        &copy,
+        pptx_fixture_with_slide(
+            r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>替换幻灯片</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+        ),
+    )
+    .unwrap();
+    drop(service);
+
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    restarted.index_pending_documents().unwrap();
+    let refreshed = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_ne!(refreshed.content_hash, imported.content_hash);
+    assert!(!cache_file.exists());
+    assert!(matches!(
+        restarted.get_document_thumbnail(&imported.id).unwrap(),
+        DocumentThumbnail::Fallback { .. }
+    ));
 }
 
 #[test]
@@ -2456,6 +2682,45 @@ fn png_prefix() -> &'static [u8] {
         b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
         0x15, 0xC4, 0x89,
     ]
+}
+
+fn pptx_fixture() -> Vec<u8> {
+    pptx_fixture_with_slide(
+        r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>演示文稿正文</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+    )
+}
+
+fn pptx_fixture_with_slide(slide_xml: &str) -> Vec<u8> {
+    pptx_fixture_with_entries(slide_xml, &[])
+}
+
+fn pptx_fixture_with_entries(slide_xml: &str, extras: &[(&str, &[u8])]) -> Vec<u8> {
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>"#;
+    let presentation = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:presentation
+  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>
+</p:presentation>"#;
+    let relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>"#;
+
+    let mut entries: Vec<(&str, &[u8])> = vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("ppt/presentation.xml", presentation.as_bytes()),
+        ("ppt/_rels/presentation.xml.rels", relationships.as_bytes()),
+        ("ppt/slides/slide1.xml", slide_xml.as_bytes()),
+    ];
+    entries.extend_from_slice(extras);
+    stored_zip(&entries)
 }
 
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {

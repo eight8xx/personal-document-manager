@@ -104,6 +104,11 @@ export const tauriBackendClient: BackendClient = {
     invoke<DocumentPreview>("get_document_preview", { documentId, page }),
   getDocumentThumbnail: (documentId) =>
     invoke<DocumentThumbnail>("get_document_thumbnail", { documentId }),
+  saveDocumentThumbnail: (documentId, thumbnailDataUrl) =>
+    invoke<DocumentThumbnail>("save_document_thumbnail", {
+      documentId,
+      thumbnailDataUrl
+    }),
   openDocument: (documentId) =>
     invoke<void>("open_document", { documentId }),
   openExternalUrl: (url) => invoke<void>("open_external_url", { url }),

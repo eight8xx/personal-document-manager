@@ -24,6 +24,7 @@ import type {
   DocumentSummary
 } from "../backend/types";
 import { DocxPreview } from "./DocxPreview";
+import { PptxPreview } from "./PptxPreview";
 import {
   documentStatusPresentation,
   documentTypeIcon,
@@ -165,6 +166,16 @@ function PreviewContent({
   if (preview.kind === "docx") {
     return (
       <DocxPreview
+        client={client}
+        document={document}
+        preview={preview}
+      />
+    );
+  }
+
+  if (preview.kind === "pptx") {
+    return (
+      <PptxPreview
         client={client}
         document={document}
         preview={preview}

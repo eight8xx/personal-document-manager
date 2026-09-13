@@ -3,6 +3,7 @@ import {
   Image as ImageIcon,
   LoaderCircle,
   Pencil,
+  Presentation,
   RotateCcw,
   Trash2
 } from "lucide-react";
@@ -19,8 +20,10 @@ import type {
 import {
   documentSupportsGeneratedThumbnail,
   documentUsesLocalImage,
-  documentUsesPdfPreview
+  documentUsesPdfPreview,
+  documentUsesPptxPreview
 } from "../backend/documentFormats";
+import { PptxThumbnail } from "./PptxPreview";
 
 export interface StatusPresentation {
   label: string;
@@ -136,7 +139,8 @@ function DocumentThumbnailVisual({
 }) {
   const [thumbnail, setThumbnail] = useState<DocumentThumbnail | null>(null);
   const usesGeneratedThumbnail =
-    documentSupportsGeneratedThumbnail(document);
+    documentSupportsGeneratedThumbnail(document) &&
+    !documentUsesPptxPreview(document);
 
   useEffect(() => {
     let active = true;
@@ -175,7 +179,15 @@ function DocumentThumbnailVisual({
     usesGeneratedThumbnail
   ]);
 
-  if (thumbnail?.kind === "image" || thumbnail?.kind === "pdf") {
+  if (documentUsesPptxPreview(document)) {
+    return <PptxThumbnail client={client} document={document} />;
+  }
+
+  if (
+    thumbnail?.kind === "image" ||
+    thumbnail?.kind === "pdf" ||
+    thumbnail?.kind === "pptx"
+  ) {
     return (
       <img
         className="document-grid-thumbnail"
@@ -594,6 +606,9 @@ export function findCollectionName(
 export function documentTypeIcon(document: DocumentSummary) {
   if (documentUsesLocalImage(document)) {
     return ImageIcon;
+  }
+  if (documentUsesPptxPreview(document)) {
+    return Presentation;
   }
   return FileText;
 }

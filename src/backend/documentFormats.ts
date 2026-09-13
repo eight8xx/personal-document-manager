@@ -62,7 +62,17 @@ export function documentSupportsGeneratedThumbnail(
   document: Pick<DocumentSummary, "fileType">
 ) {
   const strategy = documentFormatForType(document.fileType)?.thumbnail;
-  return strategy === "localImage" || strategy === "pdfFirstPage";
+  return (
+    strategy === "localImage" ||
+    strategy === "pdfFirstPage" ||
+    strategy === "pptxFirstPage"
+  );
+}
+
+export function documentUsesPptxPreview(
+  document: Pick<DocumentSummary, "fileType">
+) {
+  return documentFormatForType(document.fileType)?.preview === "pptxPages";
 }
 
 export function unsupportedDocumentMessage() {
