@@ -124,6 +124,84 @@ pub struct DocumentSummary {
     pub last_imported_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportItemStatus {
+    Imported,
+    Duplicate,
+    SourceChanged,
+    Failed,
+    Ignored,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportDecision {
+    UseExisting,
+    ImportAnyway,
+    Cancel,
+    CreateNew,
+    ReplaceExisting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportItemResult {
+    pub item_id: String,
+    pub source_path: String,
+    pub file_name: String,
+    pub file_type: Option<String>,
+    pub status: ImportItemStatus,
+    pub document_id: Option<String>,
+    pub duplicate_document_id: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_message: Option<String>,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportBatch {
+    pub batch_id: String,
+    pub items: Vec<ImportItemResult>,
+    pub imported_count: i64,
+    pub duplicate_count: i64,
+    pub source_changed_count: i64,
+    pub failed_count: i64,
+    pub ignored_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgress {
+    pub batch_id: String,
+    pub total: usize,
+    pub completed: usize,
+    pub current_file_name: Option<String>,
+    pub current_source_path: Option<String>,
+    pub item: Option<ImportItemResult>,
+    pub finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionSummary {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub is_inbox: bool,
+    pub document_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionDeleteResult {
+    pub collection_id: String,
+    pub target_collection_id: String,
+    pub moved_document_count: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LibraryMetadata {

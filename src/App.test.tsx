@@ -215,7 +215,7 @@ describe("App", () => {
 
     expect(await screen.findByText("项目说明")).toBeInTheDocument();
     expect(screen.getByText("等待索引")).toBeInTheDocument();
-    expect(screen.getByText("项目说明.md")).toBeInTheDocument();
+    expect((await screen.findAllByText("项目说明.md")).length).toBeGreaterThan(0);
     expect(client.calls).toContain(
       `import:${importedDocument.sourcePath}`
     );
@@ -265,10 +265,12 @@ describe("App", () => {
       resolveDocuments?.([]);
     });
 
-    expect(await screen.findByText("项目说明")).toBeInTheDocument();
+    expect(
+      (await screen.findAllByText("项目说明.md")).length
+    ).toBeGreaterThan(0);
   });
 
-  it("shows a clear error when the selected file type is unsupported", async () => {
+  it("shows an item failure when the selected file type is unsupported", async () => {
     const user = userEvent.setup();
     const client = new FakeBackendClient({
       bootstrap: bootstrapWithLibrary(),
@@ -283,9 +285,13 @@ describe("App", () => {
       within(emptyLibrary).getByRole("button", { name: "导入文档" })
     );
 
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG");
-    expect(screen.queryByText("installer.exe")).not.toBeInTheDocument();
+    expect(await screen.findByText("导入失败")).toBeInTheDocument();
+    expect(
+      screen.getByText(/仅支持 PDF、DOCX、TXT、Markdown、JPG 和 PNG/)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("main", { name: "文档列表" })
+    ).not.toBeInTheDocument();
   });
 
   it("shows a retryable state when document processing fails", async () => {
@@ -308,7 +314,7 @@ describe("App", () => {
     expect(screen.getByText("处理失败，等待重试")).toBeInTheDocument();
   });
 
-  it("shows a clear error when more than one file is dropped", async () => {
+  it("imports multiple dropped files as one batch", async () => {
     const client = new FakeBackendClient({
       bootstrap: bootstrapWithLibrary()
     });
@@ -320,9 +326,12 @@ describe("App", () => {
       "C:\\Documents\\第二份.md"
     ]);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "一次只能导入一个文件"
+    expect(
+      (await screen.findAllByText("项目说明.md")).length
+    ).toBeGreaterThan(0);
+    expect(screen.getAllByText("第二份.md").length).toBeGreaterThan(0);
+    expect(client.calls).toContain(
+      `startImport:${importedDocument.sourcePath}|C:\\Documents\\第二份.md`
     );
-    expect(client.calls.some((call) => call.startsWith("import:"))).toBe(false);
   });
 });

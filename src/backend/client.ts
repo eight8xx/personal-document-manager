@@ -1,11 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
   BackendClient,
   BootstrapState,
+  CollectionDeleteResult,
+  CollectionSummary,
   DocumentSummary,
+  ImportBatch,
+  ImportDecision,
+  ImportItemResult,
+  ImportProgress,
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary
@@ -48,8 +55,48 @@ export const tauriBackendClient: BackendClient = {
     });
     return typeof selected === "string" ? selected : null;
   },
+  pickDocumentFiles: async () => {
+    const selected = await open({
+      directory: false,
+      multiple: true,
+      title: "选择要导入的文档",
+      filters: [
+        {
+          name: "支持的文档",
+          extensions: [
+            "pdf",
+            "docx",
+            "txt",
+            "md",
+            "markdown",
+            "jpg",
+            "jpeg",
+            "png"
+          ]
+        }
+      ]
+    });
+    return Array.isArray(selected) ? selected : [];
+  },
+  pickDocumentFolder: async () => {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "选择要导入的文件夹"
+    });
+    return typeof selected === "string" ? selected : null;
+  },
   importDocument: (path) =>
     invoke<DocumentSummary>("import_document", { path }),
+  startImport: (paths) => invoke<ImportBatch>("start_import", { paths }),
+  resolveImportItem: (itemId, decision) =>
+    invoke<ImportItemResult>("resolve_import_item", { itemId, decision }),
+  retryImportItem: (itemId) =>
+    invoke<ImportItemResult>("retry_import_item", { itemId }),
+  subscribeToImportProgress: async (handler) =>
+    listen<ImportProgress>("import-progress", (event) => {
+      handler(event.payload);
+    }),
   listDocuments: () => invoke<DocumentSummary[]>("list_documents"),
   subscribeToFileDrops: async (handler) =>
     getCurrentWebview().onDragDropEvent((event) => {
@@ -62,5 +109,25 @@ export const tauriBackendClient: BackendClient = {
   forgetRecentLibrary: (path) =>
     invoke<RecentLibrary[]>("forget_recent_library", { path }),
   openLibraryDirectory: (path) =>
-    invoke<void>("open_library_directory", { path })
+    invoke<void>("open_library_directory", { path }),
+  listCollections: () => invoke<CollectionSummary[]>("list_collections"),
+  createCollection: (name, parentId) =>
+    invoke<CollectionSummary>("create_collection", { name, parentId }),
+  renameCollection: (collectionId, name) =>
+    invoke<CollectionSummary>("rename_collection", {
+      collectionId,
+      name
+    }),
+  moveCollection: (collectionId, parentId) =>
+    invoke<CollectionSummary>("move_collection", {
+      collectionId,
+      parentId
+    }),
+  deleteCollection: (collectionId) =>
+    invoke<CollectionDeleteResult>("delete_collection", { collectionId }),
+  moveDocumentToCollection: (documentId, collectionId) =>
+    invoke<DocumentSummary>("move_document_to_collection", {
+      documentId,
+      collectionId
+    })
 };

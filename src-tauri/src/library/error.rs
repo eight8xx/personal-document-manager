@@ -24,6 +24,18 @@ pub enum LibraryError {
     UnsupportedFile(String),
     #[error("{0}")]
     ImportFile(String),
+    #[error("{0}")]
+    ImportItemNotFound(String),
+    #[error("{0}")]
+    InvalidImportDecision(String),
+    #[error("{0}")]
+    InvalidCollection(String),
+    #[error("{0}")]
+    CollectionNotFound(String),
+    #[error("{0}")]
+    ProtectedCollection(String),
+    #[error("{0}")]
+    CollectionCycle(String),
     #[error("无法打开目录：{0}")]
     OpenDirectory(String),
     #[error("资料库状态锁已损坏")]
@@ -42,6 +54,12 @@ impl LibraryError {
             Self::NoCurrentLibrary => "noCurrentLibrary",
             Self::UnsupportedFile(_) => "unsupportedFile",
             Self::ImportFile(_) => "importFile",
+            Self::ImportItemNotFound(_) => "importItemNotFound",
+            Self::InvalidImportDecision(_) => "invalidImportDecision",
+            Self::InvalidCollection(_) => "invalidCollection",
+            Self::CollectionNotFound(_) => "collectionNotFound",
+            Self::ProtectedCollection(_) => "protectedCollection",
+            Self::CollectionCycle(_) => "collectionCycle",
             Self::OpenDirectory(_) => "openDirectory",
             Self::StateLock => "stateLock",
         }
