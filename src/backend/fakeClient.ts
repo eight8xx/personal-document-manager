@@ -801,13 +801,15 @@ export class FakeBackendClient implements BackendClient {
     if (document.fileType === "PDF") {
       return {
         kind: "pdf",
-        dataUrl: "data:application/pdf;base64,JVBERi0xLjQ="
+        dataUrl:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
       };
     }
     if (document.fileType === "JPG" || document.fileType === "PNG") {
       return {
         kind: "image",
-        dataUrl: "data:image/png;base64,iVBORw0KGgo="
+        dataUrl:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
       };
     }
     return {

@@ -1,9 +1,11 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use personal_document_manager_lib::library::{
     BatchDocumentItemStatus, BatchDocumentOperation, BatchDocumentOperationRequest,
     DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus,
@@ -1209,32 +1211,67 @@ fn generates_thumbnails_and_reports_missing_library_copies_without_changing_stat
     let state_dir = root.path().join("app-state");
     let library_dir = root.path().join("Library");
     let image_path = root.path().join("pixel.png");
+    let corrupt_image_path = root.path().join("corrupt.png");
     let pdf_path = root.path().join("report.pdf");
+    let source_image = png_fixture(800, 600);
+    fs::write(&image_path, &source_image).unwrap();
     fs::write(
-        &image_path,
-        [
-            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
-            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89,
-        ],
+        &corrupt_image_path,
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01],
     )
     .unwrap();
-    fs::write(&pdf_path, b"%PDF-1.4\n%%EOF").unwrap();
+    fs::write(&pdf_path, valid_pdf()).unwrap();
 
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
     let image = service.import_document(&image_path).unwrap();
+    let corrupt_image = service.import_document(&corrupt_image_path).unwrap();
     let pdf = service.import_document(&pdf_path).unwrap();
 
-    let DocumentThumbnail::Image { data_url } = service.get_document_thumbnail(&image.id).unwrap()
+    let DocumentThumbnail::Image {
+        data_url: image_url,
+    } = service.get_document_thumbnail(&image.id).unwrap()
     else {
         panic!("image thumbnail should be available");
     };
-    assert!(data_url.starts_with("data:image/png;base64,"));
-    assert!(matches!(
-        service.get_document_thumbnail(&pdf.id).unwrap(),
-        DocumentThumbnail::Pdf { .. }
-    ));
+    assert!(image_url.starts_with("data:image/png;base64,"));
+    let image_thumbnail = png_bytes_from_data_url(&image_url);
+    assert_eq!(png_dimensions(&image_thumbnail), (320, 240));
+    assert!(image_thumbnail.len() < source_image.len());
+
+    let thumbnail_dir = library_dir.join("thumbnails");
+    let image_cache_file = only_thumbnail_for(&thumbnail_dir, &image.id);
+    let first_modified = fs::metadata(&image_cache_file).unwrap().modified().unwrap();
+    let DocumentThumbnail::Image {
+        data_url: cached_url,
+    } = service.get_document_thumbnail(&image.id).unwrap()
+    else {
+        panic!("cached image thumbnail should be available");
+    };
+    assert_eq!(cached_url, image_url);
+    assert_eq!(
+        fs::metadata(&image_cache_file).unwrap().modified().unwrap(),
+        first_modified
+    );
+
+    let DocumentThumbnail::Pdf { data_url: pdf_url } =
+        service.get_document_thumbnail(&pdf.id).unwrap()
+    else {
+        panic!("PDF first-page thumbnail should be available");
+    };
+    assert!(pdf_url.starts_with("data:image/png;base64,"));
+    assert!(!pdf_url.starts_with("data:application/pdf"));
+    let pdf_thumbnail = png_bytes_from_data_url(&pdf_url);
+    let (pdf_width, pdf_height) = png_dimensions(&pdf_thumbnail);
+    assert!(pdf_width <= 320 && pdf_height <= 240);
+    assert!(pdf_width > 0 && pdf_height > 0);
+    assert!(only_thumbnail_for(&thumbnail_dir, &pdf.id).is_file());
+    let DocumentThumbnail::Fallback { reason } =
+        service.get_document_thumbnail(&corrupt_image.id).unwrap()
+    else {
+        panic!("corrupt image should fall back to a type icon");
+    };
+    assert!(reason.contains("无法生成缩略图"));
 
     let documents_before = service.list_documents().unwrap();
     let image_copy = library_dir
@@ -2294,6 +2331,91 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     push_u32(&mut archive, central_offset);
     push_u16(&mut archive, 0);
     archive
+}
+
+fn png_fixture(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        let mut pixels = vec![0_u8; (width * height * 3) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = ((y * width + x) * 3) as usize;
+                pixels[offset] = (x % 251) as u8;
+                pixels[offset + 1] = (y % 241) as u8;
+                pixels[offset + 2] = ((x + y) % 239) as u8;
+            }
+        }
+        writer.write_image_data(&pixels).unwrap();
+    }
+    bytes
+}
+
+fn valid_pdf() -> Vec<u8> {
+    let content = b"BT /F1 24 Tf 36 100 Td (PDF page) Tj ET";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            String::from_utf8_lossy(content)
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0_usize];
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+fn png_bytes_from_data_url(data_url: &str) -> Vec<u8> {
+    let (_, encoded) = data_url.split_once(',').unwrap();
+    BASE64.decode(encoded).unwrap()
+}
+
+fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
+    (
+        u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+        u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+    )
+}
+
+fn only_thumbnail_for(thumbnail_dir: &Path, document_id: &str) -> PathBuf {
+    let prefix = format!("{document_id}-");
+    let matches = fs::read_dir(thumbnail_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".png"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1);
+    matches[0].clone()
 }
 
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {

@@ -2303,6 +2303,7 @@ dependencies = [
  "chrono",
  "flate2",
  "open",
+ "png 0.17.16",
  "quick-xml",
  "rusqlite",
  "serde",
@@ -2314,6 +2315,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
+ "windows",
 ]
 
 [[package]]

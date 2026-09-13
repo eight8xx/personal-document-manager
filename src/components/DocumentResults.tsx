@@ -161,26 +161,14 @@ function DocumentThumbnailVisual({
     };
   }, [client, document.id, usesGeneratedThumbnail]);
 
-  if (thumbnail?.kind === "image") {
+  if (thumbnail?.kind === "image" || thumbnail?.kind === "pdf") {
     return (
       <img
         className="document-grid-thumbnail"
         src={thumbnail.dataUrl}
         alt=""
-        onError={() =>
-          setThumbnail({ kind: "fallback", reason: "无法显示缩略图。" })
-        }
-      />
-    );
-  }
-
-  if (thumbnail?.kind === "pdf") {
-    return (
-      <iframe
-        className="document-grid-thumbnail document-grid-pdf-thumbnail"
-        title=""
-        tabIndex={-1}
-        src={`${thumbnail.dataUrl.split("#", 1)[0]}#page=1&zoom=page-width&toolbar=0&navpanes=0`}
+        data-thumbnail-kind={thumbnail.kind}
+        draggable={false}
         onError={() =>
           setThumbnail({ kind: "fallback", reason: "无法显示缩略图。" })
         }

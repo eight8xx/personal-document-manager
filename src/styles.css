@@ -1785,10 +1785,6 @@ p {
   object-fit: cover;
 }
 
-.document-grid-pdf-thumbnail {
-  pointer-events: none;
-}
-
 .document-grid-select > strong {
   min-height: 38px;
   display: -webkit-box;

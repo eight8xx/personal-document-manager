@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import { BackendError } from "./backend/error";
@@ -59,12 +59,33 @@ const documents = [
   documentFor("docx", "会议记录", "DOCX")
 ];
 
+const originalCreateObjectUrl = URL.createObjectURL;
+const originalRevokeObjectUrl = URL.revokeObjectURL;
+
 afterEach(() => {
   window.sessionStorage.clear();
+  if (originalCreateObjectUrl) {
+    URL.createObjectURL = originalCreateObjectUrl;
+  } else {
+    delete (URL as Partial<typeof URL>).createObjectURL;
+  }
+  if (originalRevokeObjectUrl) {
+    URL.revokeObjectURL = originalRevokeObjectUrl;
+  } else {
+    delete (URL as Partial<typeof URL>).revokeObjectURL;
+  }
 });
 
 describe("文档预览与外部打开", () => {
   it("shows loading and renders PDF, image, text, Markdown and DOCX previews", async () => {
+    let objectUrlSequence = 0;
+    const createObjectURL = vi.fn(
+      () => `blob:controlled-pdf-${(objectUrlSequence += 1)}`
+    );
+    const revokeObjectURL = vi.fn();
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+
     let resolvePreview:
       | ((value: Awaited<ReturnType<FakeBackendClient["getDocumentPreview"]>>) => void)
       | undefined;
@@ -109,6 +130,12 @@ describe("文档预览与外部打开", () => {
     });
 
     const pdfFrame = await screen.findByTitle("年度报告 PDF 预览");
+    await waitFor(() => {
+      expect(pdfFrame).toHaveAttribute(
+        "src",
+        expect.stringContaining("blob:controlled-pdf-1#page=1")
+      );
+    });
     expect(pdfFrame).toHaveAttribute(
       "src",
       expect.stringContaining("#page=1")
@@ -116,15 +143,23 @@ describe("文档预览与外部打开", () => {
     await user.click(screen.getByRole("button", { name: "PDF 下一页" }));
     expect(screen.getByTitle("年度报告 PDF 预览")).toHaveAttribute(
       "src",
-      expect.stringContaining("#page=2")
+      expect.stringContaining("blob:controlled-pdf-2#page=2")
     );
     expect(screen.getByText("第 2 页 / 3")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:controlled-pdf-1");
+    });
+    expect(screen.getAllByTitle("年度报告 PDF 预览")).toHaveLength(1);
 
     await user.click(
       screen.getByRole("button", { name: "选择文档 扫描图" })
     );
     const image = await screen.findByRole("img", { name: "扫描图 预览" });
     expect(image).toHaveAttribute("src", expect.stringContaining("image/png"));
+    await waitFor(() => {
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:controlled-pdf-2");
+    });
+    expect(screen.queryByTitle("年度报告 PDF 预览")).not.toBeInTheDocument();
 
     await user.click(
       screen.getByRole("button", { name: "选择文档 纯文本" })
@@ -186,6 +221,37 @@ describe("文档预览与外部打开", () => {
       })
     );
     expect(client.calls).toContain("openDocument:pdf");
+  });
+
+  it("renders generated image data for PDF and image thumbnails and unmounts them with the grid", async () => {
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: documents.slice(0, 2)
+    });
+    const user = userEvent.setup();
+    const { container } = render(<App client={client} />);
+    await screen.findByText("年度报告");
+
+    await user.click(screen.getByRole("button", { name: "网格视图" }));
+    await waitFor(() => {
+      expect(
+        container.querySelectorAll(".document-grid-thumbnail")
+      ).toHaveLength(2);
+    });
+    const thumbnails = Array.from(
+      container.querySelectorAll<HTMLImageElement>(".document-grid-thumbnail")
+    );
+    expect(thumbnails.map((thumbnail) => thumbnail.dataset.thumbnailKind)).toEqual([
+      "pdf",
+      "image"
+    ]);
+    for (const thumbnail of thumbnails) {
+      expect(thumbnail.src).toContain("data:image/png");
+    }
+    expect(container.querySelector("iframe")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "列表视图" }));
+    expect(container.querySelector(".document-grid-thumbnail")).not.toBeInTheDocument();
   });
 
   it("uses one consistent type icon for DOCX, TXT and Markdown in the grid", async () => {

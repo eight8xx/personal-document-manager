@@ -31,6 +31,7 @@ use super::models::{
     IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
     RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary, TrashDocumentSummary,
 };
+use super::thumbnail;
 
 const FORMAT_VERSION: u32 = 1;
 const INTERNAL_DIR: &str = ".pdm";
@@ -73,9 +74,11 @@ struct PendingImport {
 }
 
 struct StoredDocumentFile {
+    id: String,
     file_name: String,
     file_type: String,
     library_path: String,
+    content_hash: Option<String>,
 }
 
 struct StoredDocumentIndex {
@@ -2306,16 +2309,18 @@ impl LibraryService {
             .connection
             .query_row(
                 "
-                SELECT file_name, file_type, library_path
+                SELECT id, file_name, file_type, library_path
                 FROM documents
                 WHERE id = ?1 AND deleted_at IS NOT NULL
                 ",
                 params![document_id],
                 |row| {
                     Ok(StoredDocumentFile {
-                        file_name: row.get(0)?,
-                        file_type: row.get(1)?,
-                        library_path: row.get(2)?,
+                        id: row.get(0)?,
+                        file_name: row.get(1)?,
+                        file_type: row.get(2)?,
+                        library_path: row.get(3)?,
+                        content_hash: None,
                     })
                 },
             )
@@ -2357,6 +2362,7 @@ impl LibraryService {
             // is safe and is reconciled the next time the library is opened.
             let _ = remove_library_copy(&tombstone_path);
         }
+        remove_thumbnail_versions(Path::new(&library.summary.path), document_id);
         Ok(())
     }
 
@@ -2858,12 +2864,17 @@ impl LibraryService {
         let path = self.document_copy_path(&stored)?;
 
         let result = match stored.file_type.as_str() {
-            "PDF" => fs::read(&path).map(|bytes| DocumentThumbnail::Pdf {
-                data_url: data_url("application/pdf", &bytes),
-            }),
-            "JPG" | "PNG" => fs::read(&path).map(|bytes| DocumentThumbnail::Image {
-                data_url: data_url(image_media_type(&stored.file_type), &bytes),
-            }),
+            "PDF" => self
+                .thumbnail_png(&stored, &path)
+                .map(|bytes| DocumentThumbnail::Pdf {
+                    data_url: data_url("image/png", &bytes),
+                }),
+            "JPG" | "PNG" => {
+                self.thumbnail_png(&stored, &path)
+                    .map(|bytes| DocumentThumbnail::Image {
+                        data_url: data_url("image/png", &bytes),
+                    })
+            }
             _ => {
                 return Ok(DocumentThumbnail::Fallback {
                     reason: format!("{} 使用类型图标。", stored.file_type),
@@ -2874,6 +2885,44 @@ impl LibraryService {
         Ok(result.unwrap_or_else(|error| DocumentThumbnail::Fallback {
             reason: format!("无法生成缩略图：{error}"),
         }))
+    }
+
+    fn thumbnail_png(&self, stored: &StoredDocumentFile, path: &Path) -> LibraryResult<Vec<u8>> {
+        ensure_document_copy_exists(path)?;
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let thumbnail_dir = Path::new(&library.summary.path).join(THUMBNAILS_DIR);
+        let version = match stored.content_hash.as_deref() {
+            Some(hash) if !hash.is_empty() => hash.to_string(),
+            _ => sha256_file(path)?,
+        };
+        let cache_path = thumbnail_cache_path(&thumbnail_dir, &stored.id, &version);
+
+        if let Ok(bytes) = fs::read(&cache_path) {
+            if is_png(&bytes) {
+                return Ok(bytes);
+            }
+            let _ = fs::remove_file(&cache_path);
+        }
+
+        let generated = thumbnail::generate_png_thumbnail(path, &stored.file_type)?;
+        if !is_png(&generated) {
+            return Err(LibraryError::Preview(
+                "缩略图生成器没有返回有效 PNG。".to_string(),
+            ));
+        }
+
+        fs::create_dir_all(&thumbnail_dir)?;
+        let temporary_path = cache_path.with_extension("png.tmp");
+        fs::write(&temporary_path, &generated)?;
+        if let Err(error) = fs::rename(&temporary_path, &cache_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error.into());
+        }
+        remove_other_thumbnail_versions(&thumbnail_dir, &stored.id, &cache_path);
+        Ok(generated)
     }
 
     pub fn open_document(&self, document_id: &str) -> LibraryResult<()> {
@@ -2964,16 +3013,18 @@ impl LibraryService {
             .connection
             .query_row(
                 "
-                SELECT file_name, file_type, library_path
+                SELECT id, file_name, file_type, library_path, content_hash
                 FROM documents
                 WHERE id = ?1 AND deleted_at IS NULL
                 ",
                 params![document_id],
                 |row| {
                     Ok(StoredDocumentFile {
-                        file_name: row.get(0)?,
-                        file_type: row.get(1)?,
-                        library_path: row.get(2)?,
+                        id: row.get(0)?,
+                        file_name: row.get(1)?,
+                        file_type: row.get(2)?,
+                        library_path: row.get(3)?,
+                        content_hash: row.get(4)?,
                     })
                 },
             )
@@ -4246,6 +4297,56 @@ fn image_media_type(file_type: &str) -> &'static str {
         "JPG" => "image/jpeg",
         "PNG" => "image/png",
         _ => "application/octet-stream",
+    }
+}
+
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.len() >= 24
+        && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        && &bytes[12..16] == b"IHDR"
+        && u32::from_be_bytes(bytes[16..20].try_into().unwrap_or_default()) > 0
+        && u32::from_be_bytes(bytes[20..24].try_into().unwrap_or_default()) > 0
+}
+
+fn thumbnail_cache_path(thumbnail_dir: &Path, document_id: &str, version: &str) -> PathBuf {
+    let safe_version = version
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(64)
+        .collect::<String>();
+    thumbnail_dir.join(format!("{document_id}-{safe_version}.png"))
+}
+
+fn remove_other_thumbnail_versions(thumbnail_dir: &Path, document_id: &str, keep: &Path) {
+    let Ok(entries) = fs::read_dir(thumbnail_dir) else {
+        return;
+    };
+    let prefix = format!("{document_id}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path != keep && name.starts_with(&prefix) && name.ends_with(".png") {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn remove_thumbnail_versions(library_root: &Path, document_id: &str) {
+    let thumbnail_dir = library_root.join(THUMBNAILS_DIR);
+    let Ok(entries) = fs::read_dir(&thumbnail_dir) else {
+        return;
+    };
+    let prefix = format!("{document_id}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".png") {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 

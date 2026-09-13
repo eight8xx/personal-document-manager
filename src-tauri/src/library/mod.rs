@@ -1,6 +1,7 @@
 mod error;
 mod models;
 mod service;
+mod thumbnail;
 
 pub use error::{LibraryError, LibraryResult};
 pub use models::{

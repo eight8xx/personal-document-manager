@@ -722,21 +722,23 @@ fn get_document_preview_contract(
 }
 
 #[tauri::command]
-pub fn get_document_thumbnail(
+pub async fn get_document_thumbnail(
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentThumbnail, CommandError> {
-    get_document_thumbnail_contract(&state, document_id)
-}
-
-fn get_document_thumbnail_contract(
-    state: &AppState,
-    document_id: String,
-) -> Result<DocumentThumbnail, CommandError> {
-    state
-        .service()?
-        .get_document_thumbnail(&document_id)
-        .map_err(CommandError::from)
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?
+            .get_document_thumbnail(&document_id)
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "thumbnailTask".to_string(),
+        message: format!("缩略图任务无法完成：{error}"),
+    })?
 }
 
 #[tauri::command]

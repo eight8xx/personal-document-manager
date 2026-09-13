@@ -41,6 +41,64 @@ function pdfPreviewUrl(dataUrl: string, page: number) {
   return `${dataUrl.split("#", 1)[0]}#page=${page}&zoom=page-width&view=FitH`;
 }
 
+function pdfBlobFromDataUrl(dataUrl: string) {
+  const [header, payload] = dataUrl.split(",", 2);
+  if (!header || !payload || !header.includes(";base64")) {
+    return null;
+  }
+  try {
+    const binary = window.atob(payload);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return new Blob([bytes], { type: "application/pdf" });
+  } catch {
+    return null;
+  }
+}
+
+function ControlledPdfFrame({
+  dataUrl,
+  documentId,
+  page,
+  title
+}: {
+  dataUrl: string;
+  documentId: string;
+  page: number;
+  title: string;
+}) {
+  const [source, setSource] = useState(() => pdfPreviewUrl(dataUrl, page));
+
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let nextSource = pdfPreviewUrl(dataUrl, page);
+    if (typeof URL.createObjectURL === "function") {
+      const blob = pdfBlobFromDataUrl(dataUrl);
+      if (blob) {
+        objectUrl = URL.createObjectURL(blob);
+        nextSource = pdfPreviewUrl(objectUrl, page);
+      }
+    }
+    setSource(nextSource);
+    return () => {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [dataUrl, page]);
+
+  return (
+    <iframe
+      key={`${documentId}:${page}`}
+      className="pdf-preview-frame"
+      title={`${title} PDF 预览`}
+      src={source}
+    />
+  );
+}
+
 function PreviewContent({
   preview,
   document,
@@ -84,10 +142,11 @@ function PreviewContent({
             </button>
           </div>
         </div>
-        <iframe
-          className="pdf-preview-frame"
-          title={`${document.title} PDF 预览`}
-          src={pdfPreviewUrl(preview.dataUrl, page)}
+        <ControlledPdfFrame
+          dataUrl={preview.dataUrl}
+          documentId={document.id}
+          page={page}
+          title={document.title}
         />
       </div>
     );
