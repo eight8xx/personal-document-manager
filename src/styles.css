@@ -777,17 +777,122 @@ p {
   gap: 8px;
 }
 
-.search-placeholder {
+.search-form {
   width: 230px;
   height: 36px;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 11px;
+  padding: 0 7px 0 11px;
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text-muted);
+  background: var(--surface);
+}
+
+.search-form:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.search-form > svg {
+  flex: 0 0 auto;
+}
+
+.search-form input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
   font-size: 13px;
+}
+
+.search-form input::placeholder {
+  color: var(--text-muted);
+}
+
+.filter-button {
+  min-width: 76px;
+}
+
+.filter-button.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.filter-count {
+  min-width: 17px;
+  height: 17px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--surface);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.indexing-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent-strong);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.search-filter-panel {
+  display: grid;
+  grid-template-columns:
+    minmax(140px, 1fr) minmax(140px, 1fr) minmax(120px, 0.8fr)
+    minmax(140px, 1fr) minmax(140px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  padding: 11px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.filter-field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.filter-field select,
+.filter-field input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.filter-field select:focus-visible,
+.filter-field input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.clear-filters {
+  min-width: 104px;
+  height: 34px;
 }
 
 .import-button {
@@ -997,6 +1102,39 @@ p {
   display: grid;
   place-items: center;
   color: var(--accent);
+}
+
+.search-loading-state,
+.search-error-state {
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 32px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.search-loading-state {
+  color: var(--accent);
+}
+
+.search-error-state {
+  color: var(--danger);
+}
+
+.search-error-state strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.search-error-state span {
+  max-width: 420px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .empty-library {
@@ -1221,6 +1359,10 @@ p {
   font-size: 12px;
 }
 
+.document-title-copy > .document-match-snippet {
+  color: var(--accent-strong);
+}
+
 .document-type,
 .document-date {
   overflow: hidden;
@@ -1257,6 +1399,23 @@ p {
 
 .status-badge.danger {
   background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.document-status-cell {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.document-status-cell .status-badge {
+  min-width: 0;
+  flex: 1;
+}
+
+.retry-index {
+  flex: 0 0 auto;
   color: var(--danger);
 }
 
@@ -1353,6 +1512,7 @@ p {
 }
 
 .document-grid-item {
+  position: relative;
   height: 236px;
   min-height: 236px;
   max-height: 236px;
@@ -1492,6 +1652,16 @@ p {
 .document-grid .status-badge {
   min-height: 23px;
   flex: 0 0 auto;
+}
+
+.grid-retry-index {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 2;
+  border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--border));
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  color: var(--danger);
 }
 
 .details-panel {
@@ -1682,6 +1852,13 @@ p {
 .details-status h3 {
   color: var(--text);
   font-size: 13px;
+}
+
+.details-status-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
 }
 
 .detail-preview {
@@ -2173,7 +2350,7 @@ p {
 }
 
 @media (max-width: 1380px) {
-  .search-placeholder {
+  .search-form {
     width: 186px;
   }
 }
@@ -2192,9 +2369,15 @@ p {
   .details-panel {
     display: none;
   }
+}
 
-  .search-placeholder {
-    display: none;
+@media (max-width: 1180px) {
+  .search-filter-panel {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .clear-filters {
+    align-self: end;
   }
 }
 
@@ -2260,6 +2443,10 @@ p {
 
   .field-row {
     grid-template-columns: 1fr;
+  }
+
+  .search-filter-panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .import-panel-header {

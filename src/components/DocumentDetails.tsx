@@ -8,6 +8,7 @@ import {
   Folder,
   LoaderCircle,
   Pencil,
+  RotateCcw,
   Tags
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -29,7 +30,9 @@ interface DocumentDetailsProps {
   client: BackendClient;
   document: DocumentSummary | null;
   collections: CollectionSummary[];
+  retryingIndex: boolean;
   onEditDocument: (document: DocumentSummary) => void;
+  onRetryIndex: (document: DocumentSummary) => void;
 }
 
 function pdfPreviewUrl(dataUrl: string, page: number) {
@@ -119,7 +122,9 @@ export function DocumentDetails({
   client,
   document,
   collections,
-  onEditDocument
+  retryingIndex,
+  onEditDocument,
+  onRetryIndex
 }: DocumentDetailsProps) {
   const TypeIcon = document ? documentTypeIcon(document) : FileText;
   const status = document ? documentStatusPresentation(document) : null;
@@ -286,12 +291,34 @@ export function DocumentDetails({
 
           <section className="details-status" aria-labelledby="status-title">
             <h3 id="status-title">处理状态</h3>
-            <span
-              className={`status-badge ${status?.tone ?? "neutral"}`}
-              title={document.errorMessage ?? undefined}
-            >
-              {status?.label}
-            </span>
+            <div className="details-status-actions">
+              <span
+                className={`status-badge ${status?.tone ?? "neutral"}`}
+                title={document.errorMessage ?? undefined}
+              >
+                {status?.label}
+              </span>
+              {document.indexStatus === "failed" ? (
+                <button
+                  className="button quiet"
+                  type="button"
+                  onClick={() => onRetryIndex(document)}
+                  disabled={retryingIndex}
+                  aria-label={`重试索引 ${document.title}`}
+                >
+                  {retryingIndex ? (
+                    <LoaderCircle
+                      className="spin"
+                      size={14}
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <RotateCcw size={14} aria-hidden="true" />
+                  )}
+                  重试索引
+                </button>
+              ) : null}
+            </div>
           </section>
 
           <section className="detail-preview" aria-label="文档预览">

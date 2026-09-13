@@ -13,11 +13,12 @@ import {
   Plus,
   Search,
   Settings,
+  SlidersHorizontal,
   Tag as TagIcon,
   Trash2,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toBackendError } from "../backend/error";
 import type {
@@ -25,6 +26,7 @@ import type {
   CollectionDeleteResult,
   CollectionSummary,
   DocumentMetadataUpdate,
+  DocumentSearchResponse,
   DocumentSummary,
   ImportBatch,
   ImportDecision,
@@ -48,6 +50,7 @@ import { DocumentMetadataDialog } from "./DocumentMetadataDialog";
 import { DocumentGrid, DocumentList } from "./DocumentResults";
 import { ImportBatchPanel } from "./ImportBatchPanel";
 import { ImportDecisionDialog } from "./ImportDecisionDialog";
+import { SearchFilters } from "./SearchFilters";
 import {
   DeleteTagDialog,
   TagActionDialog
@@ -137,6 +140,20 @@ export function LibraryWorkspace({
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
   const [tags, setTags] = useState<TagSummary[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [fileTypeFilter, setFileTypeFilter] = useState<string | null>(null);
+  const [documentDateFrom, setDocumentDateFrom] = useState<string | null>(
+    null
+  );
+  const [documentDateTo, setDocumentDateTo] = useState<string | null>(null);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [searchResponse, setSearchResponse] =
+    useState<DocumentSearchResponse | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [searchRevision, setSearchRevision] = useState(0);
+  const [indexing, setIndexing] = useState(false);
+  const indexingRef = useRef(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<
     string | null
   >(null);
@@ -150,6 +167,9 @@ export function LibraryWorkspace({
   const [importing, setImporting] = useState(false);
   const [importRun, setImportRun] = useState<ImportRun | null>(null);
   const [retryingItemIds, setRetryingItemIds] = useState<Set<string>>(
+    new Set()
+  );
+  const [retryingIndexIds, setRetryingIndexIds] = useState<Set<string>>(
     new Set()
   );
   const [activeDecisionItemId, setActiveDecisionItemId] = useState<
@@ -196,6 +216,26 @@ export function LibraryWorkspace({
     ]);
   }, [refreshCollections, refreshDocuments, refreshTags]);
 
+  const runPendingIndexing = useCallback(async () => {
+    if (indexingRef.current) {
+      return;
+    }
+    indexingRef.current = true;
+    setIndexing(true);
+    try {
+      const result = await client.indexPendingDocuments();
+      if (result.processed > 0) {
+        await refreshDocuments();
+        setSearchRevision((value) => value + 1);
+      }
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+    } finally {
+      indexingRef.current = false;
+      setIndexing(false);
+    }
+  }, [client, refreshDocuments]);
+
   useEffect(() => {
     let active = true;
     setLoading(true);
@@ -238,6 +278,69 @@ export function LibraryWorkspace({
     };
   }, [client, library.id]);
 
+  useEffect(() => {
+    if (!loading && documents.some((document) => document.indexStatus === "pending")) {
+      void runPendingIndexing();
+    }
+  }, [documents, loading, runPendingIndexing]);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchResponse(null);
+      setSearchError("");
+      setSearching(false);
+      return;
+    }
+
+    let active = true;
+    setSearching(true);
+    setSearchError("");
+    const timeout = window.setTimeout(() => {
+      void client
+        .searchDocuments({
+          query,
+          filters: {
+            collectionId: selectedCollectionId,
+            tagId: selectedTagId,
+            fileType: fileTypeFilter,
+            documentDateFrom,
+            documentDateTo
+          }
+        })
+        .then((response) => {
+          if (active) {
+            setSearchResponse(response);
+          }
+        })
+        .catch((caught) => {
+          if (active) {
+            setSearchError(toBackendError(caught).message);
+          }
+        })
+        .finally(() => {
+          if (active) {
+            setSearching(false);
+          }
+        });
+    }, 150);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [
+    client,
+    documents,
+    documentDateFrom,
+    documentDateTo,
+    fileTypeFilter,
+    searchQuery,
+    searchRevision,
+    selectedCollectionId,
+    selectedTagId
+  ]);
+
   const importPaths = useCallback(
     async (paths: string[]) => {
       const uniquePaths = [...new Set(paths.filter(Boolean))];
@@ -275,13 +378,14 @@ export function LibraryWorkspace({
           };
         });
         await refreshLibraryData();
+        void runPendingIndexing();
       } catch (caught) {
         setError(toBackendError(caught).message);
       } finally {
         setImporting(false);
       }
     },
-    [client, refreshLibraryData]
+    [client, refreshLibraryData, runPendingIndexing]
   );
 
   useEffect(() => {
@@ -454,6 +558,28 @@ export function LibraryWorkspace({
     }
   }
 
+  async function retryDocumentIndex(document: DocumentSummary) {
+    setRetryingIndexIds((current) => new Set(current).add(document.id));
+    setError("");
+    try {
+      const updated = await client.retryDocumentIndex(document.id);
+      setDocuments((current) =>
+        current.map((candidate) =>
+          candidate.id === updated.id ? updated : candidate
+        )
+      );
+      setSearchRevision((value) => value + 1);
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+    } finally {
+      setRetryingIndexIds((current) => {
+        const next = new Set(current);
+        next.delete(document.id);
+        return next;
+      });
+    }
+  }
+
   async function submitCollectionAction(value: string | null) {
     if (!collectionAction) {
       return;
@@ -619,48 +745,126 @@ export function LibraryWorkspace({
   const selectedTag = selectedTagId
     ? tags.find((tag) => tag.id === selectedTagId) ?? null
     : null;
-  const visibleDocuments = selectedCollectionId
-    ? documents.filter(
-        (document) => document.collectionId === selectedCollectionId
-      )
-    : selectedTagId
-      ? documents.filter((document) =>
-          document.tags.some((tag) => tag.id === selectedTagId)
-        )
-      : documents;
+  const normalizedQuery = searchQuery.trim();
+  const searchActive = normalizedQuery.length > 0;
+  const hasActiveFilters = Boolean(
+    selectedCollectionId ||
+      selectedTagId ||
+      fileTypeFilter ||
+      documentDateFrom ||
+      documentDateTo
+  );
+  const filteredDocuments = documents.filter((document) => {
+    if (
+      selectedCollectionId &&
+      document.collectionId !== selectedCollectionId
+    ) {
+      return false;
+    }
+    if (
+      selectedTagId &&
+      !document.tags.some((tag) => tag.id === selectedTagId)
+    ) {
+      return false;
+    }
+    if (
+      fileTypeFilter &&
+      document.fileType.toUpperCase() !== fileTypeFilter.toUpperCase()
+    ) {
+      return false;
+    }
+    if (
+      documentDateFrom &&
+      (!document.documentDate || document.documentDate < documentDateFrom)
+    ) {
+      return false;
+    }
+    if (
+      documentDateTo &&
+      (!document.documentDate || document.documentDate > documentDateTo)
+    ) {
+      return false;
+    }
+    return true;
+  });
+  const searchResults = searchResponse?.results ?? [];
+  const visibleDocuments = searchActive
+    ? searchResults.map((result) => result.document)
+    : filteredDocuments;
   const selectedDocument = selectedDocumentId
     ? visibleDocuments.find(
         (document) => document.id === selectedDocumentId
       ) ?? null
     : null;
-  const emptyStateKind: DocumentEmptyStateKind | null =
-    documents.length === 0
-      ? "library"
-      : visibleDocuments.length === 0
-        ? selectedTagId
-          ? "tag"
-          : "collection"
-        : null;
+  const fileTypes = [...new Set(documents.map((document) => document.fileType))]
+    .sort((left, right) => left.localeCompare(right, "zh-CN"));
+  let emptyStateKind: DocumentEmptyStateKind | null = null;
+  if (documents.length === 0) {
+    emptyStateKind = "library";
+  } else if (visibleDocuments.length === 0) {
+    const hasAdditionalFilters = Boolean(
+      fileTypeFilter || documentDateFrom || documentDateTo
+    );
+    if (searchActive) {
+      emptyStateKind = "search";
+    } else if (selectedTagId && !hasAdditionalFilters) {
+      emptyStateKind = "tag";
+    } else if (selectedCollectionId && !hasAdditionalFilters) {
+      emptyStateKind = "collection";
+    } else {
+      emptyStateKind = "search";
+    }
+  }
   const decisionItem =
     importRun?.items.find(
       (item) => item.itemId === activeDecisionItemId
     ) ?? null;
 
   function selectAllDocuments() {
-    setSelectedCollectionId(null);
-    setSelectedTagId(null);
-    setSelectedDocumentId(null);
+    clearSearchFilters();
   }
 
   function selectCollection(collectionId: string) {
     setSelectedCollectionId(collectionId);
-    setSelectedTagId(null);
     setSelectedDocumentId(null);
   }
 
   function selectTag(tagId: string) {
     setSelectedTagId(tagId);
+    setSelectedDocumentId(null);
+  }
+
+  function changeSearchFilters(change: {
+    collectionId?: string | null;
+    tagId?: string | null;
+    fileType?: string | null;
+    documentDateFrom?: string | null;
+    documentDateTo?: string | null;
+  }) {
+    if ("collectionId" in change) {
+      setSelectedCollectionId(change.collectionId ?? null);
+    }
+    if ("tagId" in change) {
+      setSelectedTagId(change.tagId ?? null);
+    }
+    if ("fileType" in change) {
+      setFileTypeFilter(change.fileType ?? null);
+    }
+    if ("documentDateFrom" in change) {
+      setDocumentDateFrom(change.documentDateFrom ?? null);
+    }
+    if ("documentDateTo" in change) {
+      setDocumentDateTo(change.documentDateTo ?? null);
+    }
+    setSelectedDocumentId(null);
+  }
+
+  function clearSearchFilters() {
     setSelectedCollectionId(null);
+    setSelectedTagId(null);
+    setFileTypeFilter(null);
+    setDocumentDateFrom(null);
+    setDocumentDateTo(null);
     setSelectedDocumentId(null);
   }
 
@@ -685,7 +889,7 @@ export function LibraryWorkspace({
         <nav className="primary-nav" aria-label="资料库导航">
           <button
             className={`nav-item${
-              selectedCollectionId === null && selectedTagId === null
+              !hasActiveFilters
                 ? " active"
                 : ""
             }`}
@@ -824,10 +1028,62 @@ export function LibraryWorkspace({
             </div>
           </div>
           <div className="header-actions">
-            <div className="search-placeholder" aria-hidden="true">
-              <Search size={17} />
-              <span>搜索文档</span>
-            </div>
+            <form
+              className="search-form"
+              role="search"
+              onSubmit={(event) => event.preventDefault()}
+            >
+              <Search size={17} aria-hidden="true" />
+              <input
+                type="search"
+                aria-label="搜索文档"
+                placeholder="搜索标题、描述和正文"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+              />
+              {searchQuery ? (
+                <button
+                  className="icon-button compact"
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  aria-label="清除搜索词"
+                  title="清除搜索词"
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
+              ) : null}
+            </form>
+            <button
+              className={`button secondary filter-button${
+                hasActiveFilters ? " active" : ""
+              }`}
+              type="button"
+              onClick={() => setFiltersOpen((current) => !current)}
+              aria-expanded={filtersOpen || hasActiveFilters}
+              aria-controls="search-filter-panel"
+            >
+              <SlidersHorizontal size={16} aria-hidden="true" />
+              筛选
+              {hasActiveFilters ? (
+                <span className="filter-count" aria-hidden="true">
+                  {
+                    [
+                      selectedCollectionId,
+                      selectedTagId,
+                      fileTypeFilter,
+                      documentDateFrom,
+                      documentDateTo
+                    ].filter(Boolean).length
+                  }
+                </span>
+              ) : null}
+            </button>
+            {indexing ? (
+              <span className="indexing-status" role="status">
+                <LoaderCircle className="spin" size={15} aria-hidden="true" />
+                正在建立索引
+              </span>
+            ) : null}
             <button
               className="button secondary import-button"
               type="button"
@@ -862,6 +1118,24 @@ export function LibraryWorkspace({
           </div>
         </header>
 
+        {filtersOpen || hasActiveFilters ? (
+          <div id="search-filter-panel">
+            <SearchFilters
+              collections={collections}
+              tags={tags}
+              fileTypes={fileTypes}
+              collectionId={selectedCollectionId}
+              tagId={selectedTagId}
+              fileType={fileTypeFilter}
+              documentDateFrom={documentDateFrom}
+              documentDateTo={documentDateTo}
+              hasActiveFilters={hasActiveFilters}
+              onChange={changeSearchFilters}
+              onClear={clearSearchFilters}
+            />
+          </div>
+        ) : null}
+
         {error ? (
           <div className="workspace-message" role="alert">
             <AlertCircle size={17} aria-hidden="true" />
@@ -895,7 +1169,25 @@ export function LibraryWorkspace({
           </main>
         ) : (
           <>
-            {emptyStateKind ? (
+            {searchError ? (
+              <main className="search-error-state" aria-label="搜索失败">
+                <AlertCircle size={22} aria-hidden="true" />
+                <strong>搜索失败</strong>
+                <span>{searchError}</span>
+                <button
+                  className="button quiet"
+                  type="button"
+                  onClick={() => setSearchRevision((value) => value + 1)}
+                >
+                  重试搜索
+                </button>
+              </main>
+            ) : searching && searchActive && !searchResponse ? (
+              <main className="search-loading-state" aria-label="正在搜索">
+                <LoaderCircle className="spin" size={22} aria-hidden="true" />
+                <span>正在搜索</span>
+              </main>
+            ) : emptyStateKind ? (
               <DocumentEmptyState
                 kind={emptyStateKind}
                 importing={importing}
@@ -940,11 +1232,16 @@ export function LibraryWorkspace({
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
                     highlightedDocumentId={highlightedDocumentId}
+                    searchResults={searchResults}
+                    retryingIndexIds={retryingIndexIds}
                     onSelectDocument={setSelectedDocumentId}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
                     onEditDocument={setMetadataTarget}
+                    onRetryIndex={(document) =>
+                      void retryDocumentIndex(document)
+                    }
                   />
                 ) : (
                   <DocumentGrid
@@ -953,11 +1250,16 @@ export function LibraryWorkspace({
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
                     highlightedDocumentId={highlightedDocumentId}
+                    searchResults={searchResults}
+                    retryingIndexIds={retryingIndexIds}
                     onSelectDocument={setSelectedDocumentId}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
                     onEditDocument={setMetadataTarget}
+                    onRetryIndex={(document) =>
+                      void retryDocumentIndex(document)
+                    }
                   />
                 )}
               </>
@@ -970,7 +1272,11 @@ export function LibraryWorkspace({
         client={client}
         document={selectedDocument}
         collections={collections}
+        retryingIndex={
+          selectedDocument ? retryingIndexIds.has(selectedDocument.id) : false
+        }
         onEditDocument={setMetadataTarget}
+        onRetryIndex={(document) => void retryDocumentIndex(document)}
       />
 
       {collectionAction ? (

@@ -217,7 +217,8 @@ describe("App", () => {
     );
 
     expect(await screen.findByText("项目说明")).toBeInTheDocument();
-    expect(screen.getByText("等待索引")).toBeInTheDocument();
+    expect(await screen.findByText("可搜索")).toBeInTheDocument();
+    expect(client.calls).toContain("indexPendingDocuments");
     expect((await screen.findAllByText("项目说明.md")).length).toBeGreaterThan(0);
     expect(client.calls).toContain(
       `import:${importedDocument.sourcePath}`

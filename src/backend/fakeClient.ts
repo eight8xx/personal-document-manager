@@ -6,6 +6,9 @@ import type {
   CollectionSummary,
   DocumentMetadataUpdate,
   DocumentPreview,
+  DocumentSearchQuery,
+  DocumentSearchResponse,
+  DocumentSearchResult,
   DocumentSummary,
   DocumentThumbnail,
   FileDropHandler,
@@ -14,6 +17,7 @@ import type {
   ImportItemResult,
   ImportProgress,
   ImportProgressHandler,
+  IndexRunResult,
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
@@ -43,6 +47,13 @@ export interface FakeBackendOptions {
   getDocumentPreview?: (documentId: string) => Promise<DocumentPreview>;
   getDocumentThumbnail?: (documentId: string) => Promise<DocumentThumbnail>;
   openDocument?: (documentId: string) => Promise<void>;
+  documentContents?: Record<string, string>;
+  indexFailures?: Record<string, string>;
+  searchDocuments?: (
+    request: DocumentSearchQuery
+  ) => Promise<DocumentSearchResponse>;
+  indexPendingDocuments?: () => Promise<IndexRunResult>;
+  retryDocumentIndex?: (documentId: string) => Promise<DocumentSummary>;
 }
 
 const emptyBootstrap: BootstrapState = {
@@ -137,6 +148,21 @@ function countsForItems(items: ImportItemResult[]) {
   };
 }
 
+function snippetAround(text: string, query: string): string | null {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const index = normalized
+    .toLocaleLowerCase()
+    .indexOf(query.toLocaleLowerCase());
+  if (index < 0) {
+    return null;
+  }
+  const start = Math.max(0, index - 48);
+  const end = Math.min(normalized.length, index + query.length + 72);
+  return `${start > 0 ? "…" : ""}${normalized.slice(start, end)}${
+    end < normalized.length ? "…" : ""
+  }`;
+}
+
 export class FakeBackendClient implements BackendClient {
   calls: string[] = [];
   private state: BootstrapState;
@@ -175,6 +201,19 @@ export class FakeBackendClient implements BackendClient {
   private readonly openDocumentImpl:
     | ((documentId: string) => Promise<void>)
     | null;
+  private readonly documentContents: Record<string, string>;
+  private readonly indexFailures: Record<string, string>;
+  private readonly searchDocumentsImpl:
+    | ((
+        request: DocumentSearchQuery
+      ) => Promise<DocumentSearchResponse>)
+    | null;
+  private readonly indexPendingDocumentsImpl:
+    | (() => Promise<IndexRunResult>)
+    | null;
+  private readonly retryDocumentIndexImpl:
+    | ((documentId: string) => Promise<DocumentSummary>)
+    | null;
   private fileDropHandlers = new Set<FileDropHandler>();
   private importProgressHandlers = new Set<ImportProgressHandler>();
   private importBatches = new Map<string, ImportBatch>();
@@ -207,6 +246,11 @@ export class FakeBackendClient implements BackendClient {
     this.getDocumentPreviewImpl = options.getDocumentPreview ?? null;
     this.getDocumentThumbnailImpl = options.getDocumentThumbnail ?? null;
     this.openDocumentImpl = options.openDocument ?? null;
+    this.documentContents = structuredClone(options.documentContents ?? {});
+    this.indexFailures = structuredClone(options.indexFailures ?? {});
+    this.searchDocumentsImpl = options.searchDocuments ?? null;
+    this.indexPendingDocumentsImpl = options.indexPendingDocuments ?? null;
+    this.retryDocumentIndexImpl = options.retryDocumentIndex ?? null;
     this.refreshCollectionCounts();
     this.refreshTagCounts();
   }
@@ -466,6 +510,167 @@ export class FakeBackendClient implements BackendClient {
   async listDocuments(): Promise<DocumentSummary[]> {
     this.calls.push("listDocuments");
     return structuredClone(this.documents);
+  }
+
+  async searchDocuments(
+    request: DocumentSearchQuery
+  ): Promise<DocumentSearchResponse> {
+    this.calls.push(`searchDocuments:${request.query}`);
+    if (this.searchDocumentsImpl) {
+      return this.searchDocumentsImpl(request);
+    }
+
+    const query = request.query.trim();
+    const normalizedQuery = query.toLocaleLowerCase();
+    const shortQuery = [...query].length <= 2;
+    const filtered = this.documents.filter((document) => {
+      const { filters } = request;
+      if (
+        filters.collectionId &&
+        document.collectionId !== filters.collectionId
+      ) {
+        return false;
+      }
+      if (
+        filters.tagId &&
+        !document.tags.some((tag) => tag.id === filters.tagId)
+      ) {
+        return false;
+      }
+      if (
+        filters.fileType &&
+        document.fileType.toUpperCase() !== filters.fileType.toUpperCase()
+      ) {
+        return false;
+      }
+      if (
+        filters.documentDateFrom &&
+        (!document.documentDate ||
+          document.documentDate < filters.documentDateFrom)
+      ) {
+        return false;
+      }
+      if (
+        filters.documentDateTo &&
+        (!document.documentDate ||
+          document.documentDate > filters.documentDateTo)
+      ) {
+        return false;
+      }
+      return true;
+    });
+
+    const results: DocumentSearchResult[] = [];
+    for (const document of filtered) {
+      if (!query) {
+        results.push({
+          document,
+          snippet: null,
+          matchKind: "metadata"
+        });
+        continue;
+      }
+
+      const content = this.documentContents[document.id] ?? "";
+      const contentSnippet = snippetAround(content, query);
+      const collectionName =
+        this.collections.find(
+          (collection) => collection.id === document.collectionId
+        )?.name ?? "";
+      const metadata = [
+        document.title,
+        document.description ?? "",
+        document.fileName,
+        document.fileType,
+        document.documentDate ?? "",
+        document.sourcePath,
+        collectionName,
+        ...document.tags.map((tag) => tag.name)
+      ]
+        .join("\n")
+        .toLocaleLowerCase();
+      const metadataMatch = metadata.includes(normalizedQuery);
+
+      if (shortQuery) {
+        if (metadataMatch) {
+          results.push({
+            document,
+            snippet: null,
+            matchKind: "metadata"
+          });
+        }
+      } else if (contentSnippet) {
+        results.push({
+          document,
+          snippet: contentSnippet,
+          matchKind: "content"
+        });
+      } else if (metadataMatch) {
+        results.push({
+          document,
+          snippet: null,
+          matchKind: "metadata"
+        });
+      }
+    }
+
+    return { results: structuredClone(results) };
+  }
+
+  async indexPendingDocuments(): Promise<IndexRunResult> {
+    this.calls.push("indexPendingDocuments");
+    if (this.indexPendingDocumentsImpl) {
+      return this.indexPendingDocumentsImpl();
+    }
+
+    const result: IndexRunResult = {
+      processed: 0,
+      searchable: 0,
+      failed: 0
+    };
+    for (const document of this.documents) {
+      if (document.indexStatus !== "pending") {
+        continue;
+      }
+      result.processed += 1;
+      const failure = this.indexFailures[document.id];
+      if (failure) {
+        document.indexStatus = "failed";
+        document.errorStage = "indexing";
+        document.errorMessage = failure;
+        result.failed += 1;
+      } else {
+        document.indexStatus = "searchable";
+        document.errorStage = null;
+        document.errorMessage = null;
+        result.searchable += 1;
+      }
+    }
+    return structuredClone(result);
+  }
+
+  async retryDocumentIndex(documentId: string): Promise<DocumentSummary> {
+    this.calls.push(`retryDocumentIndex:${documentId}`);
+    if (this.retryDocumentIndexImpl) {
+      const updated = await this.retryDocumentIndexImpl(documentId);
+      this.documents = this.documents.map((document) =>
+        document.id === updated.id ? structuredClone(updated) : document
+      );
+      return structuredClone(updated);
+    }
+
+    const document = this.requireDocument(documentId);
+    const failure = this.indexFailures[documentId];
+    if (failure) {
+      document.indexStatus = "failed";
+      document.errorStage = "indexing";
+      document.errorMessage = failure;
+    } else {
+      document.indexStatus = "searchable";
+      document.errorStage = null;
+      document.errorMessage = null;
+    }
+    return structuredClone(document);
   }
 
   async subscribeToFileDrops(handler: FileDropHandler): Promise<() => void> {

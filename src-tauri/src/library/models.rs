@@ -183,6 +183,52 @@ pub struct DocumentMetadataUpdate {
     pub tag_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DocumentSearchFilters {
+    pub collection_id: Option<String>,
+    pub tag_id: Option<String>,
+    pub file_type: Option<String>,
+    pub document_date_from: Option<String>,
+    pub document_date_to: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSearchQuery {
+    pub query: String,
+    pub filters: DocumentSearchFilters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchMatchKind {
+    Content,
+    Metadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSearchResult {
+    pub document: DocumentSummary,
+    pub snippet: Option<String>,
+    pub match_kind: SearchMatchKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSearchResponse {
+    pub results: Vec<DocumentSearchResult>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexRunResult {
+    pub processed: i64,
+    pub searchable: i64,
+    pub failed: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImportItemStatus {

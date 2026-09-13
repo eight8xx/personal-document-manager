@@ -10,12 +10,15 @@ import type {
   CollectionSummary,
   DocumentMetadataUpdate,
   DocumentPreview,
+  DocumentSearchQuery,
+  DocumentSearchResponse,
   DocumentSummary,
   DocumentThumbnail,
   ImportBatch,
   ImportDecision,
   ImportItemResult,
   ImportProgress,
+  IndexRunResult,
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
@@ -156,5 +159,11 @@ export const tauriBackendClient: BackendClient = {
     invoke<DocumentSummary>("update_document_metadata", {
       documentId,
       update
-    })
+    }),
+  searchDocuments: (request: DocumentSearchQuery) =>
+    invoke<DocumentSearchResponse>("search_documents", { request }),
+  indexPendingDocuments: () =>
+    invoke<IndexRunResult>("index_pending_documents"),
+  retryDocumentIndex: (documentId) =>
+    invoke<DocumentSummary>("retry_document_index", { documentId })
 };

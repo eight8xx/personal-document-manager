@@ -104,6 +104,37 @@ export interface DocumentMetadataUpdate {
   tagIds: string[];
 }
 
+export interface DocumentSearchFilters {
+  collectionId: string | null;
+  tagId: string | null;
+  fileType: string | null;
+  documentDateFrom: string | null;
+  documentDateTo: string | null;
+}
+
+export interface DocumentSearchQuery {
+  query: string;
+  filters: DocumentSearchFilters;
+}
+
+export type SearchMatchKind = "content" | "metadata";
+
+export interface DocumentSearchResult {
+  document: DocumentSummary;
+  snippet: string | null;
+  matchKind: SearchMatchKind;
+}
+
+export interface DocumentSearchResponse {
+  results: DocumentSearchResult[];
+}
+
+export interface IndexRunResult {
+  processed: number;
+  searchable: number;
+  failed: number;
+}
+
 export type ImportItemStatus =
   | "imported"
   | "duplicate"
@@ -235,4 +266,9 @@ export interface BackendClient {
     documentId: string,
     update: DocumentMetadataUpdate
   ): Promise<DocumentSummary>;
+  searchDocuments(
+    request: DocumentSearchQuery
+  ): Promise<DocumentSearchResponse>;
+  indexPendingDocuments(): Promise<IndexRunResult>;
+  retryDocumentIndex(documentId: string): Promise<DocumentSummary>;
 }

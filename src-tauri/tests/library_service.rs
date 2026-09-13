@@ -2,8 +2,9 @@ use std::fs;
 use std::path::Path;
 
 use personal_document_manager_lib::library::{
-    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentThumbnail,
-    ImportDecision, ImportItemStatus, IndexStatus, LibraryService, LocationStatus,
+    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
+    DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail, ImportDecision,
+    ImportItemStatus, IndexStatus, LibraryService, LocationStatus, SearchMatchKind,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -969,6 +970,251 @@ fn generates_thumbnails_and_reports_missing_library_copies_without_changing_stat
     let open_error = service.open_document(&image.id).unwrap_err();
     assert_eq!(open_error.code(), "documentFileMissing");
     assert_eq!(service.list_documents().unwrap(), documents_before);
+}
+
+#[test]
+fn searches_chinese_english_and_mixed_content_with_snippets() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let chinese_path = root.path().join("中文资料.txt");
+    let english_path = root.path().join("annual-report.md");
+    let mixed_path = root.path().join("mixed.pdf");
+    let docx_path = root.path().join("meeting.docx");
+    let image_path = root.path().join("扫描图.png");
+
+    fs::write(&chinese_path, "项目计划\n这是中文正文，用于检索完整内容。").unwrap();
+    fs::write(
+        &english_path,
+        "Annual report\nRevenue increased across every region.",
+    )
+    .unwrap();
+    let mixed_pdf =
+        "%PDF-1.4\n1 0 obj << /Length 64 >>\nstream\nBT (Project Alpha 计划) Tj ET\nendstream\n%%EOF";
+    fs::write(&mixed_path, mixed_pdf.as_bytes()).unwrap();
+    let docx_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>会议纪要</w:t></w:r></w:p></w:body>
+</w:document>"#;
+    fs::write(
+        &docx_path,
+        stored_zip(&[("word/document.xml", docx_xml.as_bytes())]),
+    )
+    .unwrap();
+    fs::write(&image_path, png_prefix()).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let chinese = service.import_document(&chinese_path).unwrap();
+    let english = service.import_document(&english_path).unwrap();
+    let mixed = service.import_document(&mixed_path).unwrap();
+    let docx = service.import_document(&docx_path).unwrap();
+    let image = service.import_document(&image_path).unwrap();
+
+    let indexed = service.index_pending_documents().unwrap();
+    assert_eq!(indexed.processed, 5);
+    assert_eq!(indexed.searchable, 5);
+    assert_eq!(indexed.failed, 0);
+
+    let chinese_results = search(&service, "中文正文", DocumentSearchFilters::default());
+    assert_eq!(chinese_results.len(), 1);
+    assert_eq!(chinese_results[0].document.id, chinese.id);
+    assert_eq!(chinese_results[0].match_kind, SearchMatchKind::Content);
+    assert!(chinese_results[0]
+        .snippet
+        .as_deref()
+        .unwrap_or_default()
+        .contains("中文正文"));
+
+    let english_results = search(
+        &service,
+        "revenue increased",
+        DocumentSearchFilters::default(),
+    );
+    assert_eq!(english_results.len(), 1);
+    assert_eq!(english_results[0].document.id, english.id);
+    assert_eq!(english_results[0].match_kind, SearchMatchKind::Content);
+
+    let mixed_results = search(&service, "Alpha 计划", DocumentSearchFilters::default());
+    assert_eq!(mixed_results.len(), 1);
+    assert_eq!(mixed_results[0].document.id, mixed.id);
+    assert!(mixed_results[0]
+        .snippet
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Alpha"));
+
+    let docx_results = search(&service, "会议纪要", DocumentSearchFilters::default());
+    assert_eq!(docx_results.len(), 1);
+    assert_eq!(docx_results[0].document.id, docx.id);
+
+    let image_results = search(&service, "扫描图", DocumentSearchFilters::default());
+    assert_eq!(image_results.len(), 1);
+    assert_eq!(image_results[0].document.id, image.id);
+    assert_eq!(image_results[0].match_kind, SearchMatchKind::Metadata);
+}
+
+#[test]
+fn supports_short_metadata_queries_and_combined_filters() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let matching_path = root.path().join("ai-plan.txt");
+    let other_path = root.path().join("budget.md");
+    fs::write(&matching_path, "正文不包含查询短词。").unwrap();
+    fs::write(&other_path, "another document").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let matching = service.import_document(&matching_path).unwrap();
+    let other = service.import_document(&other_path).unwrap();
+    service.index_pending_documents().unwrap();
+
+    let collection = service.create_collection("工作".to_string(), None).unwrap();
+    let tag = service.create_tag("重要".to_string()).unwrap();
+    service
+        .update_document_metadata(
+            &matching.id,
+            DocumentMetadataUpdate {
+                title: "AI 计划".to_string(),
+                description: Some("季度路线图".to_string()),
+                document_date: Some("2025-03-15".to_string()),
+                collection_id: collection.id.clone(),
+                tag_ids: vec![tag.id.clone()],
+            },
+        )
+        .unwrap();
+    service
+        .update_document_metadata(
+            &other.id,
+            DocumentMetadataUpdate {
+                title: "预算".to_string(),
+                description: None,
+                document_date: Some("2024-01-01".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let short_results = search(&service, "AI", DocumentSearchFilters::default());
+    assert_eq!(short_results.len(), 1);
+    assert_eq!(short_results[0].document.id, matching.id);
+    assert_eq!(short_results[0].match_kind, SearchMatchKind::Metadata);
+
+    let combined = search(
+        &service,
+        "",
+        DocumentSearchFilters {
+            collection_id: Some(collection.id.clone()),
+            tag_id: Some(tag.id),
+            file_type: Some("TXT".to_string()),
+            document_date_from: Some("2025-01-01".to_string()),
+            document_date_to: Some("2025-12-31".to_string()),
+        },
+    );
+    assert_eq!(combined.len(), 1);
+    assert_eq!(combined[0].document.id, matching.id);
+
+    let cleared = search(&service, "", DocumentSearchFilters::default());
+    assert_eq!(cleared.len(), 2);
+}
+
+#[test]
+fn updates_metadata_search_results_and_marks_failed_index_retryable() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("recover.txt");
+    fs::write(&source_path, "初始正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    let library_copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    fs::remove_file(&library_copy).unwrap();
+
+    let failed_run = service.index_pending_documents().unwrap();
+    assert_eq!(failed_run.failed, 1);
+    let failed = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(failed.index_status, IndexStatus::Failed);
+    assert!(failed
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("不存在"));
+
+    let still_failed = service.retry_document_index(&imported.id).unwrap();
+    assert_eq!(still_failed.index_status, IndexStatus::Failed);
+    let metadata_results = search(&service, "recover", DocumentSearchFilters::default());
+    assert_eq!(metadata_results.len(), 1, "失败文档仍应可按元数据浏览");
+
+    fs::write(&library_copy, "恢复后的正文内容").unwrap();
+    let recovered = service.retry_document_index(&imported.id).unwrap();
+    assert_eq!(recovered.index_status, IndexStatus::Searchable);
+    let recovered_results = search(&service, "恢复后的正文", DocumentSearchFilters::default());
+    assert_eq!(recovered_results.len(), 1);
+    assert_eq!(recovered_results[0].document.id, imported.id);
+
+    service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "旧标题资料".to_string(),
+                description: Some("旧说明文本".to_string()),
+                document_date: Some("2025-01-10".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+    service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "新标题资料".to_string(),
+                description: Some("更新后的说明文本".to_string()),
+                document_date: Some("2026-01-10".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        search(&service, "新标题", DocumentSearchFilters::default()).len(),
+        1
+    );
+    assert!(search(&service, "旧说明文本", DocumentSearchFilters::default()).is_empty());
+}
+
+fn search(
+    service: &LibraryService,
+    query: &str,
+    filters: DocumentSearchFilters,
+) -> Vec<personal_document_manager_lib::library::DocumentSearchResult> {
+    let DocumentSearchResponse { results } = service
+        .search_documents(DocumentSearchQuery {
+            query: query.to_string(),
+            filters,
+        })
+        .unwrap();
+    results
+}
+
+fn png_prefix() -> &'static [u8] {
+    &[
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+    ]
 }
 
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {

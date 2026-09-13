@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::{NaiveDate, SecondsFormat, Utc};
-use flate2::read::DeflateDecoder;
+use flate2::read::{DeflateDecoder, ZlibDecoder};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -16,10 +16,12 @@ use uuid::Uuid;
 use super::error::{LibraryError, LibraryResult};
 use super::models::{
     BootstrapState, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
-    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSummary,
+    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
+    DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
     DocumentThumbnail, ImportBatch, ImportDecision, ImportItemResult, ImportItemStatus,
-    ImportProgress, IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary,
-    LocationStatus, RecentLibrary, RecentLibraryRecord, TagSummary,
+    ImportProgress, IndexRunResult, IndexStatus, LibraryLocationInspection, LibraryMetadata,
+    LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord, SearchMatchKind,
+    TagSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -1298,6 +1300,12 @@ impl LibraryService {
             if updated == 0 {
                 return Err(("database", "要替换的文档不存在或已删除。".to_string()));
             }
+            transaction
+                .execute(
+                    "DELETE FROM document_search WHERE document_id = ?1",
+                    params![&pending.existing_document_id],
+                )
+                .map_err(|error| ("database", error.to_string()))?;
             let source_updated = transaction
                 .execute(
                     "
@@ -1779,6 +1787,14 @@ impl LibraryService {
         for tag_id in &tag_ids {
             ensure_tag_exists(&transaction, tag_id)?;
         }
+        let extracted_text = transaction
+            .query_row(
+                "SELECT extracted_text FROM document_search WHERE document_id = ?1",
+                params![document_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
 
         let timestamp = now();
         transaction.execute(
@@ -1810,6 +1826,17 @@ impl LibraryService {
                 params![document_id, tag_id],
             )?;
         }
+        transaction.execute(
+            "DELETE FROM document_search WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        transaction.execute(
+            "
+            INSERT INTO document_search (document_id, title, description, extracted_text)
+            VALUES (?1, ?2, ?3, ?4)
+            ",
+            params![document_id, &title, description.as_deref(), &extracted_text],
+        )?;
         transaction.commit()?;
 
         load_document_summary(&library.connection, document_id)
@@ -1896,6 +1923,210 @@ impl LibraryService {
             document.tags = load_document_tags(&library.connection, &document.id)?;
         }
         Ok(documents)
+    }
+
+    pub fn search_documents(
+        &self,
+        request: DocumentSearchQuery,
+    ) -> LibraryResult<DocumentSearchResponse> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let filters = normalize_search_filters(request.filters)?;
+        if let Some(collection_id) = filters.collection_id.as_deref() {
+            ensure_collection_exists(&library.connection, collection_id)?;
+        }
+        if let Some(tag_id) = filters.tag_id.as_deref() {
+            ensure_tag_exists(&library.connection, tag_id)?;
+        }
+
+        let query = request.query.trim();
+        let short_query = query.chars().count() <= 2;
+        let mut content_matches = HashMap::new();
+
+        if !query.is_empty() && !short_query {
+            let fts_query = format!("extracted_text : {}", fts_phrase(query));
+            let mut statement = library.connection.prepare(
+                "
+                SELECT
+                    document_id,
+                    snippet(document_search, 3, '', '', '…', 36)
+                FROM document_search
+                WHERE document_search MATCH ?1
+                ",
+            )?;
+            let matches = statement.query_map(params![fts_query], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for result in matches {
+                let (document_id, snippet) = result?;
+                content_matches.insert(document_id, snippet);
+            }
+        }
+
+        let documents = load_filtered_documents(&library.connection, &filters)?;
+        let collection_names = load_collection_names(&library.connection)?;
+        let mut results = Vec::new();
+        for document in documents {
+            if query.is_empty() {
+                results.push(DocumentSearchResult {
+                    document,
+                    snippet: None,
+                    match_kind: SearchMatchKind::Metadata,
+                });
+                continue;
+            }
+
+            let content_snippet = content_matches
+                .get(&document.id)
+                .filter(|snippet| !snippet.trim().is_empty())
+                .cloned();
+            if short_query {
+                if metadata_matches(&document, query, &collection_names) {
+                    results.push(DocumentSearchResult {
+                        document,
+                        snippet: None,
+                        match_kind: SearchMatchKind::Metadata,
+                    });
+                }
+                continue;
+            }
+
+            if let Some(snippet) = content_snippet {
+                results.push(DocumentSearchResult {
+                    document,
+                    snippet: Some(snippet),
+                    match_kind: SearchMatchKind::Content,
+                });
+            } else if metadata_matches(&document, query, &collection_names) {
+                results.push(DocumentSearchResult {
+                    document,
+                    snippet: None,
+                    match_kind: SearchMatchKind::Metadata,
+                });
+            }
+        }
+
+        Ok(DocumentSearchResponse { results })
+    }
+
+    pub fn index_pending_documents(&mut self) -> LibraryResult<IndexRunResult> {
+        let mut result = IndexRunResult::default();
+        while let Some(document) = self.index_next_pending_document()? {
+            result.processed += 1;
+            match document.index_status {
+                IndexStatus::Searchable => result.searchable += 1,
+                IndexStatus::Failed => result.failed += 1,
+                IndexStatus::Pending => {}
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn index_next_pending_document(&mut self) -> LibraryResult<Option<DocumentSummary>> {
+        let document_id = {
+            let library = self
+                .current
+                .as_ref()
+                .ok_or(LibraryError::NoCurrentLibrary)?;
+            library
+                .connection
+                .query_row(
+                    "
+                    SELECT id
+                    FROM documents
+                    WHERE deleted_at IS NULL AND index_status = 'pending'
+                    ORDER BY imported_at, id
+                    LIMIT 1
+                    ",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        };
+        document_id
+            .map(|document_id| self.index_document(&document_id))
+            .transpose()
+    }
+
+    pub fn retry_document_index(&mut self, document_id: &str) -> LibraryResult<DocumentSummary> {
+        {
+            let library = self
+                .current
+                .as_ref()
+                .ok_or(LibraryError::NoCurrentLibrary)?;
+            ensure_document_exists(&library.connection, document_id)?;
+            library.connection.execute(
+                "
+                UPDATE documents
+                SET index_status = 'pending',
+                    error_stage = NULL,
+                    error_message = NULL,
+                    updated_at = ?1
+                WHERE id = ?2 AND deleted_at IS NULL
+                ",
+                params![now(), document_id],
+            )?;
+        }
+        self.index_document(document_id)
+    }
+
+    fn index_document(&mut self, document_id: &str) -> LibraryResult<DocumentSummary> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let path = self.document_copy_path(&stored)?;
+        let extraction = ensure_document_copy_exists(&path)
+            .and_then(|_| extract_search_text(&path, &stored.file_type));
+
+        let (index_status, extracted_text, error_message) = match extraction {
+            Ok(text) => (IndexStatus::Searchable, text, None),
+            Err(error) => (IndexStatus::Failed, String::new(), Some(error.to_string())),
+        };
+
+        let library = self
+            .current
+            .as_mut()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let transaction = library.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM document_search WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        if index_status == IndexStatus::Searchable {
+            transaction.execute(
+                "
+                INSERT INTO document_search (document_id, title, description, extracted_text)
+                SELECT id, title, description, ?1
+                FROM documents
+                WHERE id = ?2 AND deleted_at IS NULL
+                ",
+                params![&extracted_text, document_id],
+            )?;
+        }
+        let updated = transaction.execute(
+            "
+            UPDATE documents
+            SET index_status = ?1,
+                error_stage = ?2,
+                error_message = ?3,
+                updated_at = ?4
+            WHERE id = ?5 AND deleted_at IS NULL
+            ",
+            params![
+                index_status.as_str(),
+                error_message.as_ref().map(|_| "indexing"),
+                error_message.as_deref(),
+                now(),
+                document_id,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(LibraryError::DocumentNotFound(format!(
+                "文档不存在或已删除：{document_id}"
+            )));
+        }
+        transaction.commit()?;
+        load_document_summary(&library.connection, document_id)
     }
 
     pub fn get_document_preview(&self, document_id: &str) -> LibraryResult<DocumentPreview> {
@@ -3040,6 +3271,395 @@ fn extract_wordprocessing_text(xml: &[u8]) -> LibraryResult<String> {
         .join("\n")
         .trim()
         .to_string())
+}
+
+fn normalize_search_filters(
+    filters: DocumentSearchFilters,
+) -> LibraryResult<DocumentSearchFilters> {
+    let filters = DocumentSearchFilters {
+        collection_id: normalize_optional_text(filters.collection_id),
+        tag_id: normalize_optional_text(filters.tag_id),
+        file_type: normalize_optional_text(filters.file_type)
+            .map(|file_type| file_type.to_ascii_uppercase()),
+        document_date_from: normalize_optional_text(filters.document_date_from),
+        document_date_to: normalize_optional_text(filters.document_date_to),
+    };
+    if let Some(date) = filters.document_date_from.as_deref() {
+        validate_document_date(date)?;
+    }
+    if let Some(date) = filters.document_date_to.as_deref() {
+        validate_document_date(date)?;
+    }
+    if let (Some(from), Some(to)) = (
+        filters.document_date_from.as_deref(),
+        filters.document_date_to.as_deref(),
+    ) {
+        if from > to {
+            return Err(LibraryError::InvalidDocumentMetadata(
+                "文档日期起始值不能晚于结束值。".to_string(),
+            ));
+        }
+    }
+    Ok(filters)
+}
+
+fn load_filtered_documents(
+    connection: &Connection,
+    filters: &DocumentSearchFilters,
+) -> LibraryResult<Vec<DocumentSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            d.id,
+            d.title,
+            d.file_name,
+            d.file_type,
+            d.file_size,
+            d.content_hash,
+            d.collection_id,
+            d.processing_status,
+            d.index_status,
+            d.error_stage,
+            d.error_message,
+            d.imported_at,
+            COALESCE(s.source_path, ''),
+            COALESCE(s.source_identifier, ''),
+            COALESCE(s.last_imported_at, d.imported_at),
+            d.description,
+            d.document_date
+        FROM documents d
+        LEFT JOIN sources s ON s.document_id = d.id
+        WHERE d.deleted_at IS NULL
+          AND (?1 IS NULL OR d.collection_id = ?1)
+          AND (
+              ?2 IS NULL OR EXISTS (
+                  SELECT 1
+                  FROM document_tags dt
+                  WHERE dt.document_id = d.id AND dt.tag_id = ?2
+              )
+          )
+          AND (?3 IS NULL OR UPPER(d.file_type) = UPPER(?3))
+          AND (
+              ?4 IS NULL OR
+              (d.document_date IS NOT NULL AND d.document_date >= ?4)
+          )
+          AND (
+              ?5 IS NULL OR
+              (d.document_date IS NOT NULL AND d.document_date <= ?5)
+          )
+        ORDER BY d.imported_at DESC, d.id DESC
+        ",
+    )?;
+    let mut documents = statement
+        .query_map(
+            params![
+                filters.collection_id.as_deref(),
+                filters.tag_id.as_deref(),
+                filters.file_type.as_deref(),
+                filters.document_date_from.as_deref(),
+                filters.document_date_to.as_deref(),
+            ],
+            document_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for document in &mut documents {
+        document.tags = load_document_tags(connection, &document.id)?;
+    }
+    Ok(documents)
+}
+
+fn load_collection_names(connection: &Connection) -> LibraryResult<HashMap<String, String>> {
+    let mut statement = connection.prepare("SELECT id, name FROM collections")?;
+    let names = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    Ok(names)
+}
+
+fn metadata_matches(
+    document: &DocumentSummary,
+    query: &str,
+    collection_names: &HashMap<String, String>,
+) -> bool {
+    let query = query.to_lowercase();
+    let mut values = vec![
+        document.title.clone(),
+        document.description.clone().unwrap_or_default(),
+        document.file_name.clone(),
+        document.file_type.clone(),
+        document.document_date.clone().unwrap_or_default(),
+        document.source_path.clone(),
+    ];
+    values.extend(document.tags.iter().map(|tag| tag.name.clone()));
+    if let Some(collection_name) = collection_names.get(&document.collection_id) {
+        values.push(collection_name.clone());
+    }
+    values
+        .iter()
+        .any(|value| value.to_lowercase().contains(&query))
+}
+
+fn fts_phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
+fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
+    match file_type {
+        "PDF" => extract_pdf_text(path),
+        "DOCX" => extract_docx_text(path),
+        "TXT" | "Markdown" => read_utf8_text(path),
+        "JPG" | "PNG" => Ok(String::new()),
+        _ => Err(LibraryError::UnsupportedFile(format!(
+            "不支持的索引格式：{file_type}"
+        ))),
+    }
+}
+
+fn extract_pdf_text(path: &Path) -> LibraryResult<String> {
+    let bytes = fs::read(path)?;
+    let mut cursor = 0;
+    let mut text = String::new();
+
+    while let Some(relative_stream) = find_bytes(&bytes[cursor..], b"stream") {
+        let stream_keyword = cursor + relative_stream;
+        let dictionary_start = bytes[..stream_keyword]
+            .windows(2)
+            .rposition(|window| window == b"<<")
+            .unwrap_or(0);
+        let dictionary = &bytes[dictionary_start..stream_keyword];
+        let mut data_start = stream_keyword + b"stream".len();
+        if bytes.get(data_start) == Some(&b'\r') {
+            data_start += 1;
+        }
+        if bytes.get(data_start) == Some(&b'\n') {
+            data_start += 1;
+        }
+        let Some(relative_end) = find_bytes(&bytes[data_start..], b"endstream") else {
+            break;
+        };
+        let data_end = data_start + relative_end;
+        let stream = &bytes[data_start..data_end];
+        let decoded = decode_pdf_stream(dictionary, stream)?;
+        let stream_text = extract_pdf_content_text(&decoded);
+        if !stream_text.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&stream_text);
+        }
+        cursor = data_end + b"endstream".len();
+    }
+
+    Ok(normalize_extracted_text(&text))
+}
+
+fn decode_pdf_stream(dictionary: &[u8], stream: &[u8]) -> LibraryResult<Vec<u8>> {
+    let dictionary = String::from_utf8_lossy(dictionary);
+    if dictionary.contains("FlateDecode") {
+        let mut decoder = ZlibDecoder::new(Cursor::new(stream));
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .map_err(|error| LibraryError::Preview(format!("无法解压 PDF 正文流：{error}")))?;
+        Ok(decoded)
+    } else {
+        Ok(stream.to_vec())
+    }
+}
+
+fn extract_pdf_content_text(content: &[u8]) -> String {
+    if find_bytes(content, b"BT").is_none()
+        && find_bytes(content, b"Tj").is_none()
+        && find_bytes(content, b"TJ").is_none()
+    {
+        return String::new();
+    }
+
+    let mut cursor = 0;
+    let mut parts = Vec::new();
+
+    while cursor < content.len() {
+        match content[cursor] {
+            b'(' => {
+                if let Some((bytes, next)) = parse_pdf_literal(content, cursor + 1) {
+                    let text = decode_pdf_text_bytes(&bytes);
+                    if !text.trim().is_empty() {
+                        parts.push(text);
+                    }
+                    cursor = next;
+                } else {
+                    break;
+                }
+            }
+            b'<' if content.get(cursor + 1) != Some(&b'<') => {
+                if let Some((bytes, next)) = parse_pdf_hex_string(content, cursor + 1) {
+                    let text = decode_pdf_text_bytes(&bytes);
+                    if !text.trim().is_empty() {
+                        parts.push(text);
+                    }
+                    cursor = next;
+                } else {
+                    break;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+
+    parts.join(" ")
+}
+
+fn parse_pdf_literal(content: &[u8], mut cursor: usize) -> Option<(Vec<u8>, usize)> {
+    let mut depth = 1_u32;
+    let mut output = Vec::new();
+
+    while cursor < content.len() {
+        let byte = content[cursor];
+        cursor += 1;
+        match byte {
+            b'\\' => {
+                let escaped = *content.get(cursor)?;
+                cursor += 1;
+                match escaped {
+                    b'n' => output.push(b'\n'),
+                    b'r' => output.push(b'\r'),
+                    b't' => output.push(b'\t'),
+                    b'b' => output.push(0x08),
+                    b'f' => output.push(0x0C),
+                    b'\r' => {
+                        if content.get(cursor) == Some(&b'\n') {
+                            cursor += 1;
+                        }
+                    }
+                    b'\n' => {}
+                    b'0'..=b'7' => {
+                        let mut value = u16::from(escaped - b'0');
+                        for _ in 0..2 {
+                            match content.get(cursor) {
+                                Some(next @ b'0'..=b'7') => {
+                                    value = value * 8 + u16::from(*next - b'0');
+                                    cursor += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        output.push(value as u8);
+                    }
+                    other => output.push(other),
+                }
+            }
+            b'(' => {
+                depth += 1;
+                output.push(byte);
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((output, cursor));
+                }
+                output.push(byte);
+            }
+            other => output.push(other),
+        }
+    }
+
+    None
+}
+
+fn parse_pdf_hex_string(content: &[u8], mut cursor: usize) -> Option<(Vec<u8>, usize)> {
+    let mut digits = Vec::new();
+    while cursor < content.len() {
+        let byte = content[cursor];
+        cursor += 1;
+        if byte == b'>' {
+            if digits.len() % 2 == 1 {
+                digits.push(0);
+            }
+            let bytes = digits
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| {
+                    let high = hex_digit(pair[0])?;
+                    let low = hex_digit(pair[1])?;
+                    Some((high << 4) | low)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some((bytes, cursor));
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if !byte.is_ascii_hexdigit() {
+            return None;
+        }
+        digits.push(byte);
+    }
+    None
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_pdf_text_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16_be(&bytes[2..]);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    if bytes.len().is_multiple_of(2) {
+        let decoded = decode_utf16_be(bytes);
+        if !decoded.contains('\u{FFFD}') {
+            return decoded;
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn decode_utf16_be(bytes: &[u8]) -> String {
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
+fn normalize_extracted_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentSummary> {

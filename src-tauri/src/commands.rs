@@ -1,28 +1,33 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
     BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate,
-    DocumentPreview, DocumentSummary, DocumentThumbnail, ImportBatch, ImportDecision,
-    ImportItemResult, ImportProgress, LibraryError, LibraryResult, LibraryService, LibrarySummary,
+    DocumentPreview, DocumentSearchQuery, DocumentSearchResponse, DocumentSummary,
+    DocumentThumbnail, ImportBatch, ImportDecision, ImportItemResult, ImportProgress,
+    IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService, LibrarySummary,
     RecentLibrary, TagSummary,
 };
 
 pub struct AppState {
-    service: Mutex<LibraryService>,
+    service: Arc<Mutex<LibraryService>>,
 }
 
 impl AppState {
     pub fn new(service: LibraryService) -> Self {
         Self {
-            service: Mutex::new(service),
+            service: Arc::new(Mutex::new(service)),
         }
     }
 
     fn service(&self) -> LibraryResult<MutexGuard<'_, LibraryService>> {
         self.service.lock().map_err(|_| LibraryError::StateLock)
+    }
+
+    fn service_handle(&self) -> Arc<Mutex<LibraryService>> {
+        Arc::clone(&self.service)
     }
 }
 
@@ -431,6 +436,78 @@ fn list_documents_contract(state: &AppState) -> Result<Vec<DocumentSummary>, Com
 }
 
 #[tauri::command]
+pub async fn search_documents(
+    request: DocumentSearchQuery,
+    state: State<'_, AppState>,
+) -> Result<DocumentSearchResponse, CommandError> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?
+            .search_documents(request)
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "searchTask".to_string(),
+        message: format!("搜索任务无法完成：{error}"),
+    })?
+}
+
+#[tauri::command]
+pub async fn index_pending_documents(
+    state: State<'_, AppState>,
+) -> Result<IndexRunResult, CommandError> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut result = IndexRunResult::default();
+        loop {
+            let document = service
+                .lock()
+                .map_err(|_| LibraryError::StateLock)?
+                .index_next_pending_document()
+                .map_err(CommandError::from)?;
+            let Some(document) = document else {
+                break;
+            };
+            result.processed += 1;
+            match document.index_status {
+                IndexStatus::Searchable => result.searchable += 1,
+                IndexStatus::Failed => result.failed += 1,
+                IndexStatus::Pending => {}
+            }
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "indexTask".to_string(),
+        message: format!("索引任务无法完成：{error}"),
+    })?
+}
+
+#[tauri::command]
+pub async fn retry_document_index(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentSummary, CommandError> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?
+            .retry_document_index(&document_id)
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "indexTask".to_string(),
+        message: format!("索引任务无法完成：{error}"),
+    })?
+}
+
+#[tauri::command]
 pub fn get_document_preview(
     document_id: String,
     state: State<'_, AppState>,
@@ -536,8 +613,9 @@ mod tests {
         update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
     };
     use crate::library::{
-        DocumentMetadataUpdate, DocumentPreview, DocumentThumbnail, ImportDecision,
-        ImportItemStatus, LibraryService, LibrarySummary, LocationStatus,
+        DocumentMetadataUpdate, DocumentPreview, DocumentSearchFilters, DocumentSearchQuery,
+        DocumentThumbnail, ImportDecision, ImportItemStatus, LibraryService, LibrarySummary,
+        LocationStatus,
     };
     use tempfile::tempdir;
 
@@ -593,6 +671,62 @@ mod tests {
         .unwrap();
         assert_eq!(thumbnail["kind"], "fallback");
         assert!(thumbnail.get("reason").is_some());
+    }
+
+    #[test]
+    fn search_contract_uses_camel_case_and_returns_match_details() {
+        let request: DocumentSearchQuery = serde_json::from_value(serde_json::json!({
+            "query": "正文匹配",
+            "filters": {
+                "collectionId": null,
+                "tagId": null,
+                "fileType": "TXT",
+                "documentDateFrom": null,
+                "documentDateTo": null
+            }
+        }))
+        .unwrap();
+        assert_eq!(request.filters.file_type.as_deref(), Some("TXT"));
+
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        create_library_contract(
+            &state,
+            root.path().join("Library").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        let source_path = root.path().join("document.txt");
+        std::fs::write(&source_path, "正文匹配内容").unwrap();
+        let document_id = start_import_contract(
+            &state,
+            vec![source_path.to_string_lossy().into_owned()],
+            |_| {},
+        )
+        .unwrap()
+        .items
+        .remove(0)
+        .document_id
+        .unwrap();
+        state.service().unwrap().index_pending_documents().unwrap();
+
+        let response = state
+            .service()
+            .unwrap()
+            .search_documents(DocumentSearchQuery {
+                filters: DocumentSearchFilters {
+                    file_type: Some("TXT".to_string()),
+                    ..DocumentSearchFilters::default()
+                },
+                ..request
+            })
+            .unwrap();
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["results"][0]["document"]["id"], document_id);
+        assert_eq!(value["results"][0]["matchKind"], "content");
+        assert!(value["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("正文匹配"));
     }
 
     #[test]

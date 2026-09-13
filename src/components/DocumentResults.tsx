@@ -1,13 +1,16 @@
 import {
   FileText,
   Image as ImageIcon,
-  Pencil
+  LoaderCircle,
+  Pencil,
+  RotateCcw
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import type {
   BackendClient,
   CollectionSummary,
+  DocumentSearchResult,
   DocumentSummary,
   DocumentThumbnail
 } from "../backend/types";
@@ -22,12 +25,15 @@ interface DocumentResultsProps {
   collections: CollectionSummary[];
   selectedDocumentId: string | null;
   highlightedDocumentId: string | null;
+  searchResults: DocumentSearchResult[];
+  retryingIndexIds: Set<string>;
   onSelectDocument: (documentId: string) => void;
   onMoveDocument: (
     document: DocumentSummary,
     collectionId: string
   ) => void;
   onEditDocument: (document: DocumentSummary) => void;
+  onRetryIndex: (document: DocumentSummary) => void;
 }
 
 export function documentStatusPresentation(
@@ -172,19 +178,29 @@ function DocumentRow({
   collections,
   selected,
   highlighted,
+  searchResult,
+  retryingIndex,
   onSelect,
   onMove,
-  onEdit
+  onEdit,
+  onRetryIndex
 }: {
   document: DocumentSummary;
   collections: CollectionSummary[];
   selected: boolean;
   highlighted: boolean;
+  searchResult: DocumentSearchResult | null;
+  retryingIndex: boolean;
   onSelect: () => void;
   onMove: (collectionId: string) => void;
   onEdit: () => void;
+  onRetryIndex: () => void;
 }) {
   const status = documentStatusPresentation(document);
+  const resultCopy =
+    searchResult?.snippet && searchResult.matchKind === "content"
+      ? searchResult.snippet
+      : document.fileName;
 
   return (
     <article
@@ -206,7 +222,19 @@ function DocumentRow({
           <DocumentIcon document={document} />
           <span className="document-title-copy">
             <strong title={document.title}>{document.title}</strong>
-            <span title={document.fileName}>{document.fileName}</span>
+            <span
+              className={
+                searchResult?.snippet && searchResult.matchKind === "content"
+                  ? "document-match-snippet"
+                  : undefined
+              }
+              title={resultCopy}
+            >
+              {searchResult?.snippet && searchResult.matchKind === "content" ? (
+                <span className="visually-hidden">正文匹配片段：</span>
+              ) : null}
+              {resultCopy}
+            </span>
           </span>
         </button>
       </div>
@@ -241,13 +269,30 @@ function DocumentRow({
         </select>
       </label>
       <DocumentTags document={document} tableCell />
-      <span
-        className={`status-badge ${status.tone}`}
-        role="cell"
-        title={document.errorMessage ?? undefined}
-      >
-        {status.label}
-      </span>
+      <div className="document-status-cell" role="cell">
+        <span
+          className={`status-badge ${status.tone}`}
+          title={document.errorMessage ?? undefined}
+        >
+          {status.label}
+        </span>
+        {document.indexStatus === "failed" ? (
+          <button
+            className="icon-button compact retry-index"
+            type="button"
+            onClick={onRetryIndex}
+            disabled={retryingIndex}
+            aria-label={`重试索引 ${document.title}`}
+            title="重试索引"
+          >
+            {retryingIndex ? (
+              <LoaderCircle className="spin" size={14} aria-hidden="true" />
+            ) : (
+              <RotateCcw size={14} aria-hidden="true" />
+            )}
+          </button>
+        ) : null}
+      </div>
       <div className="document-actions-cell" role="cell">
         <button
           className="icon-button compact document-edit"
@@ -268,9 +313,12 @@ export function DocumentList({
   collections,
   selectedDocumentId,
   highlightedDocumentId,
+  searchResults,
+  retryingIndexIds,
   onSelectDocument,
   onMoveDocument,
-  onEditDocument
+  onEditDocument,
+  onRetryIndex
 }: DocumentResultsProps) {
   return (
     <main className="document-area" aria-label="文档列表">
@@ -303,11 +351,18 @@ export function DocumentList({
               collections={collections}
               selected={document.id === selectedDocumentId}
               highlighted={document.id === highlightedDocumentId}
+              searchResult={
+                searchResults.find(
+                  (result) => result.document.id === document.id
+                ) ?? null
+              }
+              retryingIndex={retryingIndexIds.has(document.id)}
               onSelect={() => onSelectDocument(document.id)}
               onMove={(collectionId) =>
                 onMoveDocument(document, collectionId)
               }
               onEdit={() => onEditDocument(document)}
+              onRetryIndex={() => onRetryIndex(document)}
             />
           ))}
         </div>
@@ -322,7 +377,10 @@ export function DocumentGrid({
   collections,
   selectedDocumentId,
   highlightedDocumentId,
-  onSelectDocument
+  searchResults,
+  retryingIndexIds,
+  onSelectDocument,
+  onRetryIndex
 }: DocumentResultsProps & { client: BackendClient }) {
   return (
     <main className="document-area" aria-label="文档网格">
@@ -334,6 +392,13 @@ export function DocumentGrid({
           );
           const selected = document.id === selectedDocumentId;
           const highlighted = document.id === highlightedDocumentId;
+          const searchResult =
+            searchResults.find((result) => result.document.id === document.id) ??
+            null;
+          const resultCopy =
+            searchResult?.snippet && searchResult.matchKind === "content"
+              ? searchResult.snippet
+              : document.fileName;
 
           return (
             <article
@@ -360,8 +425,8 @@ export function DocumentGrid({
                   <span>{document.fileType}</span>
                 </span>
                 <strong title={document.title}>{document.title}</strong>
-                <span className="document-grid-file" title={document.fileName}>
-                  {document.fileName}
+                <span className="document-grid-file" title={resultCopy}>
+                  {resultCopy}
                 </span>
                 <span className="document-grid-metadata">
                   <span title={document.documentDate ?? "未设置"}>
@@ -376,6 +441,26 @@ export function DocumentGrid({
                   {status.label}
                 </span>
               </button>
+              {document.indexStatus === "failed" ? (
+                <button
+                  className="icon-button compact grid-retry-index"
+                  type="button"
+                  onClick={() => onRetryIndex(document)}
+                  disabled={retryingIndexIds.has(document.id)}
+                  aria-label={`重试索引 ${document.title}`}
+                  title="重试索引"
+                >
+                  {retryingIndexIds.has(document.id) ? (
+                    <LoaderCircle
+                      className="spin"
+                      size={14}
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <RotateCcw size={14} aria-hidden="true" />
+                  )}
+                </button>
+              ) : null}
             </article>
           );
         })}
