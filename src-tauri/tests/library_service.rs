@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use personal_document_manager_lib::library::{
+    BatchDocumentItemStatus, BatchDocumentOperation, BatchDocumentOperationRequest,
     DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus,
     DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail,
     ExternalChangeMonitor, ImportDecision, ImportItemStatus, IndexStatus, LibraryService,
@@ -777,6 +778,283 @@ fn manages_tag_lifecycle_and_multiple_document_tags_without_deleting_documents()
         .join(&remaining_document.id)
         .join(&remaining_document.file_name);
     assert!(library_copy.is_file());
+}
+
+#[test]
+fn batch_organizes_every_document_and_refreshes_derived_counts() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let collection = service.create_collection("归档".to_string(), None).unwrap();
+    let tag = service.create_tag("重要".to_string()).unwrap();
+
+    let mut document_ids = Vec::new();
+    for index in 1..=3 {
+        let source_path = root.path().join(format!("document-{index}.txt"));
+        fs::write(&source_path, format!("document {index}")).unwrap();
+        document_ids.push(service.import_document(source_path).unwrap().id);
+    }
+
+    let moved = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "move-all".to_string(),
+                document_ids: document_ids.clone(),
+                operation: BatchDocumentOperation::MoveToCollection {
+                    collection_id: collection.id.clone(),
+                },
+            },
+            || false,
+        )
+        .unwrap();
+    assert_eq!(moved.succeeded_count, 3);
+    assert_eq!(moved.failed_count, 0);
+    assert_eq!(moved.cancelled_count, 0);
+    assert!(moved
+        .results
+        .iter()
+        .all(|result| result.status == BatchDocumentItemStatus::Succeeded));
+    assert_eq!(
+        service
+            .list_documents()
+            .unwrap()
+            .iter()
+            .filter(|document| document.collection_id == collection.id)
+            .count(),
+        3
+    );
+    assert_eq!(
+        service
+            .list_collections()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == collection.id)
+            .unwrap()
+            .document_count,
+        3
+    );
+
+    let tagged = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "tag-all".to_string(),
+                document_ids: document_ids.clone(),
+                operation: BatchDocumentOperation::AddTag {
+                    tag_id: tag.id.clone(),
+                },
+            },
+            || false,
+        )
+        .unwrap();
+    assert_eq!(tagged.succeeded_count, 3);
+    assert_eq!(service.list_tags().unwrap()[0].document_count, 3);
+
+    let untagged = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "untag-all".to_string(),
+                document_ids: document_ids.clone(),
+                operation: BatchDocumentOperation::RemoveTag {
+                    tag_id: tag.id.clone(),
+                },
+            },
+            || false,
+        )
+        .unwrap();
+    assert_eq!(untagged.succeeded_count, 3);
+    assert_eq!(service.list_tags().unwrap()[0].document_count, 0);
+
+    let trashed = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "trash-all".to_string(),
+                document_ids,
+                operation: BatchDocumentOperation::MoveToTrash,
+            },
+            || false,
+        )
+        .unwrap();
+    assert_eq!(trashed.succeeded_count, 3);
+    assert!(service.list_documents().unwrap().is_empty());
+    assert_eq!(service.list_trash_documents().unwrap().len(), 3);
+    assert_eq!(
+        service
+            .list_collections()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == collection.id)
+            .unwrap()
+            .document_count,
+        0
+    );
+}
+
+#[test]
+fn batch_organize_keeps_successes_when_one_document_fails() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let collection = service.create_collection("项目".to_string(), None).unwrap();
+
+    let mut document_ids = Vec::new();
+    for index in 1..=2 {
+        let source_path = root.path().join(format!("document-{index}.txt"));
+        fs::write(&source_path, format!("document {index}")).unwrap();
+        document_ids.push(service.import_document(source_path).unwrap().id);
+    }
+    document_ids.insert(1, "missing-document".to_string());
+
+    let result = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "partial".to_string(),
+                document_ids: document_ids.clone(),
+                operation: BatchDocumentOperation::MoveToCollection {
+                    collection_id: collection.id.clone(),
+                },
+            },
+            || false,
+        )
+        .unwrap();
+
+    assert_eq!(result.succeeded_count, 2);
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(result.cancelled_count, 0);
+    assert_eq!(result.results[1].document_id, "missing-document");
+    assert_eq!(result.results[1].status, BatchDocumentItemStatus::Failed);
+    assert_eq!(
+        result.results[1].error_code.as_deref(),
+        Some("documentNotFound")
+    );
+    assert!(result.results[1]
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("missing-document"));
+    assert_eq!(
+        service
+            .list_documents()
+            .unwrap()
+            .iter()
+            .filter(|document| document.collection_id == collection.id)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn batch_organize_cancels_remaining_items_and_preserves_completed_work() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let collection = service.create_collection("归档".to_string(), None).unwrap();
+
+    let mut document_ids = Vec::new();
+    for index in 1..=3 {
+        let source_path = root.path().join(format!("document-{index}.txt"));
+        fs::write(&source_path, format!("document {index}")).unwrap();
+        document_ids.push(service.import_document(source_path).unwrap().id);
+    }
+
+    let mut cancellation_checks = 0;
+    let result = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "cancel-after-first".to_string(),
+                document_ids: document_ids.clone(),
+                operation: BatchDocumentOperation::MoveToCollection {
+                    collection_id: collection.id.clone(),
+                },
+            },
+            || {
+                cancellation_checks += 1;
+                cancellation_checks > 1
+            },
+        )
+        .unwrap();
+
+    assert_eq!(result.succeeded_count, 1);
+    assert_eq!(result.cancelled_count, 2);
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.results[0].status, BatchDocumentItemStatus::Succeeded);
+    assert_eq!(result.results[1].status, BatchDocumentItemStatus::Cancelled);
+    assert_eq!(result.results[2].status, BatchDocumentItemStatus::Cancelled);
+    assert_eq!(
+        service
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .filter(|document| document.collection_id == collection.id)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn batch_organize_failed_items_can_be_retried_after_their_blocker_is_removed() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let tag = service.create_tag("重要".to_string()).unwrap();
+
+    let first_source = root.path().join("first.txt");
+    let second_source = root.path().join("second.txt");
+    fs::write(&first_source, "first").unwrap();
+    fs::write(&second_source, "second").unwrap();
+    let first = service.import_document(first_source).unwrap();
+    let second = service.import_document(second_source).unwrap();
+    service.move_document_to_trash(&second.id).unwrap();
+
+    let initial = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "initial-retry".to_string(),
+                document_ids: vec![first.id.clone(), second.id.clone()],
+                operation: BatchDocumentOperation::AddTag {
+                    tag_id: tag.id.clone(),
+                },
+            },
+            || false,
+        )
+        .unwrap();
+    assert_eq!(initial.succeeded_count, 1);
+    assert_eq!(initial.failed_count, 1);
+    let failed_id = initial.results[1].document_id.clone();
+
+    service.restore_document(&failed_id).unwrap();
+    let retried = service
+        .batch_organize_documents(
+            BatchDocumentOperationRequest {
+                job_id: "retry-failed".to_string(),
+                document_ids: vec![failed_id.clone()],
+                operation: BatchDocumentOperation::AddTag {
+                    tag_id: tag.id.clone(),
+                },
+            },
+            || false,
+        )
+        .unwrap();
+
+    assert_eq!(retried.succeeded_count, 1);
+    assert_eq!(retried.failed_count, 0);
+    assert_eq!(service.list_tags().unwrap()[0].document_count, 2);
+    assert!(service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == failed_id)
+        .unwrap()
+        .tags
+        .iter()
+        .any(|candidate| candidate.id == tag.id));
 }
 
 #[test]

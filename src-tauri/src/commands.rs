@@ -1,19 +1,25 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
-    BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate,
-    DocumentPreview, DocumentSearchQuery, DocumentSearchResponse, DocumentSummary,
-    DocumentThumbnail, EmptyTrashResult, ExternalChangeMonitor, ImportBatch, ImportDecision,
-    ImportItemResult, ImportProgress, IndexRunResult, IndexStatus, LibraryError, LibraryResult,
-    LibraryService, LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
+    BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState,
+    CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate, DocumentPreview,
+    DocumentSearchQuery, DocumentSearchResponse, DocumentSummary, DocumentThumbnail,
+    EmptyTrashResult, ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult,
+    ImportProgress, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
+    LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
     service: Arc<Mutex<LibraryService>>,
     monitor: Mutex<Option<ExternalChangeMonitor>>,
+    batch_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -21,6 +27,7 @@ impl AppState {
         Self {
             service: Arc::new(Mutex::new(service)),
             monitor: Mutex::new(None),
+            batch_cancellations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -38,6 +45,36 @@ impl AppState {
     ) -> LibraryResult<()> {
         let mut current = self.monitor.lock().map_err(|_| LibraryError::StateLock)?;
         *current = Some(monitor);
+        Ok(())
+    }
+
+    fn begin_batch(&self, job_id: &str) -> LibraryResult<Arc<AtomicBool>> {
+        let mut cancellations = self
+            .batch_cancellations
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        cancellations.insert(job_id.to_string(), Arc::clone(&cancellation));
+        Ok(cancellation)
+    }
+
+    fn cancel_batch(&self, job_id: &str) -> LibraryResult<bool> {
+        let cancellations = self
+            .batch_cancellations
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?;
+        let Some(cancellation) = cancellations.get(job_id) else {
+            return Ok(false);
+        };
+        cancellation.store(true, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn finish_batch(&self, job_id: &str) -> LibraryResult<()> {
+        self.batch_cancellations
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?
+            .remove(job_id);
         Ok(())
     }
 }
@@ -522,6 +559,36 @@ fn update_document_metadata_contract(
 }
 
 #[tauri::command]
+pub async fn batch_organize_documents(
+    request: BatchDocumentOperationRequest,
+    state: State<'_, AppState>,
+) -> Result<BatchDocumentOperationResult, CommandError> {
+    let job_id = request.job_id.clone();
+    let cancellation = state.begin_batch(&job_id).map_err(CommandError::from)?;
+    let service = state.service_handle();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service
+            .batch_organize_documents(request, || cancellation.load(Ordering::Relaxed))
+            .map_err(CommandError::from)
+    })
+    .await;
+    state.finish_batch(&job_id).map_err(CommandError::from)?;
+    task.map_err(|error| CommandError {
+        code: "batchTask".to_string(),
+        message: format!("批量操作无法完成：{error}"),
+    })?
+}
+
+#[tauri::command]
+pub fn cancel_batch_document_operation(
+    job_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, CommandError> {
+    state.cancel_batch(&job_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
 pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<DocumentSummary>, CommandError> {
     list_documents_contract(&state)
 }
@@ -714,9 +781,9 @@ mod tests {
         LibraryChangedEvent,
     };
     use crate::library::{
-        DocumentMetadataUpdate, DocumentPreview, DocumentSearchFilters, DocumentSearchQuery,
-        DocumentThumbnail, ImportDecision, ImportItemStatus, LibraryService, LibrarySummary,
-        LocationStatus,
+        BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
+        DocumentPreview, DocumentSearchFilters, DocumentSearchQuery, DocumentThumbnail,
+        ImportDecision, ImportItemStatus, LibraryService, LibrarySummary, LocationStatus,
     };
     use tempfile::tempdir;
 
@@ -772,6 +839,69 @@ mod tests {
         .unwrap();
         assert_eq!(thumbnail["kind"], "fallback");
         assert!(thumbnail.get("reason").is_some());
+    }
+
+    #[test]
+    fn batch_operation_contract_uses_camel_case() {
+        let request: BatchDocumentOperationRequest = serde_json::from_value(serde_json::json!({
+            "jobId": "batch-1",
+            "documentIds": ["document-1", "document-2"],
+            "operation": {
+                "kind": "moveToCollection",
+                "collectionId": "projects"
+            }
+        }))
+        .unwrap();
+        assert_eq!(request.job_id, "batch-1");
+        assert_eq!(request.document_ids.len(), 2);
+        assert_eq!(
+            request.operation,
+            BatchDocumentOperation::MoveToCollection {
+                collection_id: "projects".to_string()
+            }
+        );
+
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        create_library_contract(
+            &state,
+            root.path().join("Library").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        let collection = create_collection_contract(&state, "项目".to_string(), None).unwrap();
+        let source_path = root.path().join("document.txt");
+        std::fs::write(&source_path, "document").unwrap();
+        let document_id = start_import_contract(
+            &state,
+            vec![source_path.to_string_lossy().into_owned()],
+            |_| {},
+        )
+        .unwrap()
+        .items
+        .remove(0)
+        .document_id
+        .unwrap();
+
+        let result = state
+            .service()
+            .unwrap()
+            .batch_organize_documents(
+                BatchDocumentOperationRequest {
+                    job_id: request.job_id,
+                    document_ids: vec![document_id.clone()],
+                    operation: BatchDocumentOperation::MoveToCollection {
+                        collection_id: collection.id,
+                    },
+                },
+                || false,
+            )
+            .unwrap();
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["jobId"], "batch-1");
+        assert_eq!(value["succeededCount"], 1);
+        assert_eq!(value["results"][0]["documentId"], document_id);
+        assert_eq!(value["results"][0]["status"], "succeeded");
+        assert!(value["results"][0].get("errorMessage").is_some());
     }
 
     #[test]

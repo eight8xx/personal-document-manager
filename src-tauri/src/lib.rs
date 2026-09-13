@@ -54,6 +54,8 @@ pub fn run() {
             commands::add_tag_to_document,
             commands::remove_tag_from_document,
             commands::update_document_metadata,
+            commands::batch_organize_documents,
+            commands::cancel_batch_document_operation,
             commands::list_documents,
             commands::search_documents,
             commands::index_pending_documents,

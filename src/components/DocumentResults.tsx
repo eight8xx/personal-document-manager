@@ -25,6 +25,8 @@ interface DocumentResultsProps {
   documents: DocumentSummary[];
   collections: CollectionSummary[];
   selectedDocumentId: string | null;
+  selectedDocumentIds: Set<string>;
+  selectionDisabled: boolean;
   highlightedDocumentId: string | null;
   searchResults: DocumentSearchResult[];
   retryingIndexIds: Set<string>;
@@ -179,6 +181,7 @@ function DocumentRow({
   document,
   collections,
   selected,
+  selectionDisabled,
   highlighted,
   searchResult,
   retryingIndex,
@@ -191,6 +194,7 @@ function DocumentRow({
   document: DocumentSummary;
   collections: CollectionSummary[];
   selected: boolean;
+  selectionDisabled: boolean;
   highlighted: boolean;
   searchResult: DocumentSearchResult | null;
   retryingIndex: boolean;
@@ -220,6 +224,7 @@ function DocumentRow({
           className="document-select"
           type="button"
           onClick={onSelect}
+          disabled={selectionDisabled}
           aria-pressed={selected}
           aria-label={`选择文档 ${document.title}`}
         >
@@ -325,6 +330,8 @@ export function DocumentList({
   documents,
   collections,
   selectedDocumentId,
+  selectedDocumentIds,
+  selectionDisabled,
   highlightedDocumentId,
   searchResults,
   retryingIndexIds,
@@ -363,7 +370,8 @@ export function DocumentList({
               key={document.id}
               document={document}
               collections={collections}
-              selected={document.id === selectedDocumentId}
+              selected={selectedDocumentIds.has(document.id)}
+              selectionDisabled={selectionDisabled}
               highlighted={document.id === highlightedDocumentId}
               searchResult={
                 searchResults.find(
@@ -391,6 +399,8 @@ export function DocumentGrid({
   documents,
   collections,
   selectedDocumentId,
+  selectedDocumentIds,
+  selectionDisabled,
   highlightedDocumentId,
   searchResults,
   retryingIndexIds,
@@ -406,7 +416,7 @@ export function DocumentGrid({
           const collection = collections.find(
             (candidate) => candidate.id === document.collectionId
           );
-          const selected = document.id === selectedDocumentId;
+          const selected = selectedDocumentIds.has(document.id);
           const highlighted = document.id === highlightedDocumentId;
           const searchResult =
             searchResults.find((result) => result.document.id === document.id) ??
@@ -430,6 +440,7 @@ export function DocumentGrid({
                 className="document-grid-select"
                 type="button"
                 onClick={() => onSelectDocument(document.id)}
+                disabled={selectionDisabled}
                 aria-pressed={selected}
                 aria-label={`选择文档 ${document.title}`}
               >

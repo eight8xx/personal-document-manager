@@ -115,6 +115,39 @@ export interface DocumentMetadataUpdate {
   tagIds: string[];
 }
 
+export type BatchDocumentOperation =
+  | { kind: "moveToCollection"; collectionId: string }
+  | { kind: "addTag"; tagId: string }
+  | { kind: "removeTag"; tagId: string }
+  | { kind: "moveToTrash" };
+
+export interface BatchDocumentOperationRequest {
+  jobId: string;
+  documentIds: string[];
+  operation: BatchDocumentOperation;
+}
+
+export type BatchDocumentItemStatus =
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface BatchDocumentItemResult {
+  documentId: string;
+  status: BatchDocumentItemStatus;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export interface BatchDocumentOperationResult {
+  jobId: string;
+  operation: BatchDocumentOperation;
+  results: BatchDocumentItemResult[];
+  succeededCount: number;
+  failedCount: number;
+  cancelledCount: number;
+}
+
 export interface DocumentSearchFilters {
   collectionId: string | null;
   tagId: string | null;
@@ -293,6 +326,10 @@ export interface BackendClient {
     documentId: string,
     update: DocumentMetadataUpdate
   ): Promise<DocumentSummary>;
+  batchOrganizeDocuments(
+    request: BatchDocumentOperationRequest
+  ): Promise<BatchDocumentOperationResult>;
+  cancelBatchDocumentOperation(jobId: string): Promise<boolean>;
   searchDocuments(
     request: DocumentSearchQuery
   ): Promise<DocumentSearchResponse>;

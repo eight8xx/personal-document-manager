@@ -198,6 +198,55 @@ pub struct DocumentMetadataUpdate {
     pub tag_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum BatchDocumentOperation {
+    MoveToCollection { collection_id: String },
+    AddTag { tag_id: String },
+    RemoveTag { tag_id: String },
+    MoveToTrash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDocumentOperationRequest {
+    pub job_id: String,
+    pub document_ids: Vec<String>,
+    pub operation: BatchDocumentOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BatchDocumentItemStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDocumentItemResult {
+    pub document_id: String,
+    pub status: BatchDocumentItemStatus,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDocumentOperationResult {
+    pub job_id: String,
+    pub operation: BatchDocumentOperation,
+    pub results: Vec<BatchDocumentItemResult>,
+    pub succeeded_count: usize,
+    pub failed_count: usize,
+    pub cancelled_count: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DocumentSearchFilters {

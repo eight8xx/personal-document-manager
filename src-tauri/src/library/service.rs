@@ -21,13 +21,15 @@ use uuid::Uuid;
 
 use super::error::{LibraryError, LibraryResult};
 use super::models::{
-    BootstrapState, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
-    DocumentIndexChangedEvent, DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview,
-    DocumentProcessingStatus, DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse,
-    DocumentSearchResult, DocumentSummary, DocumentThumbnail, EmptyTrashResult, ImportBatch,
-    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, IndexRunResult,
-    IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
-    RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary, TrashDocumentSummary,
+    BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
+    BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,
+    CollectionDeleteResult, CollectionSummary, DocumentIndexChangedEvent, DocumentIndexPhase,
+    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
+    DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
+    DocumentThumbnail, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
+    ImportItemStatus, ImportProgress, IndexRunResult, IndexStatus, LibraryLocationInspection,
+    LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
+    SearchMatchKind, TagSummary, TrashDocumentSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -1990,6 +1992,86 @@ impl LibraryService {
         load_document_summary(&library.connection, document_id)
     }
 
+    pub fn batch_organize_documents<F>(
+        &mut self,
+        request: BatchDocumentOperationRequest,
+        mut is_cancelled: F,
+    ) -> LibraryResult<BatchDocumentOperationResult>
+    where
+        F: FnMut() -> bool,
+    {
+        let operation = request.operation.clone();
+        let mut seen = HashSet::new();
+        let document_ids = request
+            .document_ids
+            .into_iter()
+            .filter(|document_id| seen.insert(document_id.clone()))
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(document_ids.len());
+
+        for document_id in document_ids {
+            if is_cancelled() {
+                results.push(BatchDocumentItemResult {
+                    document_id,
+                    status: BatchDocumentItemStatus::Cancelled,
+                    error_code: None,
+                    error_message: None,
+                });
+                continue;
+            }
+
+            let outcome = match &operation {
+                BatchDocumentOperation::MoveToCollection { collection_id } => self
+                    .move_document_to_collection(&document_id, collection_id)
+                    .map(|_| ()),
+                BatchDocumentOperation::AddTag { tag_id } => {
+                    self.add_tag_to_document(&document_id, tag_id).map(|_| ())
+                }
+                BatchDocumentOperation::RemoveTag { tag_id } => self
+                    .remove_tag_from_document(&document_id, tag_id)
+                    .map(|_| ()),
+                BatchDocumentOperation::MoveToTrash => self.move_document_to_trash(&document_id),
+            };
+
+            results.push(match outcome {
+                Ok(()) => BatchDocumentItemResult {
+                    document_id,
+                    status: BatchDocumentItemStatus::Succeeded,
+                    error_code: None,
+                    error_message: None,
+                },
+                Err(error) => BatchDocumentItemResult {
+                    document_id,
+                    status: BatchDocumentItemStatus::Failed,
+                    error_code: Some(error.code().to_string()),
+                    error_message: Some(error.to_string()),
+                },
+            });
+        }
+
+        let succeeded_count = results
+            .iter()
+            .filter(|result| result.status == BatchDocumentItemStatus::Succeeded)
+            .count();
+        let failed_count = results
+            .iter()
+            .filter(|result| result.status == BatchDocumentItemStatus::Failed)
+            .count();
+        let cancelled_count = results
+            .iter()
+            .filter(|result| result.status == BatchDocumentItemStatus::Cancelled)
+            .count();
+
+        Ok(BatchDocumentOperationResult {
+            job_id: request.job_id,
+            operation,
+            results,
+            succeeded_count,
+            failed_count,
+            cancelled_count,
+        })
+    }
+
     pub fn move_document_to_collection(
         &mut self,
         document_id: &str,
@@ -2009,7 +2091,7 @@ impl LibraryService {
             params![collection_id, now(), document_id],
         )?;
         if updated == 0 {
-            return Err(LibraryError::ImportFile(format!(
+            return Err(LibraryError::DocumentNotFound(format!(
                 "文档不存在或已删除：{document_id}"
             )));
         }

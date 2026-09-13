@@ -5,6 +5,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
   BackendClient,
+  BatchDocumentOperationRequest,
+  BatchDocumentOperationResult,
   BootstrapState,
   CollectionDeleteResult,
   CollectionSummary,
@@ -172,6 +174,12 @@ export const tauriBackendClient: BackendClient = {
       documentId,
       update
     }),
+  batchOrganizeDocuments: (request: BatchDocumentOperationRequest) =>
+    invoke<BatchDocumentOperationResult>("batch_organize_documents", {
+      request
+    }),
+  cancelBatchDocumentOperation: (jobId) =>
+    invoke<boolean>("cancel_batch_document_operation", { jobId }),
   searchDocuments: (request: DocumentSearchQuery) =>
     invoke<DocumentSearchResponse>("search_documents", { request }),
   indexPendingDocuments: () =>

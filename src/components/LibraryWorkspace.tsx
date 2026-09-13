@@ -23,6 +23,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toBackendError } from "../backend/error";
 import type {
   BackendClient,
+  BatchDocumentOperation,
+  BatchDocumentOperationResult,
   CollectionDeleteResult,
   CollectionSummary,
   DocumentMetadataUpdate,
@@ -36,6 +38,13 @@ import type {
   TagSummary,
   TrashDocumentSummary
 } from "../backend/types";
+import {
+  BatchActionMenu,
+  BatchOperationDialog,
+  BatchResultPanel,
+  BatchRunningStatus
+} from "./BatchOrganize";
+import type { BatchOrganizeAction } from "./BatchOrganize";
 import {
   CollectionActionDialog,
   DeleteCollectionDialog
@@ -80,6 +89,13 @@ interface ImportRun {
 type DocumentView = "list" | "grid";
 
 const DOCUMENT_VIEW_STORAGE_KEY = "personal-document-manager.document-view";
+
+function createBatchJobId() {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+}
 
 function storedDocumentView(): DocumentView {
   try {
@@ -171,6 +187,9 @@ export function LibraryWorkspace({
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(
     null
   );
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState<Set<string>>(
+    new Set()
+  );
   const [showingTrash, setShowingTrash] = useState(false);
   const [documentView, setDocumentView] =
     useState<DocumentView>(storedDocumentView);
@@ -210,11 +229,23 @@ export function LibraryWorkspace({
   const [highlightedDocumentId, setHighlightedDocumentId] = useState<
     string | null
   >(null);
+  const [batchAction, setBatchAction] =
+    useState<BatchOrganizeAction | null>(null);
+  const [batchResult, setBatchResult] =
+    useState<BatchDocumentOperationResult | null>(null);
+  const [batchRunning, setBatchRunning] = useState<{
+    jobId: string;
+    count: number;
+  } | null>(null);
+  const batchRunningRef = useRef(false);
+  const [cancellingBatch, setCancellingBatch] = useState(false);
   const [error, setError] = useState("");
 
-  const refreshDocuments = useCallback(async () => {
+  const refreshDocuments = useCallback(async (replace = false) => {
     const items = await client.listDocuments();
-    setDocuments((current) => mergeById(current, items, documentId));
+    setDocuments((current) =>
+      replace ? items : mergeById(current, items, documentId)
+    );
     return items;
   }, [client]);
 
@@ -236,9 +267,9 @@ export function LibraryWorkspace({
     return items;
   }, [client]);
 
-  const refreshLibraryData = useCallback(async () => {
+  const refreshLibraryData = useCallback(async (replaceDocuments = false) => {
     await Promise.all([
-      refreshDocuments(),
+      refreshDocuments(replaceDocuments),
       refreshTrashDocuments(),
       refreshCollections(),
       refreshTags()
@@ -281,6 +312,8 @@ export function LibraryWorkspace({
     setSelectedCollectionId(null);
     setSelectedTagId(null);
     setSelectedDocumentId(null);
+    setSelectedDocumentIds(new Set());
+    setBatchResult(null);
     setShowingTrash(false);
 
     void Promise.all([
@@ -898,6 +931,111 @@ export function LibraryWorkspace({
     }
   }
 
+  async function runBatchOperation(
+    operation: BatchDocumentOperation,
+    documentIds: string[]
+  ) {
+    const uniqueDocumentIds = [...new Set(documentIds)];
+    if (batchRunningRef.current || uniqueDocumentIds.length === 0) {
+      return;
+    }
+
+    const jobId = createBatchJobId();
+    batchRunningRef.current = true;
+    setBatchRunning({ jobId, count: uniqueDocumentIds.length });
+    setBatchResult(null);
+    setCancellingBatch(false);
+    setError("");
+
+    try {
+      const result = await client.batchOrganizeDocuments({
+        jobId,
+        documentIds: uniqueDocumentIds,
+        operation
+      });
+      setBatchResult(result);
+
+      const failedIds = result.results
+        .filter((item) => item.status === "failed")
+        .map((item) => item.documentId);
+      setSelectedDocumentIds(new Set(failedIds));
+
+      if (
+        operation.kind === "moveToTrash" &&
+        selectedDocumentId &&
+        result.results.some(
+          (item) =>
+            item.documentId === selectedDocumentId &&
+            item.status === "succeeded"
+        )
+      ) {
+        setSelectedDocumentId(null);
+      }
+      if (
+        operation.kind === "moveToTrash" &&
+        highlightedDocumentId &&
+        result.results.some(
+          (item) =>
+            item.documentId === highlightedDocumentId &&
+            item.status === "succeeded"
+        )
+      ) {
+        setHighlightedDocumentId(null);
+      }
+
+      await refreshLibraryData(true);
+      setSearchRevision((value) => value + 1);
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+    } finally {
+      batchRunningRef.current = false;
+      setBatchRunning(null);
+      setCancellingBatch(false);
+    }
+  }
+
+  function startBatchOperation(targetId: string | null) {
+    if (!batchAction) {
+      return;
+    }
+
+    const action = batchAction;
+    const operation: BatchDocumentOperation =
+      action === "moveToCollection"
+        ? { kind: "moveToCollection", collectionId: targetId ?? "" }
+        : action === "addTag"
+          ? { kind: "addTag", tagId: targetId ?? "" }
+          : action === "removeTag"
+            ? { kind: "removeTag", tagId: targetId ?? "" }
+            : { kind: "moveToTrash" };
+    setBatchAction(null);
+    void runBatchOperation(operation, [...selectedDocumentIds]);
+  }
+
+  async function cancelBatchOperation() {
+    if (!batchRunning || cancellingBatch) {
+      return;
+    }
+
+    setCancellingBatch(true);
+    try {
+      await client.cancelBatchDocumentOperation(batchRunning.jobId);
+    } catch (caught) {
+      setCancellingBatch(false);
+      setError(toBackendError(caught).message);
+    }
+  }
+
+  function retryFailedBatchOperation() {
+    if (!batchResult) {
+      return;
+    }
+    const failedIds = batchResult.results
+      .filter((item) => item.status === "failed")
+      .map((item) => item.documentId);
+    void runBatchOperation(batchResult.operation, failedIds);
+  }
+
   const selectedCollection = selectedCollectionId
     ? collections.find(
         (collection) => collection.id === selectedCollectionId
@@ -952,6 +1090,10 @@ export function LibraryWorkspace({
   const visibleDocuments = searchActive
     ? searchResults.map((result) => result.document)
     : filteredDocuments;
+  const selectedCount = selectedDocumentIds.size;
+  const allVisibleSelected =
+    visibleDocuments.length > 0 &&
+    visibleDocuments.every((document) => selectedDocumentIds.has(document.id));
   const selectedDocument = selectedDocumentId
     ? visibleDocuments.find(
         (document) => document.id === selectedDocumentId
@@ -981,25 +1123,58 @@ export function LibraryWorkspace({
       (item) => item.itemId === activeDecisionItemId
     ) ?? null;
 
+  function clearDocumentSelection() {
+    setSelectedDocumentIds(new Set());
+  }
+
+  function toggleDocumentSelection(documentId: string) {
+    if (batchRunningRef.current) {
+      return;
+    }
+    setSelectedDocumentIds((current) => {
+      const next = new Set(current);
+      if (next.has(documentId)) {
+        next.delete(documentId);
+      } else {
+        next.add(documentId);
+      }
+      return next;
+    });
+    setSelectedDocumentId(documentId);
+  }
+
+  function selectAllVisibleDocuments() {
+    if (batchRunningRef.current) {
+      return;
+    }
+    setSelectedDocumentIds(
+      new Set(visibleDocuments.map((document) => document.id))
+    );
+  }
+
   function selectAllDocuments() {
     setShowingTrash(false);
     clearSearchFilters();
+    clearDocumentSelection();
   }
 
   function selectCollection(collectionId: string) {
     setShowingTrash(false);
     setSelectedCollectionId(collectionId);
     setSelectedDocumentId(null);
+    clearDocumentSelection();
   }
 
   function selectTag(tagId: string) {
     setShowingTrash(false);
     setSelectedTagId(tagId);
     setSelectedDocumentId(null);
+    clearDocumentSelection();
   }
 
   function selectTrash() {
     clearSearchFilters();
+    clearDocumentSelection();
     setHighlightedDocumentId(null);
     setShowingTrash(true);
   }
@@ -1027,6 +1202,7 @@ export function LibraryWorkspace({
       setDocumentDateTo(change.documentDateTo ?? null);
     }
     setSelectedDocumentId(null);
+    clearDocumentSelection();
   }
 
   function clearSearchFilters() {
@@ -1036,6 +1212,7 @@ export function LibraryWorkspace({
     setDocumentDateFrom(null);
     setDocumentDateTo(null);
     setSelectedDocumentId(null);
+    clearDocumentSelection();
   }
 
   function changeDocumentView(view: DocumentView) {
@@ -1230,7 +1407,10 @@ export function LibraryWorkspace({
                     aria-label="搜索文档"
                     placeholder="搜索标题、描述和正文"
                     value={searchQuery}
-                    onChange={(event) => setSearchQuery(event.target.value)}
+                    onChange={(event) => {
+                      setSearchQuery(event.target.value);
+                      clearDocumentSelection();
+                    }}
                   />
                   {searchQuery ? (
                     <button
@@ -1417,9 +1597,39 @@ export function LibraryWorkspace({
             ) : (
               <>
                 <div className="document-view-toolbar">
-                  <span>
-                    {documentView === "list" ? "列表视图" : "网格视图"}
-                  </span>
+                  <div className="batch-selection-controls">
+                    <strong>已选择 {selectedCount} 项</strong>
+                    <button
+                      className="button quiet"
+                      type="button"
+                      onClick={selectAllVisibleDocuments}
+                      disabled={allVisibleSelected || Boolean(batchRunning)}
+                    >
+                      全选当前结果
+                    </button>
+                    <button
+                      className="button quiet"
+                      type="button"
+                      onClick={clearDocumentSelection}
+                      disabled={
+                        selectedCount === 0 || Boolean(batchRunning)
+                      }
+                    >
+                      清空选择
+                    </button>
+                    <BatchActionMenu
+                      count={selectedCount}
+                      disabled={Boolean(batchRunning)}
+                      onChoose={setBatchAction}
+                    />
+                    {batchRunning ? (
+                      <BatchRunningStatus
+                        count={batchRunning.count}
+                        cancelling={cancellingBatch}
+                        onCancel={() => void cancelBatchOperation()}
+                      />
+                    ) : null}
+                  </div>
                   <div
                     className="view-switcher"
                     role="group"
@@ -1447,15 +1657,25 @@ export function LibraryWorkspace({
                     </button>
                   </div>
                 </div>
+                {batchResult ? (
+                  <BatchResultPanel
+                    result={batchResult}
+                    documents={documents}
+                    onRetry={retryFailedBatchOperation}
+                    onDismiss={() => setBatchResult(null)}
+                  />
+                ) : null}
                 {documentView === "list" ? (
                   <DocumentList
                     documents={visibleDocuments}
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
+                    selectedDocumentIds={selectedDocumentIds}
+                    selectionDisabled={Boolean(batchRunning)}
                     highlightedDocumentId={highlightedDocumentId}
                     searchResults={searchResults}
                     retryingIndexIds={retryingIndexIds}
-                    onSelectDocument={setSelectedDocumentId}
+                    onSelectDocument={toggleDocumentSelection}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
@@ -1471,10 +1691,12 @@ export function LibraryWorkspace({
                     documents={visibleDocuments}
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
+                    selectedDocumentIds={selectedDocumentIds}
+                    selectionDisabled={Boolean(batchRunning)}
                     highlightedDocumentId={highlightedDocumentId}
                     searchResults={searchResults}
                     retryingIndexIds={retryingIndexIds}
-                    onSelectDocument={setSelectedDocumentId}
+                    onSelectDocument={toggleDocumentSelection}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
@@ -1533,6 +1755,17 @@ export function LibraryWorkspace({
           tag={deleteTagTarget}
           onClose={() => setDeleteTagTarget(null)}
           onConfirm={deleteTag}
+        />
+      ) : null}
+
+      {batchAction ? (
+        <BatchOperationDialog
+          action={batchAction}
+          count={selectedCount}
+          collections={collections}
+          tags={tags}
+          onClose={() => setBatchAction(null)}
+          onConfirm={startBatchOperation}
         />
       ) : null}
 

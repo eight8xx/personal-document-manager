@@ -1,6 +1,9 @@
-import { BackendError } from "./error";
+import { BackendError, toBackendError } from "./error";
 import type {
   BackendClient,
+  BatchDocumentItemResult,
+  BatchDocumentOperationRequest,
+  BatchDocumentOperationResult,
   BootstrapState,
   CollectionDeleteResult,
   CollectionSummary,
@@ -59,6 +62,10 @@ export interface FakeBackendOptions {
   ) => Promise<DocumentSearchResponse>;
   indexPendingDocuments?: () => Promise<IndexRunResult>;
   retryDocumentIndex?: (documentId: string) => Promise<DocumentSummary>;
+  batchOrganizeDocuments?: (
+    request: BatchDocumentOperationRequest
+  ) => Promise<BatchDocumentOperationResult>;
+  cancelBatchDocumentOperation?: (jobId: string) => Promise<boolean>;
 }
 
 const emptyBootstrap: BootstrapState = {
@@ -220,11 +227,21 @@ export class FakeBackendClient implements BackendClient {
   private readonly retryDocumentIndexImpl:
     | ((documentId: string) => Promise<DocumentSummary>)
     | null;
+  private readonly batchOrganizeDocumentsImpl:
+    | ((
+        request: BatchDocumentOperationRequest
+      ) => Promise<BatchDocumentOperationResult>)
+    | null;
+  private readonly cancelBatchDocumentOperationImpl:
+    | ((jobId: string) => Promise<boolean>)
+    | null;
   private fileDropHandlers = new Set<FileDropHandler>();
   private importProgressHandlers = new Set<ImportProgressHandler>();
   private documentIndexChangedHandlers =
     new Set<DocumentIndexChangedHandler>();
   private importBatches = new Map<string, ImportBatch>();
+  private activeBatchJobs = new Set<string>();
+  private cancelledBatchJobs = new Set<string>();
   private nextCollectionId = 1;
   private nextTagId = 1;
 
@@ -260,6 +277,10 @@ export class FakeBackendClient implements BackendClient {
     this.searchDocumentsImpl = options.searchDocuments ?? null;
     this.indexPendingDocumentsImpl = options.indexPendingDocuments ?? null;
     this.retryDocumentIndexImpl = options.retryDocumentIndex ?? null;
+    this.batchOrganizeDocumentsImpl =
+      options.batchOrganizeDocuments ?? null;
+    this.cancelBatchDocumentOperationImpl =
+      options.cancelBatchDocumentOperation ?? null;
     this.refreshCollectionCounts();
     this.refreshTagCounts();
   }
@@ -1190,6 +1211,103 @@ export class FakeBackendClient implements BackendClient {
     this.refreshCollectionCounts();
     this.refreshTagCounts();
     return structuredClone(document);
+  }
+
+  async batchOrganizeDocuments(
+    request: BatchDocumentOperationRequest
+  ): Promise<BatchDocumentOperationResult> {
+    this.calls.push(
+      `batchOrganizeDocuments:${request.jobId}:${request.operation.kind}`
+    );
+    if (this.batchOrganizeDocumentsImpl) {
+      return this.batchOrganizeDocumentsImpl(request);
+    }
+
+    this.activeBatchJobs.add(request.jobId);
+    const documentIds = [...new Set(request.documentIds)];
+    const results: BatchDocumentItemResult[] = [];
+    try {
+      for (const documentId of documentIds) {
+        if (this.cancelledBatchJobs.has(request.jobId)) {
+          results.push({
+            documentId,
+            status: "cancelled",
+            errorCode: null,
+            errorMessage: null
+          });
+          continue;
+        }
+
+        try {
+          switch (request.operation.kind) {
+            case "moveToCollection":
+              await this.moveDocumentToCollection(
+                documentId,
+                request.operation.collectionId
+              );
+              break;
+            case "addTag":
+              await this.addTagToDocument(
+                documentId,
+                request.operation.tagId
+              );
+              break;
+            case "removeTag":
+              await this.removeTagFromDocument(
+                documentId,
+                request.operation.tagId
+              );
+              break;
+            case "moveToTrash":
+              await this.moveDocumentToTrash(documentId);
+              break;
+          }
+          results.push({
+            documentId,
+            status: "succeeded",
+            errorCode: null,
+            errorMessage: null
+          });
+        } catch (caught) {
+          const error = toBackendError(caught);
+          results.push({
+            documentId,
+            status: "failed",
+            errorCode: error.code,
+            errorMessage: error.message
+          });
+        }
+      }
+    } finally {
+      this.activeBatchJobs.delete(request.jobId);
+      this.cancelledBatchJobs.delete(request.jobId);
+    }
+
+    return {
+      jobId: request.jobId,
+      operation: structuredClone(request.operation),
+      results,
+      succeededCount: results.filter(
+        (result) => result.status === "succeeded"
+      ).length,
+      failedCount: results.filter((result) => result.status === "failed")
+        .length,
+      cancelledCount: results.filter(
+        (result) => result.status === "cancelled"
+      ).length
+    };
+  }
+
+  async cancelBatchDocumentOperation(jobId: string): Promise<boolean> {
+    this.calls.push(`cancelBatchDocumentOperation:${jobId}`);
+    if (this.cancelBatchDocumentOperationImpl) {
+      return this.cancelBatchDocumentOperationImpl(jobId);
+    }
+    if (!this.activeBatchJobs.has(jobId)) {
+      return false;
+    }
+    this.cancelledBatchJobs.add(jobId);
+    return true;
   }
 
   private snapshot(): BootstrapState {
