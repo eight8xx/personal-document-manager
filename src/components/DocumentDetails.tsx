@@ -16,12 +16,14 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { toBackendError } from "../backend/error";
+import { safeExternalUrl } from "../backend/url";
 import type {
   BackendClient,
   CollectionSummary,
   DocumentPreview,
   DocumentSummary
 } from "../backend/types";
+import { DocxPreview } from "./DocxPreview";
 import {
   documentStatusPresentation,
   documentTypeIcon,
@@ -36,17 +38,6 @@ interface DocumentDetailsProps {
   onEditDocument: (document: DocumentSummary) => void;
   onMoveDocumentToTrash: (document: DocumentSummary) => void;
   onRetryIndex: (document: DocumentSummary) => void;
-}
-
-function safeExternalUrl(url: string) {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:"
-      ? parsed.toString()
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function MarkdownPreview({
@@ -171,12 +162,19 @@ function PreviewContent({
     );
   }
 
-  if (preview.kind === "text" || preview.kind === "docx") {
+  if (preview.kind === "docx") {
+    return (
+      <DocxPreview
+        client={client}
+        document={document}
+        preview={preview}
+      />
+    );
+  }
+
+  if (preview.kind === "text") {
     return (
       <div className="text-preview">
-        {preview.kind === "docx" ? (
-          <p className="preview-notice">{preview.notice}</p>
-        ) : null}
         <pre tabIndex={0}>{preview.text}</pre>
       </div>
     );

@@ -100,8 +100,10 @@ export type DocumentPreview =
     }
   | {
       kind: "docx";
+      dataUrl: string;
       text: string;
       notice: string;
+      degradedFeatures: string[];
     }
   | {
       kind: "failure";
@@ -158,7 +160,7 @@ export interface DocumentFormatCapability {
     | "officeOpenXmlReserved";
   preview:
     | "pdfPages"
-    | "extractedOfficeText"
+    | "docxLayout"
     | "plainText"
     | "safeMarkdown"
     | "localImage"

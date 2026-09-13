@@ -2913,10 +2913,23 @@ impl LibraryService {
             PreviewStrategy::SafeMarkdown => Ok(DocumentPreview::Markdown {
                 text: read_utf8_text(&path)?,
             }),
-            PreviewStrategy::ExtractedOfficeText => Ok(DocumentPreview::Docx {
-                text: extract_docx_text(&path)?,
-                notice: "DOCX 预览仅显示提取文本，不是完整版式预览。".to_string(),
-            }),
+            PreviewStrategy::DocxLayout => {
+                let bytes = fs::read(&path)?;
+                let degraded_features = inspect_docx_degradations(&bytes);
+                Ok(DocumentPreview::Docx {
+                    data_url: data_url(
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        &bytes,
+                    ),
+                    text: extract_docx_text_from_bytes(&bytes)?,
+                    notice: if degraded_features.is_empty() {
+                        "DOCX 版式预览为本地只读近似呈现。".to_string()
+                    } else {
+                        "DOCX 版式预览已呈现，部分复杂内容需要降级。".to_string()
+                    },
+                    degraded_features,
+                })
+            }
             PreviewStrategy::PptxPagesReserved => Ok(DocumentPreview::Unsupported {
                 message: "PPTX 版式预览将在后续功能中启用。".to_string(),
             }),
@@ -4560,13 +4573,123 @@ fn memchr_indices(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 
 fn extract_docx_text(path: &Path) -> LibraryResult<String> {
     let archive = fs::read(path)?;
-    let xml = read_zip_entry(&archive, "word/document.xml")?;
+    extract_docx_text_from_bytes(&archive)
+}
+
+fn extract_docx_text_from_bytes(archive: &[u8]) -> LibraryResult<String> {
+    let xml = read_zip_entry(archive, "word/document.xml")?;
     let text = extract_wordprocessing_text(&xml)?;
     if text.trim().is_empty() {
         Ok("文档中没有可提取的文本。".to_string())
     } else {
         Ok(text)
     }
+}
+
+fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
+    let Ok(entry_names) = zip_entry_names(archive) else {
+        return Vec::new();
+    };
+    let mut features = Vec::new();
+    let mut push_feature = |feature: &str| {
+        if !features.iter().any(|candidate| candidate == feature) {
+            features.push(feature.to_string());
+        }
+    };
+
+    for entry_name in entry_names {
+        let lowercase_name = entry_name.to_ascii_lowercase();
+        if lowercase_name.contains("word/charts/") || lowercase_name.contains("word/diagrams/") {
+            push_feature("图表或 SmartArt");
+        }
+        if lowercase_name.contains("word/embeddings/") {
+            push_feature("嵌入对象");
+        }
+        if lowercase_name.ends_with("vbaproject.bin") || lowercase_name.contains("activex") {
+            push_feature("宏或 ActiveX");
+        }
+
+        if !(lowercase_name.ends_with(".xml") || lowercase_name.ends_with(".rels")) {
+            continue;
+        }
+        let Ok(xml) = read_zip_entry(archive, &entry_name) else {
+            continue;
+        };
+        let xml_text = String::from_utf8_lossy(&xml);
+        let lowercase_xml = xml_text.to_ascii_lowercase();
+
+        if lowercase_xml.contains("<w:txbxcontent")
+            || lowercase_xml.contains("<wps:txbx")
+            || lowercase_xml.contains("<v:textbox")
+            || lowercase_xml.contains("<v:shape")
+        {
+            push_feature("形状或文本框");
+        }
+        if lowercase_xml.contains("<w:fldchar")
+            || lowercase_xml.contains("<w:instrtext")
+            || lowercase_xml.contains("<w:fldsimple")
+        {
+            push_feature("字段");
+        }
+        if lowercase_xml.contains("<w:object")
+            || lowercase_xml.contains("<o:oleobject")
+            || lowercase_xml.contains("<w:oleobject")
+        {
+            push_feature("嵌入对象");
+        }
+        if lowercase_xml.contains("<w:altchunk") {
+            push_feature("替换内容");
+        }
+
+        if lowercase_name.ends_with(".rels") {
+            for relationship in xml_text.split("<Relationship").skip(1) {
+                if relationship.contains("TargetMode=\"External\"")
+                    && !relationship.contains("/hyperlink\"")
+                {
+                    push_feature("远程资源");
+                    break;
+                }
+            }
+        }
+    }
+
+    features
+}
+
+fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
+    let eocd = find_zip_eocd(archive).ok_or_else(|| {
+        LibraryError::Preview("DOCX 文件结构无效：找不到 ZIP 中央目录。".to_string())
+    })?;
+    let entry_count = read_u16(archive, eocd + 10)? as usize;
+    let mut cursor = read_u32(archive, eocd + 16)? as usize;
+    let mut names = Vec::with_capacity(entry_count);
+
+    for _ in 0..entry_count {
+        if read_u32(archive, cursor)? != 0x0201_4b50 {
+            return Err(LibraryError::Preview(
+                "DOCX 文件结构无效：中央目录项损坏。".to_string(),
+            ));
+        }
+        let name_length = read_u16(archive, cursor + 28)? as usize;
+        let extra_length = read_u16(archive, cursor + 30)? as usize;
+        let comment_length = read_u16(archive, cursor + 32)? as usize;
+        let name_start = cursor + 46;
+        let name_end = name_start.checked_add(name_length).ok_or_else(|| {
+            LibraryError::Preview("DOCX 文件结构无效：文件名长度溢出。".to_string())
+        })?;
+        let name = archive.get(name_start..name_end).ok_or_else(|| {
+            LibraryError::Preview("DOCX 文件结构无效：文件名超出文件范围。".to_string())
+        })?;
+        names.push(String::from_utf8_lossy(name).into_owned());
+        cursor = name_end
+            .checked_add(extra_length)
+            .and_then(|value| value.checked_add(comment_length))
+            .ok_or_else(|| {
+                LibraryError::Preview("DOCX 文件结构无效：目录项长度溢出。".to_string())
+            })?;
+    }
+
+    Ok(names)
 }
 
 fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {

@@ -33,7 +33,7 @@ pub enum ValidationStrategy {
 #[serde(rename_all = "camelCase")]
 pub enum PreviewStrategy {
     PdfPages,
-    ExtractedOfficeText,
+    DocxLayout,
     PlainText,
     SafeMarkdown,
     LocalImage,

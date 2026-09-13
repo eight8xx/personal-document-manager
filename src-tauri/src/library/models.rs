@@ -183,8 +183,10 @@ pub enum DocumentPreview {
         text: String,
     },
     Docx {
+        data_url: String,
         text: String,
         notice: String,
+        degraded_features: Vec<String>,
     },
     Failure {
         code: String,

@@ -1208,13 +1208,21 @@ fn previews_real_library_text_docx_and_pdf_contents() {
             text: "# Markdown\n\n只读文本内容".to_string()
         }
     );
-    let DocumentPreview::Docx { text, notice } =
-        service.get_document_preview(&docx.id, None).unwrap()
+    let DocumentPreview::Docx {
+        data_url,
+        text,
+        notice,
+        degraded_features,
+    } = service.get_document_preview(&docx.id, None).unwrap()
     else {
-        panic!("DOCX should return extracted text");
+        panic!("DOCX should return a local layout preview");
     };
+    assert!(data_url.starts_with(
+        "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
+    ));
     assert_eq!(text, "会议记录\n第二段\n续行");
-    assert!(notice.contains("不是完整版式预览"));
+    assert!(notice.contains("本地只读近似呈现"));
+    assert!(degraded_features.is_empty());
 
     let DocumentPreview::Pdf {
         data_url,
@@ -1227,6 +1235,63 @@ fn previews_real_library_text_docx_and_pdf_contents() {
     assert!(data_url.starts_with("data:image/png;base64,"));
     assert_eq!(page_count, Some(1));
     assert_eq!(page, 1);
+}
+
+#[test]
+fn docx_preview_reports_degraded_regions_without_failing_the_document() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let docx_path = root.path().join("complex.docx");
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+  <w:body>
+    <w:p><w:r><w:t>仍可预览的正文</w:t></w:r></w:p>
+    <w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:p>
+    <w:p><w:r><wps:txbx><w:txbxContent><w:p><w:r><w:t>文本框</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:r></w:p>
+  </w:body>
+</w:document>"#;
+    let relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>
+  <Relationship Id="rIdRemote" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://example.com/image.png" TargetMode="External"/>
+</Relationships>"#;
+    fs::write(
+        &docx_path,
+        stored_zip(&[
+            ("word/document.xml", document_xml.as_bytes()),
+            ("word/_rels/document.xml.rels", relationships.as_bytes()),
+            (
+                "word/charts/chart1.xml",
+                br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>"#,
+            ),
+        ]),
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let document = service.import_document(&docx_path).unwrap();
+
+    let DocumentPreview::Docx {
+        text,
+        notice,
+        degraded_features,
+        ..
+    } = service.get_document_preview(&document.id, None).unwrap()
+    else {
+        panic!("complex DOCX should still return a preview");
+    };
+    assert!(text.contains("仍可预览的正文"));
+    assert!(notice.contains("部分复杂内容"));
+    for expected in ["形状或文本框", "字段", "图表或 SmartArt", "远程资源"] {
+        assert!(
+            degraded_features.iter().any(|feature| feature == expected),
+            "missing degraded feature: {expected}"
+        );
+    }
 }
 
 #[test]

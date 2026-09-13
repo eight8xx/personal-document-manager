@@ -1,6 +1,14 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseAsync, renderDocument } from "docx-preview";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi
+} from "vitest";
 
 import { App } from "./App";
 import { BackendError } from "./backend/error";
@@ -10,6 +18,14 @@ import type {
   DocumentSummary,
   LibrarySummary
 } from "./backend/types";
+
+vi.mock("docx-preview", () => ({
+  parseAsync: vi.fn(),
+  renderDocument: vi.fn()
+}));
+
+const parseDocxMock = vi.mocked(parseAsync);
+const renderDocxMock = vi.mocked(renderDocument);
 
 const library: LibrarySummary = {
   id: "library-preview",
@@ -62,6 +78,19 @@ const documents = [
 afterEach(() => {
   cleanup();
   window.sessionStorage.clear();
+});
+
+beforeEach(() => {
+  parseDocxMock.mockReset();
+  renderDocxMock.mockReset();
+  parseDocxMock.mockResolvedValue({});
+  renderDocxMock.mockResolvedValue([
+    Object.assign(document.createElement("div"), {
+      className: "docx-wrapper",
+      innerHTML:
+        '<section class="docx" style="width: 800px; min-height: 1000px"><article><p>会议记录版式内容</p></article></section>'
+    })
+  ]);
 });
 
 describe("文档预览与外部打开", () => {
@@ -156,9 +185,11 @@ describe("文档预览与外部打开", () => {
       screen.getByRole("button", { name: "选择文档 会议记录" })
     );
     expect(
-      await screen.findByText("DOCX 预览仅显示提取文本，不是完整版式预览。")
+      await screen.findByText("会议记录版式内容")
     ).toBeInTheDocument();
-    expect(screen.getByText("会议记录 的提取文本")).toBeInTheDocument();
+    expect(
+      screen.getByText("DOCX 版式预览为本地只读近似呈现。")
+    ).toBeInTheDocument();
   });
 
   it("falls back to a type icon when a thumbnail fails without blocking preview or open", async () => {
@@ -461,7 +492,7 @@ describe("文档预览与外部打开", () => {
     await user.click(
       screen.getByRole("button", { name: "选择文档 会议记录" })
     );
-    await screen.findByText("会议记录 的提取文本");
+    await screen.findByText("会议记录版式内容");
     await user.click(
       screen.getByRole("button", {
         name: "用系统默认程序打开 会议记录"
@@ -472,6 +503,6 @@ describe("文档预览与外部打开", () => {
       "系统默认程序启动失败：找不到关联程序。"
     );
     expect(screen.getByRole("heading", { name: /会议记录/ })).toBeInTheDocument();
-    expect(screen.getByText("会议记录 的提取文本")).toBeInTheDocument();
+    expect(screen.getByText("会议记录版式内容")).toBeInTheDocument();
   });
 });

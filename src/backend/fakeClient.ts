@@ -758,11 +758,14 @@ export class FakeBackendClient implements BackendClient {
         dataUrl: "data:image/png;base64,iVBORw0KGgo="
       };
     }
-    if (capability.preview === "extractedOfficeText") {
+    if (capability.preview === "docxLayout") {
       return {
         kind: "docx",
+        dataUrl:
+          "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==",
         text: `${document.title} 的提取文本`,
-        notice: "DOCX 预览仅显示提取文本，不是完整版式预览。"
+        notice: "DOCX 版式预览为本地只读近似呈现。",
+        degradedFeatures: []
       };
     }
     if (capability.preview === "safeMarkdown") {

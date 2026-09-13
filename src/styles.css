@@ -2319,6 +2319,146 @@ p {
   gap: 2px;
 }
 
+.docx-layout-preview {
+  min-width: 0;
+  background: var(--surface-muted);
+}
+
+.docx-preview-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  flex-wrap: wrap;
+  align-items: center;
+  background: var(--surface);
+}
+
+.docx-page-navigation,
+.docx-zoom-controls {
+  min-height: 27px;
+  flex-wrap: wrap;
+}
+
+.docx-page-navigation > span,
+.docx-zoom-value {
+  min-width: 62px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.docx-page-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 4px;
+}
+
+.docx-page-jump input {
+  width: 52px;
+  height: 27px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.docx-fit-width.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.docx-degradation-notice {
+  position: static;
+}
+
+.docx-preview-styles {
+  display: none;
+}
+
+.docx-preview-pages {
+  max-height: 620px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--surface-muted);
+}
+
+.docx-preview-render {
+  min-width: 0;
+  zoom: var(--docx-preview-scale, 1);
+}
+
+.docx-preview-pages .docx-wrapper {
+  gap: 14px;
+  padding: 12px;
+  background: transparent;
+}
+
+.docx-preview-pages .docx-wrapper > section.docx {
+  flex: none;
+  margin-bottom: 0;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.22);
+  transform-origin: top center;
+}
+
+.docx-preview-pages .docx img {
+  max-width: 100%;
+  height: auto;
+}
+
+.docx-safe-link {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.docx-safe-link:hover,
+.docx-safe-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.docx-blocked-link,
+.docx-blocked-region {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.docx-render-error {
+  min-height: 180px;
+}
+
+.docx-fallback-text {
+  max-height: 360px;
+  overflow: auto;
+  padding: 0 12px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.docx-fallback-text > strong {
+  display: block;
+  padding: 12px 0 6px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.docx-fallback-text pre {
+  margin: 0;
+  padding: 0 0 4px;
+  color: var(--text);
+  font-family:
+    "Cascadia Mono", "Microsoft YaHei UI", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .pdf-preview-page {
   width: 100%;
   min-height: 360px;
