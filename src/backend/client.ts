@@ -182,6 +182,7 @@ export const tauriBackendClient: BackendClient = {
     invoke<boolean>("cancel_batch_document_operation", { jobId }),
   searchDocuments: (request: DocumentSearchQuery) =>
     invoke<DocumentSearchResponse>("search_documents", { request }),
+  pendingIndexCount: () => invoke<number>("pending_index_count"),
   indexPendingDocuments: () =>
     invoke<IndexRunResult>("index_pending_documents"),
   retryDocumentIndex: (documentId) =>

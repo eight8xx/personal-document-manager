@@ -138,8 +138,27 @@ pub struct TrashDocumentSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum EmptyTrashItemStatus {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmptyTrashItemResult {
+    pub document_id: String,
+    pub file_name: String,
+    pub status: EmptyTrashItemStatus,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EmptyTrashResult {
     pub deleted_count: i64,
+    pub failed_count: i64,
+    pub items: Vec<EmptyTrashItemResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

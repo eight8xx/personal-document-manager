@@ -59,6 +59,7 @@ pub fn run() {
             commands::list_documents,
             commands::search_documents,
             commands::index_pending_documents,
+            commands::pending_index_count,
             commands::retry_document_index,
             commands::get_document_preview,
             commands::get_document_thumbnail,

@@ -647,6 +647,13 @@ export class FakeBackendClient implements BackendClient {
     return { results: structuredClone(results) };
   }
 
+  async pendingIndexCount(): Promise<number> {
+    this.calls.push("pendingIndexCount");
+    return this.documents.filter(
+      (document) => document.indexStatus === "pending"
+    ).length;
+  }
+
   async indexPendingDocuments(): Promise<IndexRunResult> {
     this.calls.push("indexPendingDocuments");
     if (this.indexPendingDocumentsImpl) {
@@ -1064,10 +1071,20 @@ export class FakeBackendClient implements BackendClient {
 
   async emptyTrash(): Promise<EmptyTrashResult> {
     this.calls.push("emptyTrash");
-    const deletedCount = this.trashDocuments.length;
+    const items = this.trashDocuments.map(({ document }) => ({
+      documentId: document.id,
+      fileName: document.fileName,
+      status: "succeeded" as const,
+      errorCode: null,
+      errorMessage: null
+    }));
     this.trashDocuments = [];
     this.refreshTagCounts();
-    return { deletedCount };
+    return {
+      deletedCount: items.length,
+      failedCount: 0,
+      items
+    };
   }
 
   async listTags(): Promise<TagSummary[]> {

@@ -15,6 +15,7 @@ import type {
   DocumentSummary,
   ImportBatch,
   ImportItemResult,
+  IndexRunResult,
   LibrarySummary
 } from "./backend/types";
 
@@ -125,6 +126,22 @@ describe("批量导入流程", () => {
       client.emitImportProgress({
         batchId: "batch-merge",
         total: 3,
+        completed: 0,
+        currentFileName: progressItem.fileName,
+        currentSourcePath: progressItem.sourcePath,
+        item: null,
+        finished: false
+      });
+    });
+    expect(await screen.findByText("已完成 0/3")).toBeInTheDocument();
+    expect(
+      within(screen.getByLabelText("批量导入进度")).getByText("正在导入")
+    ).toBeInTheDocument();
+
+    act(() => {
+      client.emitImportProgress({
+        batchId: "batch-merge",
+        total: 3,
         completed: 1,
         currentFileName: progressItem.fileName,
         currentSourcePath: progressItem.sourcePath,
@@ -153,6 +170,31 @@ describe("批量导入流程", () => {
     expect(
       await screen.findByRole("dialog", { name: "发现重复文档" })
     ).toBeInTheDocument();
+  });
+
+  it("loads the live pending total after import instead of using the old snapshot", async () => {
+    const user = userEvent.setup();
+    const sourcePath = "C:\\Sources\\fresh-import.txt";
+    const client = new FakeBackendClient({
+      bootstrap,
+      selectedDocuments: [sourcePath]
+    });
+    client.indexPendingDocuments = () =>
+      new Promise<IndexRunResult>(() => {});
+
+    render(<App client={client} />);
+    await screen.findByRole("button", { name: /全部文档/ });
+    await user.click(
+      screen.getAllByRole("button", { name: "导入文档" })[0]
+    );
+
+    await waitFor(() => {
+      expect(client.calls).toContain("pendingIndexCount");
+    });
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent("正在建立索引 0/1");
+    const results = await screen.findByRole("main", { name: "文档列表" });
+    expect(within(results).getByText("处理中")).toBeInTheDocument();
   });
 
   it("opens an existing duplicate and highlights it in the document list", async () => {

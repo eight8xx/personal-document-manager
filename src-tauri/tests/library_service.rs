@@ -8,8 +8,8 @@ use personal_document_manager_lib::library::{
     BatchDocumentItemStatus, BatchDocumentOperation, BatchDocumentOperationRequest,
     DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus,
     DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail,
-    ExternalChangeMonitor, ImportDecision, ImportItemStatus, IndexStatus, LibraryService,
-    LocationStatus, SearchMatchKind,
+    EmptyTrashItemStatus, ExternalChangeMonitor, ImportDecision, ImportItemStatus, IndexStatus,
+    LibraryService, LocationStatus, SearchMatchKind,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -1555,6 +1555,28 @@ fn monitor_coalesces_consecutive_saves_and_refreshes_content() {
 }
 
 #[test]
+fn dropping_monitor_releases_its_worker_promptly() {
+    let root = tempdir().unwrap();
+    let service = LibraryService::new(root.path().join("app-state")).unwrap();
+    let service = Arc::new(Mutex::new(service));
+    let monitor = ExternalChangeMonitor::start(
+        service,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        |_| {},
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    drop(monitor);
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "monitor drop should wake and join the worker promptly"
+    );
+}
+
+#[test]
 fn startup_scan_finds_changes_made_while_the_application_was_closed() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -1608,6 +1630,69 @@ fn startup_scan_finds_changes_made_while_the_application_was_closed() {
         1
     );
     assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+}
+
+#[test]
+fn startup_hash_scan_detects_same_size_timestamp_preserving_rewrite() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("rewrite.txt");
+    let source_bytes = "source stays unchanged";
+    let replacement = "source remains changed";
+    assert_eq!(source_bytes.len(), replacement.len());
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    let original_modified = fs::metadata(&copy).unwrap().modified().unwrap();
+    drop(service);
+
+    fs::write(&copy, replacement).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(original_modified)
+        .unwrap();
+    let metadata = fs::metadata(&copy).unwrap();
+    assert_eq!(metadata.len(), replacement.len() as u64);
+    assert_eq!(metadata.modified().unwrap(), original_modified);
+
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    let processing = restarted
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == imported.id)
+        .unwrap();
+    assert_eq!(
+        processing.processing_status,
+        DocumentProcessingStatus::Processing
+    );
+    assert_eq!(processing.index_status, IndexStatus::Pending);
+
+    let result = restarted.index_pending_documents().unwrap();
+    assert_eq!(result.processed, 1);
+    assert_eq!(result.searchable, 1);
+    assert!(search(
+        &restarted,
+        "stays unchanged",
+        DocumentSearchFilters::default()
+    )
+    .is_empty());
+    assert_eq!(
+        search(&restarted, replacement, DocumentSearchFilters::default()).len(),
+        1
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes.as_bytes());
 }
 
 #[test]
@@ -1862,6 +1947,119 @@ fn restores_to_inbox_when_the_original_collection_was_deleted() {
 }
 
 #[test]
+fn database_failure_during_permanent_delete_restores_the_library_copy() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("rollback.txt");
+    fs::write(&source_path, "rollback contents").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    let library_copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    service.move_document_to_trash(&imported.id).unwrap();
+
+    let connection = Connection::open(library_dir.join(".pdm").join("library.sqlite3")).unwrap();
+    connection
+        .execute_batch(&format!(
+            "
+            CREATE TRIGGER fail_document_delete
+            BEFORE DELETE ON documents
+            WHEN OLD.id = '{}'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced delete failure');
+            END;
+            ",
+            imported.id
+        ))
+        .unwrap();
+    drop(connection);
+
+    let error = service
+        .permanently_delete_document(&imported.id)
+        .unwrap_err();
+    assert_eq!(error.code(), "database");
+    assert!(library_copy.is_file());
+    assert_eq!(
+        service.list_trash_documents().unwrap()[0].document.id,
+        imported.id
+    );
+    assert!(fs::read_dir(library_copy.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| !entry.file_name().to_string_lossy().contains(".tombstone")));
+}
+
+#[test]
+fn opening_library_restores_or_removes_crash_left_tombstones() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("tombstone.txt");
+    fs::write(&source_path, "tombstone contents").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let restored_document = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    let restored_copy = library_dir
+        .join("documents")
+        .join(&restored_document.id)
+        .join(&restored_document.file_name);
+    let restored_tombstone = restored_copy
+        .parent()
+        .unwrap()
+        .join(".pdm-delete-crash-restore.tombstone");
+    fs::rename(&restored_copy, &restored_tombstone).unwrap();
+    drop(service);
+
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    assert!(restored_copy.is_file());
+    assert!(!restored_tombstone.exists());
+
+    let deleted_document_id = restarted.list_documents().unwrap()[0].id.clone();
+    let deleted_file_name = restarted.list_documents().unwrap()[0].file_name.clone();
+    let deleted_copy = library_dir
+        .join("documents")
+        .join(&deleted_document_id)
+        .join(&deleted_file_name);
+    let deleted_tombstone = deleted_copy
+        .parent()
+        .unwrap()
+        .join(".pdm-delete-crash-cleanup.tombstone");
+    fs::rename(&deleted_copy, &deleted_tombstone).unwrap();
+    drop(restarted);
+
+    let connection = Connection::open(library_dir.join(".pdm").join("library.sqlite3")).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM document_search WHERE document_id = ?1",
+            [&deleted_document_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM documents WHERE id = ?1",
+            [&deleted_document_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut cleaned = LibraryService::new(&state_dir).unwrap();
+    cleaned.open_library(&library_dir).unwrap();
+    assert!(!deleted_tombstone.exists());
+    assert!(!deleted_copy.exists());
+}
+
+#[test]
 fn permanently_deletes_records_index_tags_and_library_copy_but_not_source() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -1948,11 +2146,73 @@ fn empties_trash_and_removes_every_library_copy() {
     let result = service.empty_trash().unwrap();
 
     assert_eq!(result.deleted_count, 2);
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.items.len(), 2);
     assert!(service.list_trash_documents().unwrap().is_empty());
     assert!(!first_copy.exists());
     assert!(!second_copy.exists());
     assert!(first_source.is_file());
     assert!(second_source.is_file());
+}
+
+#[test]
+fn empty_trash_reports_partial_failures_and_keeps_failed_documents_retryable() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let blocked_source = root.path().join("blocked.txt");
+    let removable_source = root.path().join("removable.txt");
+    fs::write(&blocked_source, "blocked").unwrap();
+    fs::write(&removable_source, "removable").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let blocked = service.import_document(&blocked_source).unwrap();
+    let removable = service.import_document(&removable_source).unwrap();
+    let blocked_copy = library_dir
+        .join("documents")
+        .join(&blocked.id)
+        .join(&blocked.file_name);
+    let removable_copy = library_dir
+        .join("documents")
+        .join(&removable.id)
+        .join(&removable.file_name);
+    service.move_document_to_trash(&blocked.id).unwrap();
+    service.move_document_to_trash(&removable.id).unwrap();
+
+    let connection = Connection::open(library_dir.join(".pdm").join("library.sqlite3")).unwrap();
+    connection
+        .execute_batch(&format!(
+            "
+            CREATE TRIGGER fail_specific_document_delete
+            BEFORE DELETE ON documents
+            WHEN OLD.id = '{}'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced per-document failure');
+            END;
+            ",
+            blocked.id
+        ))
+        .unwrap();
+    drop(connection);
+
+    let result = service.empty_trash().unwrap();
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(result.items.len(), 2);
+    assert!(result.items.iter().any(|item| {
+        item.document_id == blocked.id
+            && item.status == EmptyTrashItemStatus::Failed
+            && item.error_message.is_some()
+    }));
+    assert!(result.items.iter().any(|item| {
+        item.document_id == removable.id && item.status == EmptyTrashItemStatus::Succeeded
+    }));
+    assert!(blocked_copy.is_file());
+    assert!(!removable_copy.exists());
+    let remaining = service.list_trash_documents().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].document.id, blocked.id);
 }
 
 fn search(

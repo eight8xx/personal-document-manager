@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { toBackendError } from "../backend/error";
+import { BackendError, toBackendError } from "../backend/error";
 import type {
   BackendClient,
   BatchDocumentOperation,
@@ -291,14 +291,21 @@ export function LibraryWorkspace({
       return;
     }
     indexingRef.current = true;
-    const pendingCount = documents.filter(
-      (document) =>
-        document.processingStatus === "ready" &&
-        document.indexStatus === "pending"
-    ).length;
-    setIndexProgress({ processed: 0, total: pendingCount });
-    setIndexing(true);
     try {
+      const pendingCount = await client.pendingIndexCount();
+      if (pendingCount <= 0) {
+        return;
+      }
+      setDocuments((current) =>
+        current.map((document) =>
+          document.indexStatus === "pending" &&
+          document.processingStatus === "ready"
+            ? { ...document, processingStatus: "processing" }
+            : document
+        )
+      );
+      setIndexProgress({ processed: 0, total: pendingCount });
+      setIndexing(true);
       const result = await client.indexPendingDocuments();
       if (result.processed > 0) {
         await refreshDocuments();
@@ -311,7 +318,7 @@ export function LibraryWorkspace({
       setIndexing(false);
       setIndexProgress(null);
     }
-  }, [client, documents, refreshDocuments]);
+  }, [client, refreshDocuments]);
 
   useEffect(() => {
     let active = true;
@@ -380,7 +387,31 @@ export function LibraryWorkspace({
 
     void client
       .subscribeToDocumentIndexChanges((event: DocumentIndexChangedEvent) => {
+        if (!active) {
+          return;
+        }
         if (event.phase === "processing") {
+          if (event.documentIds.length > 0) {
+            const changedIds = new Set(event.documentIds);
+            setDocuments((current) =>
+              current.map((document) =>
+                changedIds.has(document.id)
+                  ? {
+                      ...document,
+                      processingStatus: "processing",
+                      indexStatus: "pending"
+                    }
+                  : document
+              )
+            );
+            setIndexing(true);
+            setIndexProgress((current) =>
+              current ?? {
+                processed: 0,
+                total: event.documentIds.length
+              }
+            );
+          }
           if (event.result) {
             const processed = event.result.processed;
             setIndexProgress((current) => {
@@ -388,10 +419,20 @@ export function LibraryWorkspace({
                 current && current.total > 0 ? current.total : processed;
               return { processed, total };
             });
+            setDocuments((current) =>
+              current.map((document) =>
+                document.processingStatus === "ready" &&
+                document.indexStatus === "pending"
+                  ? { ...document, processingStatus: "processing" }
+                  : document
+              )
+            );
           }
           return;
         }
 
+        setIndexing(false);
+        setIndexProgress(null);
         void refreshDocuments()
           .then(() => {
             if (active) {
@@ -517,14 +558,13 @@ export function LibraryWorkspace({
           };
         });
         await refreshLibraryData();
-        void runPendingIndexing();
       } catch (caught) {
         setError(toBackendError(caught).message);
       } finally {
         setImporting(false);
       }
     },
-    [client, refreshLibraryData, runPendingIndexing]
+    [client, refreshLibraryData]
   );
 
   useEffect(() => {
@@ -946,9 +986,26 @@ export function LibraryWorkspace({
   async function emptyTrash() {
     setError("");
     try {
-      await client.emptyTrash();
-      setEmptyTrashOpen(false);
+      const result = await client.emptyTrash();
       await refreshLibraryData();
+      if (result.failedCount > 0) {
+        const failures = result.items
+          .filter((item) => item.status === "failed")
+          .slice(0, 3)
+          .map(
+            (item) =>
+              `${item.fileName}：${item.errorMessage ?? "未知原因"}`
+          )
+          .join("；");
+        throw new BackendError({
+          code: "emptyTrashPartial",
+          message:
+            `已永久删除 ${result.deletedCount} 份，` +
+            `${result.failedCount} 份失败：${failures}。` +
+            "失败项仍保留在回收站，可以重试。"
+        });
+      }
+      setEmptyTrashOpen(false);
     } catch (caught) {
       setError(toBackendError(caught).message);
       throw caught;

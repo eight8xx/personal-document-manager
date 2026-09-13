@@ -139,6 +139,50 @@ describe("外部变化重索引状态", () => {
     expect(await within(results).findByText("可搜索")).toBeInTheDocument();
   });
 
+  it("marks documents processing for id-only events and refreshes on completion", async () => {
+    const original = document("changed", "无结果事件资料");
+    const refreshed = {
+      ...original,
+      contentHash: "hash-id-only-refresh",
+      processingStatus: "ready" as const,
+      indexStatus: "searchable" as const
+    };
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections,
+      documents: [original]
+    });
+
+    render(<App client={client} />);
+    const results = await screen.findByRole("main", { name: "文档列表" });
+    expect(within(results).getByText("可搜索")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(client.calls).toContain("subscribeToDocumentIndexChanges")
+    );
+
+    act(() => {
+      client.emitDocumentIndexChanged({
+        phase: "processing",
+        documentIds: [original.id],
+        result: null
+      });
+    });
+    expect(await within(results).findByText("处理中")).toBeInTheDocument();
+
+    client.setDocument(refreshed);
+    await act(async () => {
+      client.emitDocumentIndexChanged({
+        phase: "completed",
+        documentIds: [],
+        result: { processed: 1, searchable: 1, failed: 0 }
+      });
+    });
+
+    await waitFor(() =>
+      expect(within(results).getByText("可搜索")).toBeInTheDocument()
+    );
+  });
+
   it("keeps the failure visible when retry still cannot index", async () => {
     const user = userEvent.setup();
     const failed = document("failed", "仍需修复的资料", {

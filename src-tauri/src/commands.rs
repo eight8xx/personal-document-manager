@@ -672,6 +672,18 @@ pub async fn index_pending_documents(
 }
 
 #[tauri::command]
+pub fn pending_index_count(state: State<'_, AppState>) -> Result<i64, CommandError> {
+    pending_index_count_contract(&state)
+}
+
+fn pending_index_count_contract(state: &AppState) -> Result<i64, CommandError> {
+    state
+        .service()?
+        .pending_index_count()
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
 pub async fn retry_document_index(
     document_id: String,
     state: State<'_, AppState>,
@@ -793,11 +805,11 @@ mod tests {
         delete_tag_contract, empty_trash_contract, inspect_library_location_contract,
         list_collections_contract, list_tags_contract, list_trash_documents_contract,
         move_collection_contract, move_document_to_collection_contract,
-        move_document_to_trash_contract, permanently_delete_document_contract,
-        remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
-        resolve_import_item_contract, restore_document_contract, retry_import_item_contract,
-        start_import_contract, update_document_metadata_contract, AppState, CommandError,
-        LibraryChangedEvent,
+        move_document_to_trash_contract, pending_index_count_contract,
+        permanently_delete_document_contract, remove_tag_from_document_contract,
+        rename_collection_contract, rename_tag_contract, resolve_import_item_contract,
+        restore_document_contract, retry_import_item_contract, start_import_contract,
+        update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
     };
     use crate::library::{
         BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
@@ -1014,6 +1026,7 @@ mod tests {
         assert!(!progress.first().unwrap().finished);
         assert!(progress.last().unwrap().finished);
         assert_eq!(progress.last().unwrap().completed, 1);
+        assert_eq!(pending_index_count_contract(&state).unwrap(), 1);
 
         let value = serde_json::to_value(&batch).unwrap();
         assert!(value.get("batchId").is_some());
@@ -1208,5 +1221,7 @@ mod tests {
         let empty = empty_trash_contract(&state).unwrap();
         let value = serde_json::to_value(empty).unwrap();
         assert_eq!(value["deletedCount"], 0);
+        assert_eq!(value["failedCount"], 0);
+        assert!(value["items"].as_array().unwrap().is_empty());
     }
 }

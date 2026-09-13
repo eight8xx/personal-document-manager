@@ -26,10 +26,10 @@ use super::models::{
     CollectionDeleteResult, CollectionSummary, DocumentIndexChangedEvent, DocumentIndexPhase,
     DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
     DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
-    DocumentThumbnail, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
-    ImportItemStatus, ImportProgress, IndexRunResult, IndexStatus, LibraryLocationInspection,
-    LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
-    SearchMatchKind, TagSummary, TrashDocumentSummary,
+    DocumentThumbnail, EmptyTrashItemResult, EmptyTrashItemStatus, EmptyTrashResult, ImportBatch,
+    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, IndexRunResult,
+    IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
+    RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary, TrashDocumentSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -41,6 +41,8 @@ const TRASH_DIR: &str = "trash";
 const THUMBNAILS_DIR: &str = "thumbnails";
 const RECENT_FILE: &str = "recent_libraries.json";
 const MAX_RECENT_LIBRARIES: usize = 10;
+const DELETE_TOMBSTONE_PREFIX: &str = ".pdm-delete-";
+const DELETE_TOMBSTONE_SUFFIX: &str = ".tombstone";
 
 pub struct LibraryService {
     state_dir: PathBuf,
@@ -126,14 +128,17 @@ impl ExternalChangeMonitor {
                 let mut quiet_deadline = None;
 
                 while !thread_stop.load(Ordering::Relaxed) {
-                    thread::sleep(poll_interval);
+                    thread::park_timeout(poll_interval);
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     let scan = {
                         let mut service = match service.lock() {
                             Ok(service) => service,
                             Err(_) => break,
                         };
-                        let scan = match service.scan_external_changes() {
+                        let scan = match service.scan_external_changes(false) {
                             Ok(scan) => scan,
                             Err(_) => continue,
                         };
@@ -199,6 +204,7 @@ impl Drop for ExternalChangeMonitor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }
@@ -414,6 +420,7 @@ impl LibraryService {
 
         let connection = open_database(&path)?;
         initialize_schema(&connection)?;
+        cleanup_delete_tombstones(&path, &connection)?;
 
         let summary = summary_from_metadata(&path, &metadata);
         self.current = Some(OpenLibrary {
@@ -421,7 +428,7 @@ impl LibraryService {
             connection,
         });
         self.record_recent(&summary)?;
-        self.scan_external_changes()?;
+        self.scan_external_changes(true)?;
         Ok(summary)
     }
 
@@ -2235,31 +2242,59 @@ impl LibraryService {
     }
 
     pub fn empty_trash(&mut self) -> LibraryResult<EmptyTrashResult> {
-        let document_ids = {
+        let documents = {
             let library = self
                 .current
                 .as_ref()
                 .ok_or(LibraryError::NoCurrentLibrary)?;
             let mut statement = library.connection.prepare(
                 "
-                    SELECT id
+                    SELECT id, file_name
                     FROM documents
                     WHERE deleted_at IS NOT NULL
                     ORDER BY deleted_at, id
                     ",
             )?;
-            let document_ids = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+            let documents = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
-            document_ids
+            documents
         };
 
         let mut deleted_count = 0;
-        for document_id in document_ids {
-            self.permanently_delete_trashed_document(&document_id)?;
-            deleted_count += 1;
+        let mut failed_count = 0;
+        let mut items = Vec::with_capacity(documents.len());
+        for (document_id, file_name) in documents {
+            match self.permanently_delete_trashed_document(&document_id) {
+                Ok(()) => {
+                    deleted_count += 1;
+                    items.push(EmptyTrashItemResult {
+                        document_id,
+                        file_name,
+                        status: EmptyTrashItemStatus::Succeeded,
+                        error_code: None,
+                        error_message: None,
+                    });
+                }
+                Err(error) => {
+                    failed_count += 1;
+                    items.push(EmptyTrashItemResult {
+                        document_id,
+                        file_name,
+                        status: EmptyTrashItemStatus::Failed,
+                        error_code: Some(error.code().to_string()),
+                        error_message: Some(error.to_string()),
+                    });
+                }
+            }
         }
-        Ok(EmptyTrashResult { deleted_count })
+        Ok(EmptyTrashResult {
+            deleted_count,
+            failed_count,
+            items,
+        })
     }
 
     fn permanently_delete_trashed_document(&self, document_id: &str) -> LibraryResult<()> {
@@ -2289,22 +2324,39 @@ impl LibraryService {
                 LibraryError::DocumentNotFound(format!("回收站中不存在文档：{document_id}"))
             })?;
         let copy_path = self.document_copy_path(&stored)?;
-        let transaction = library.connection.unchecked_transaction()?;
-        transaction.execute(
-            "DELETE FROM document_search WHERE document_id = ?1",
-            params![document_id],
-        )?;
-        let deleted = transaction.execute(
-            "DELETE FROM documents WHERE id = ?1 AND deleted_at IS NOT NULL",
-            params![document_id],
-        )?;
-        if deleted == 0 {
-            return Err(LibraryError::DocumentNotFound(format!(
-                "回收站中不存在文档：{document_id}"
-            )));
+        let tombstone_path = move_library_copy_to_tombstone(&copy_path, DELETE_TOMBSTONE_PREFIX)?;
+
+        let database_result = (|| -> LibraryResult<()> {
+            let transaction = library.connection.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM document_search WHERE document_id = ?1",
+                params![document_id],
+            )?;
+            let deleted = transaction.execute(
+                "DELETE FROM documents WHERE id = ?1 AND deleted_at IS NOT NULL",
+                params![document_id],
+            )?;
+            if deleted == 0 {
+                return Err(LibraryError::DocumentNotFound(format!(
+                    "回收站中不存在文档：{document_id}"
+                )));
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+
+        if let Err(error) = database_result {
+            if let Some(tombstone_path) = tombstone_path.as_deref() {
+                restore_library_copy_tombstone(tombstone_path, &copy_path)?;
+            }
+            return Err(error);
         }
-        remove_library_copy(&copy_path)?;
-        transaction.commit()?;
+
+        if let Some(tombstone_path) = tombstone_path {
+            // The database is authoritative once committed. A leftover tombstone
+            // is safe and is reconciled the next time the library is opened.
+            let _ = remove_library_copy(&tombstone_path);
+        }
         Ok(())
     }
 
@@ -2465,7 +2517,29 @@ impl LibraryService {
         Ok(result)
     }
 
-    fn scan_external_changes(&mut self) -> LibraryResult<ExternalChangeScan> {
+    pub fn pending_index_count(&self) -> LibraryResult<i64> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        library
+            .connection
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM documents
+                WHERE deleted_at IS NULL AND index_status = 'pending'
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(LibraryError::from)
+    }
+
+    fn scan_external_changes(
+        &mut self,
+        verify_content_hashes: bool,
+    ) -> LibraryResult<ExternalChangeScan> {
         let Some(library) = self.current.as_ref() else {
             return Ok(ExternalChangeScan::default());
         };
@@ -2497,7 +2571,8 @@ impl LibraryService {
             if !fingerprint.available || !fingerprint.is_file {
                 changed = document.processing_status != DocumentProcessingStatus::Failed
                     || document.index_status != IndexStatus::Failed;
-            } else if fingerprint.size != document.file_size
+            } else if verify_content_hashes
+                || fingerprint.size != document.file_size
                 || fingerprint.modified_at != document.file_modified_at
                 || document.file_modified_at.is_none()
             {
@@ -3352,6 +3427,123 @@ fn remove_previous_copies(previous_copies: &[(PathBuf, PathBuf)]) {
     for (backup_path, _) in previous_copies {
         let _ = fs::remove_file(backup_path);
     }
+}
+
+fn move_library_copy_to_tombstone(path: &Path, prefix: &str) -> LibraryResult<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            let parent = path.parent().ok_or_else(|| {
+                LibraryError::DocumentFileMissing(format!("资料库副本路径无效：{}", path.display()))
+            })?;
+            let tombstone_path = parent.join(format!(
+                "{prefix}{}{DELETE_TOMBSTONE_SUFFIX}",
+                Uuid::new_v4()
+            ));
+            fs::rename(path, &tombstone_path)?;
+            Ok(Some(tombstone_path))
+        }
+        Ok(_) => Err(LibraryError::DocumentFileMissing(format!(
+            "资料库副本路径不是文件：{}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Ok(None);
+            };
+            Ok(find_library_tombstone(parent, prefix))
+        }
+        Err(error) => Err(LibraryError::Io(error)),
+    }
+}
+
+fn restore_library_copy_tombstone(
+    tombstone_path: &Path,
+    original_path: &Path,
+) -> LibraryResult<()> {
+    if original_path.exists() {
+        remove_library_copy(tombstone_path)?;
+        return Ok(());
+    }
+    fs::rename(tombstone_path, original_path)?;
+    Ok(())
+}
+
+fn find_library_tombstone(directory: &Path, prefix: &str) -> Option<PathBuf> {
+    fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| is_delete_tombstone_name(name, prefix))
+        })
+}
+
+fn is_delete_tombstone_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with(prefix) && name.ends_with(DELETE_TOMBSTONE_SUFFIX)
+}
+
+fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> LibraryResult<()> {
+    let documents_directory = library_root.join(DOCUMENTS_DIR);
+    let document_directories = match fs::read_dir(&documents_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LibraryError::Io(error)),
+    };
+
+    for document_directory in document_directories {
+        let document_directory = document_directory?;
+        if !document_directory.file_type()?.is_dir() {
+            continue;
+        }
+
+        let document_id = document_directory
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let library_path = connection
+            .query_row(
+                "SELECT library_path FROM documents WHERE id = ?1",
+                params![&document_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let directory_path = document_directory.path();
+        let mut tombstones = fs::read_dir(&directory_path)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entry| is_delete_tombstone_name(&entry.file_name(), DELETE_TOMBSTONE_PREFIX))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        tombstones.sort();
+        let had_tombstones = !tombstones.is_empty();
+
+        for tombstone_path in tombstones {
+            match library_path.as_deref() {
+                Some(library_path) => {
+                    let original_path = document_path(library_root, library_path)?;
+                    restore_library_copy_tombstone(&tombstone_path, &original_path)?;
+                }
+                None => {
+                    fs::remove_file(&tombstone_path)?;
+                }
+            }
+        }
+
+        if had_tombstones {
+            match fs::remove_dir(&directory_path) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(LibraryError::Io(error)),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn remove_library_copy(path: &Path) -> LibraryResult<()> {

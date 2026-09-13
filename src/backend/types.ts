@@ -63,8 +63,20 @@ export interface TrashDocumentSummary {
   deletedAt: string;
 }
 
+export type EmptyTrashItemStatus = "succeeded" | "failed";
+
+export interface EmptyTrashItemResult {
+  documentId: string;
+  fileName: string;
+  status: EmptyTrashItemStatus;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
 export interface EmptyTrashResult {
   deletedCount: number;
+  failedCount: number;
+  items: EmptyTrashItemResult[];
 }
 
 export type DocumentPreview =
@@ -333,6 +345,7 @@ export interface BackendClient {
   searchDocuments(
     request: DocumentSearchQuery
   ): Promise<DocumentSearchResponse>;
+  pendingIndexCount(): Promise<number>;
   indexPendingDocuments(): Promise<IndexRunResult>;
   retryDocumentIndex(documentId: string): Promise<DocumentSummary>;
   subscribeToDocumentIndexChanges(

@@ -9,6 +9,7 @@ import type {
   BootstrapState,
   CollectionSummary,
   DocumentSummary,
+  EmptyTrashResult,
   LibrarySummary,
   TagSummary,
   TrashDocumentSummary
@@ -227,6 +228,71 @@ describe("回收站、恢复与永久删除", () => {
     expect(await within(dialog).findByRole("alert")).toHaveTextContent(
       "清空回收站时发生错误。"
     );
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "清空回收站" })
+    );
+    expect(await screen.findByText("回收站为空")).toBeInTheDocument();
+    expect(attempts).toBe(2);
+  });
+
+  it("shows partial empty failures and retries the remaining documents", async () => {
+    const user = userEvent.setup();
+    const first = documentFor("first", "第一份");
+    const second = documentFor("second", "第二份", "inbox");
+    const client = new FakeBackendClient({
+      bootstrap,
+      trashDocuments: [
+        trashSummary(first),
+        trashSummary(second, null)
+      ],
+      collections,
+      tags: [tag]
+    });
+    const originalEmpty = client.emptyTrash.bind(client);
+    let attempts = 0;
+    client.emptyTrash = async (): Promise<EmptyTrashResult> => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          deletedCount: 1,
+          failedCount: 1,
+          items: [
+            {
+              documentId: first.id,
+              fileName: first.fileName,
+              status: "succeeded",
+              errorCode: null,
+              errorMessage: null
+            },
+            {
+              documentId: second.id,
+              fileName: second.fileName,
+              status: "failed",
+              errorCode: "filesystem",
+              errorMessage: "资料库副本暂时无法删除。"
+            }
+          ]
+        };
+      }
+      return originalEmpty();
+    };
+
+    render(<App client={client} />);
+    await screen.findByRole("button", { name: /回收站 2/ });
+    await user.click(screen.getByRole("button", { name: /回收站 2/ }));
+    await user.click(screen.getByRole("button", { name: "清空回收站" }));
+
+    const dialog = screen.getByRole("dialog", { name: "清空回收站" });
+    await user.click(
+      within(dialog).getByRole("button", { name: "清空回收站" })
+    );
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent("已永久删除 1 份，1 份失败");
+    expect(alert).toHaveTextContent("第二份.txt");
+    expect(alert).toHaveTextContent("资料库副本暂时无法删除。");
+    expect(alert).toHaveTextContent("失败项仍保留在回收站，可以重试。");
 
     await user.click(
       within(dialog).getByRole("button", { name: "清空回收站" })
