@@ -698,6 +698,111 @@ fn duplicate_imports_wait_for_use_existing_import_anyway_or_cancel() {
 }
 
 #[test]
+fn target_collection_imports_keep_partial_success_and_fall_back_when_deleted() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("target.txt");
+    let missing_path = root.path().join("missing.txt");
+    fs::write(&source_path, "target collection contents").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let target = service
+        .create_collection("目标集合".to_string(), None)
+        .unwrap();
+
+    let batch = service
+        .start_import_to_collection(
+            vec![
+                source_path.to_string_lossy().into_owned(),
+                missing_path.to_string_lossy().into_owned(),
+            ],
+            Some(target.id.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        batch.target_collection_id.as_deref(),
+        Some(target.id.as_str())
+    );
+    assert_eq!(batch.imported_count, 1);
+    assert_eq!(batch.failed_count, 1);
+
+    let imported = batch
+        .items
+        .iter()
+        .find(|item| item.status == ImportItemStatus::Imported)
+        .unwrap();
+    assert_eq!(
+        imported.target_collection_id.as_deref(),
+        Some(target.id.as_str())
+    );
+    assert_eq!(imported.collection_id.as_deref(), Some(target.id.as_str()));
+    assert!(imported.notice.is_none());
+    let imported_document_id = imported.document_id.clone().unwrap();
+    assert_eq!(
+        service
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .find(|document| document.id == imported_document_id)
+            .unwrap()
+            .collection_id,
+        target.id
+    );
+
+    let failed = batch
+        .items
+        .iter()
+        .find(|item| item.status == ImportItemStatus::Failed)
+        .unwrap();
+    assert_eq!(
+        failed.target_collection_id.as_deref(),
+        Some(target.id.as_str())
+    );
+
+    let pending = service
+        .start_import_to_collection(
+            vec![source_path.to_string_lossy().into_owned()],
+            Some(target.id.clone()),
+        )
+        .unwrap()
+        .items
+        .remove(0);
+    assert_eq!(pending.status, ImportItemStatus::Duplicate);
+    assert_eq!(
+        pending.target_collection_id.as_deref(),
+        Some(target.id.as_str())
+    );
+
+    service.delete_collection(&target.id).unwrap();
+    let fallback = service
+        .resolve_import_item(&pending.item_id, ImportDecision::ImportAnyway)
+        .unwrap();
+    assert_eq!(fallback.status, ImportItemStatus::Imported);
+    assert_eq!(
+        fallback.target_collection_id.as_deref(),
+        Some(target.id.as_str())
+    );
+    assert_eq!(fallback.collection_id.as_deref(), Some("inbox"));
+    assert!(fallback
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("目标集合已删除"));
+    assert_eq!(
+        service
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .find(|document| { document.id == fallback.document_id.as_deref().unwrap() })
+            .unwrap()
+            .collection_id,
+        "inbox"
+    );
+}
+
+#[test]
 fn changed_source_can_create_or_replace_without_retaining_the_old_library_copy() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");

@@ -8,7 +8,11 @@ import {
   Trash2
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { MouseEvent as ReactMouseEvent, UIEvent } from "react";
+import type {
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  UIEvent
+} from "react";
 
 import type {
   BackendClient,
@@ -90,6 +94,7 @@ interface DocumentResultsProps {
   collections: CollectionSummary[];
   selectedDocumentId: string | null;
   selectedDocumentIds: Set<string>;
+  draggingDocumentIds: Set<string>;
   selectionDisabled: boolean;
   highlightedDocumentId: string | null;
   searchResults: DocumentSearchResult[];
@@ -97,6 +102,10 @@ interface DocumentResultsProps {
   onSelectDocument: (
     documentId: string,
     event: ReactMouseEvent<HTMLButtonElement>
+  ) => void;
+  onStartDocumentDrag: (
+    document: DocumentSummary,
+    event: ReactPointerEvent<HTMLButtonElement>
   ) => void;
   onMoveDocument: (
     document: DocumentSummary,
@@ -251,11 +260,13 @@ function DocumentRow({
   document,
   collections,
   selected,
+  dragging,
   selectionDisabled,
   highlighted,
   searchResult,
   retryingIndex,
   onSelect,
+  onStartDocumentDrag,
   onMove,
   onEdit,
   onMoveToTrash,
@@ -264,11 +275,15 @@ function DocumentRow({
   document: DocumentSummary;
   collections: CollectionSummary[];
   selected: boolean;
+  dragging: boolean;
   selectionDisabled: boolean;
   highlighted: boolean;
   searchResult: DocumentSearchResult | null;
   retryingIndex: boolean;
   onSelect: (event: ReactMouseEvent<HTMLButtonElement>) => void;
+  onStartDocumentDrag: (
+    event: ReactPointerEvent<HTMLButtonElement>
+  ) => void;
   onMove: (collectionId: string) => void;
   onEdit: () => void;
   onMoveToTrash: () => void;
@@ -285,7 +300,7 @@ function DocumentRow({
       id={`document-row-${document.id}`}
       className={`document-row collection-aware${selected ? " selected" : ""}${
         highlighted ? " highlighted" : ""
-      }`}
+      }${dragging ? " dragging" : ""}`}
       role="row"
       aria-current={highlighted ? "true" : undefined}
     >
@@ -294,6 +309,7 @@ function DocumentRow({
           className="document-select"
           type="button"
           onClick={onSelect}
+          onPointerDown={onStartDocumentDrag}
           disabled={selectionDisabled}
           aria-pressed={selected}
           aria-label={`选择文档 ${document.title}`}
@@ -401,11 +417,13 @@ export function DocumentList({
   collections,
   selectedDocumentId,
   selectedDocumentIds,
+  draggingDocumentIds,
   selectionDisabled,
   highlightedDocumentId,
   searchResults,
   retryingIndexIds,
   onSelectDocument,
+  onStartDocumentDrag,
   onMoveDocument,
   onEditDocument,
   onMoveDocumentToTrash,
@@ -450,11 +468,15 @@ export function DocumentList({
               document={document}
               collections={collections}
               selected={selectedDocumentIds.has(document.id)}
+              dragging={draggingDocumentIds.has(document.id)}
               selectionDisabled={selectionDisabled}
               highlighted={document.id === highlightedDocumentId}
               searchResult={searchResultsById.get(document.id) ?? null}
               retryingIndex={retryingIndexIds.has(document.id)}
               onSelect={(event) => onSelectDocument(document.id, event)}
+              onStartDocumentDrag={(event) =>
+                onStartDocumentDrag(document, event)
+              }
               onMove={(collectionId) =>
                 onMoveDocument(document, collectionId)
               }
@@ -475,11 +497,13 @@ export function DocumentGrid({
   collections,
   selectedDocumentId,
   selectedDocumentIds,
+  draggingDocumentIds,
   selectionDisabled,
   highlightedDocumentId,
   searchResults,
   retryingIndexIds,
   onSelectDocument,
+  onStartDocumentDrag,
   onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps & { client: BackendClient }) {
@@ -519,6 +543,8 @@ export function DocumentGrid({
               id={`document-card-${document.id}`}
               className={`document-grid-item${selected ? " selected" : ""}${
                 highlighted ? " highlighted" : ""
+              }${
+                draggingDocumentIds.has(document.id) ? " dragging" : ""
               }`}
               role="listitem"
               aria-current={highlighted ? "true" : undefined}
@@ -528,6 +554,9 @@ export function DocumentGrid({
                 className="document-grid-select"
                 type="button"
                 onClick={(event) => onSelectDocument(document.id, event)}
+                onPointerDown={(event) =>
+                  onStartDocumentDrag(document, event)
+                }
                 disabled={selectionDisabled}
                 aria-pressed={selected}
                 aria-label={`选择文档 ${document.title}`}

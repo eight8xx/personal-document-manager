@@ -544,6 +544,41 @@ p {
   color: var(--accent-strong);
 }
 
+.collection-row.drop-target {
+  background: color-mix(in srgb, var(--accent-soft) 82%, var(--surface));
+  color: var(--accent-strong);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 72%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.collection-row.drop-target.drop-rejected {
+  background: color-mix(in srgb, #c2413b 14%, var(--surface));
+  color: #9f2f2b;
+  box-shadow: inset 0 0 0 1px #c2413b;
+}
+
+.collection-row.drop-target[data-drag-payload-count]::after {
+  content: attr(data-drag-payload-count);
+  min-width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.collection-row.drop-target.drop-rejected[data-drag-payload-count]::after {
+  background: #c2413b;
+  color: #fff;
+}
+
 .collection-toggle,
 .collection-toggle-spacer {
   width: 20px;
@@ -1524,6 +1559,11 @@ p {
   background: color-mix(in srgb, var(--accent-soft) 58%, var(--surface));
 }
 
+.document-row.dragging,
+.document-grid-item.dragging {
+  opacity: 0.52;
+}
+
 .document-row.highlighted {
   background: var(--accent-soft);
   box-shadow: inset 3px 0 0 var(--accent);
@@ -1761,6 +1801,46 @@ p {
 .document-grid-item.selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
+}
+
+.app-shell.dragging-documents {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.app-shell.dragging-documents.drag-rejected {
+  cursor: not-allowed;
+}
+
+.document-drag-ghost {
+  position: fixed;
+  z-index: 120;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 70%, var(--border));
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 12px 30px color-mix(in srgb, #000 22%, transparent);
+  pointer-events: none;
+}
+
+.document-drag-ghost.rejected {
+  border-color: #c2413b;
+  color: #9f2f2b;
+}
+
+.document-drag-ghost span {
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.document-drag-ghost small {
+  color: var(--text-muted);
+  font-size: 10px;
 }
 
 .document-grid-item.highlighted {

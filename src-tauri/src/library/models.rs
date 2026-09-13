@@ -378,6 +378,9 @@ pub struct ImportItemResult {
     pub error_stage: Option<String>,
     pub error_message: Option<String>,
     pub retryable: bool,
+    pub target_collection_id: Option<String>,
+    pub collection_id: Option<String>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +393,7 @@ pub struct ImportBatch {
     pub source_changed_count: i64,
     pub failed_count: i64,
     pub ignored_count: i64,
+    pub target_collection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

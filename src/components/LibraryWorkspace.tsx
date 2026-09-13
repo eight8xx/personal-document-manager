@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   FilePlus2,
+  Files,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -19,7 +20,10 @@ import {
   X
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import type {
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent
+} from "react";
 
 import { BackendError, toBackendError } from "../backend/error";
 import { importableDocumentTypes } from "../backend/documentFormats";
@@ -34,6 +38,7 @@ import type {
   DocumentSearchFilters,
   DocumentSearchResponse,
   DocumentSummary,
+  FileDropEvent,
   ImportBatch,
   ImportDecision,
   ImportItemResult,
@@ -91,8 +96,82 @@ interface ImportRun {
 }
 
 type DocumentView = "list" | "grid";
+type DropHitKind = "collection" | "allDocuments" | "invalid";
+
+interface DropHit {
+  kind: DropHitKind;
+  collectionId: string | null;
+}
+
+interface PendingDocumentDrag {
+  document: DocumentSummary;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  selected: boolean;
+}
+
+interface InternalDocumentDrag {
+  documentIds: string[];
+  pointerId: number;
+  x: number;
+  y: number;
+  targetCollectionId: string | null;
+  rejected: boolean;
+}
+
+interface ExternalFileDrag {
+  targetCollectionId: string | null;
+  count: number;
+}
 
 const DOCUMENT_VIEW_STORAGE_KEY = "personal-document-manager.document-view";
+const DRAG_START_DISTANCE = 6;
+
+function pointerIdFrom(event: ReactPointerEvent<HTMLElement>) {
+  return Number.isFinite(event.pointerId) ? event.pointerId : 0;
+}
+
+function pointerCoordinate(value: number, fallback: number) {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function dropHitFromElement(element: Element | null): DropHit {
+  if (element?.closest("[data-drop-kind='all-documents']")) {
+    return { kind: "allDocuments", collectionId: null };
+  }
+  const collection = element?.closest<HTMLElement>("[data-collection-id]");
+  if (collection?.dataset.collectionId) {
+    return {
+      kind: "collection",
+      collectionId: collection.dataset.collectionId
+    };
+  }
+  return { kind: "invalid", collectionId: null };
+}
+
+function dropHitFromPointerEvent(
+  event: ReactPointerEvent<HTMLElement>
+): DropHit {
+  return dropHitFromElement(
+    event.target instanceof Element ? event.target : null
+  );
+}
+
+function dropHitFromPosition(
+  position: FileDropEvent["position"]
+): DropHit {
+  if (!position || !document.elementFromPoint) {
+    return { kind: "invalid", collectionId: null };
+  }
+  try {
+    return dropHitFromElement(
+      document.elementFromPoint(position.x, position.y)
+    );
+  } catch {
+    return { kind: "invalid", collectionId: null };
+  }
+}
 
 function createBatchJobId() {
   return (
@@ -243,7 +322,15 @@ export function LibraryWorkspace({
     useState<DocumentView>(storedDocumentView);
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
+  const importingRef = useRef(false);
   const [importRun, setImportRun] = useState<ImportRun | null>(null);
+  const [internalDocumentDrag, setInternalDocumentDrag] =
+    useState<InternalDocumentDrag | null>(null);
+  const pendingDocumentDragRef = useRef<PendingDocumentDrag | null>(null);
+  const activeDocumentDragRef = useRef<InternalDocumentDrag | null>(null);
+  const suppressDocumentClickRef = useRef(false);
+  const [externalFileDrag, setExternalFileDrag] =
+    useState<ExternalFileDrag | null>(null);
   const [retryingItemIds, setRetryingItemIds] = useState<Set<string>>(
     new Set()
   );
@@ -565,12 +652,22 @@ export function LibraryWorkspace({
   ]);
 
   const importPaths = useCallback(
-    async (paths: string[]) => {
+    async (
+      paths: string[],
+      targetCollectionId: string | null = null
+    ) => {
       const uniquePaths = [...new Set(paths.filter(Boolean))];
       if (uniquePaths.length === 0) {
         return;
       }
+      if (importingRef.current) {
+        setError(
+          "已有导入批次正在运行，请等待完成后再拖入文件或文件夹。"
+        );
+        return;
+      }
 
+      importingRef.current = true;
       setImporting(true);
       setError("");
       setHighlightedDocumentId(null);
@@ -583,7 +680,10 @@ export function LibraryWorkspace({
       });
 
       try {
-        const batch = await client.startImport(uniquePaths);
+        const batch = await client.startImport(
+          uniquePaths,
+          targetCollectionId
+        );
         setImportRun((current) => {
           if (current?.batchId && current.batchId !== batch.batchId) {
             return current;
@@ -604,6 +704,7 @@ export function LibraryWorkspace({
       } catch (caught) {
         setError(toBackendError(caught).message);
       } finally {
+        importingRef.current = false;
         setImporting(false);
       }
     },
@@ -615,8 +716,26 @@ export function LibraryWorkspace({
     let unlisten: (() => void) | undefined;
 
     void client
-      .subscribeToFileDrops((paths) => {
-        void importPaths(paths);
+      .subscribeToFileDrops((event) => {
+        if (event.type === "leave") {
+          setExternalFileDrag(null);
+          return;
+        }
+
+        const hit = dropHitFromPosition(event.position);
+        if (event.type !== "drop") {
+          setExternalFileDrag((current) => ({
+            targetCollectionId: hit.collectionId,
+            count:
+              event.paths.length > 0
+                ? event.paths.length
+                : current?.count ?? 0
+          }));
+          return;
+        }
+
+        setExternalFileDrag(null);
+        void importPaths(event.paths, hit.collectionId);
       })
       .then((stopListening) => {
         if (active) {
@@ -1160,6 +1279,143 @@ export function LibraryWorkspace({
     void runBatchOperation(batchResult.operation, failedIds);
   }
 
+  function startDocumentDrag(
+    document: DocumentSummary,
+    event: ReactPointerEvent<HTMLButtonElement>
+  ) {
+    if (
+      batchRunningRef.current ||
+      (event.button !== undefined && event.button !== 0)
+    ) {
+      return;
+    }
+    pendingDocumentDragRef.current = {
+      document,
+      pointerId: pointerIdFrom(event),
+      startX: pointerCoordinate(event.clientX, 0),
+      startY: pointerCoordinate(event.clientY, 0),
+      selected: selectedDocumentIds.has(document.id)
+    };
+  }
+
+  function updateDocumentDrag(event: ReactPointerEvent<HTMLElement>) {
+    const pending = pendingDocumentDragRef.current;
+    if (!pending || pending.pointerId !== pointerIdFrom(event)) {
+      return;
+    }
+
+    let active = activeDocumentDragRef.current;
+    if (!active) {
+      const clientX = pointerCoordinate(
+        event.clientX,
+        pending.startX + DRAG_START_DISTANCE
+      );
+      const clientY = pointerCoordinate(
+        event.clientY,
+        pending.startY + DRAG_START_DISTANCE
+      );
+      const distance = Math.hypot(
+        clientX - pending.startX,
+        clientY - pending.startY
+      );
+      if (distance < DRAG_START_DISTANCE) {
+        return;
+      }
+
+      const documentIds = pending.selected
+        ? [...selectedDocumentIds]
+        : [pending.document.id];
+      if (!pending.selected) {
+        selectionAnchorIdRef.current = pending.document.id;
+        setSelectedDocumentIds(new Set(documentIds));
+        setSelectedDocumentId(pending.document.id);
+      }
+      active = {
+        documentIds,
+        pointerId: pending.pointerId,
+        x: clientX,
+        y: clientY,
+        targetCollectionId: null,
+        rejected: true
+      };
+    }
+
+    event.preventDefault();
+    const hit = dropHitFromPointerEvent(event);
+    const clientX = pointerCoordinate(event.clientX, active.x);
+    const clientY = pointerCoordinate(event.clientY, active.y);
+    const documentsById = new Map(
+      documents.map((document) => [document.id, document])
+    );
+    const movableDocumentCount =
+      hit.kind === "collection"
+        ? active.documentIds.filter(
+            (documentId) =>
+              documentsById.get(documentId)?.collectionId !==
+              hit.collectionId
+          ).length
+        : 0;
+    const nextDrag: InternalDocumentDrag = {
+      ...active,
+      x: clientX,
+      y: clientY,
+      targetCollectionId: hit.collectionId,
+      rejected: hit.kind !== "collection" || movableDocumentCount === 0
+    };
+    activeDocumentDragRef.current = nextDrag;
+    setInternalDocumentDrag(nextDrag);
+  }
+
+  function finishDocumentDrag(event: ReactPointerEvent<HTMLElement>) {
+    const pending = pendingDocumentDragRef.current;
+    if (!pending || pending.pointerId !== pointerIdFrom(event)) {
+      return;
+    }
+
+    const active = activeDocumentDragRef.current;
+    pendingDocumentDragRef.current = null;
+    if (!active) {
+      return;
+    }
+
+    activeDocumentDragRef.current = null;
+    setInternalDocumentDrag(null);
+    suppressDocumentClickRef.current = true;
+    window.setTimeout(() => {
+      suppressDocumentClickRef.current = false;
+    }, 0);
+
+    const hit = dropHitFromPointerEvent(event);
+    if (hit.kind !== "collection" || !hit.collectionId) {
+      return;
+    }
+    const documentsById = new Map(
+      documents.map((document) => [document.id, document])
+    );
+    const documentIds = active.documentIds.filter(
+      (documentId) =>
+        documentsById.get(documentId)?.collectionId !== hit.collectionId
+    );
+    if (documentIds.length > 0) {
+      void runBatchOperation(
+        {
+          kind: "moveToCollection",
+          collectionId: hit.collectionId
+        },
+        documentIds
+      );
+    }
+  }
+
+  function cancelDocumentDrag(event: ReactPointerEvent<HTMLElement>) {
+    if (pendingDocumentDragRef.current?.pointerId !== pointerIdFrom(event)) {
+      return;
+    }
+    pendingDocumentDragRef.current = null;
+    activeDocumentDragRef.current = null;
+    setInternalDocumentDrag(null);
+  }
+
   const selectedCollection = selectedCollectionId
     ? collections.find(
         (collection) => collection.id === selectedCollectionId
@@ -1188,6 +1444,18 @@ export function LibraryWorkspace({
     ? searchResults.map((result) => result.document)
     : filteredDocuments;
   const selectedCount = selectedDocumentIds.size;
+  const draggingDocumentIds = new Set(
+    internalDocumentDrag?.documentIds ?? []
+  );
+  const dragPayloadCount =
+    internalDocumentDrag?.documentIds.length ??
+    externalFileDrag?.count ??
+    0;
+  const dropTargetCollectionId =
+    internalDocumentDrag?.targetCollectionId ??
+    externalFileDrag?.targetCollectionId ??
+    null;
+  const dropTargetRejected = internalDocumentDrag?.rejected ?? false;
   const allVisibleSelected =
     visibleDocuments.length > 0 &&
     visibleDocuments.every((document) => selectedDocumentIds.has(document.id));
@@ -1230,6 +1498,9 @@ export function LibraryWorkspace({
     documentId: string,
     event: ReactMouseEvent<HTMLButtonElement>
   ) {
+    if (suppressDocumentClickRef.current) {
+      return;
+    }
     if (batchRunningRef.current) {
       return;
     }
@@ -1355,7 +1626,16 @@ export function LibraryWorkspace({
   }
 
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell${
+        internalDocumentDrag ? " dragging-documents" : ""
+      }${
+        internalDocumentDrag?.rejected ? " drag-rejected" : ""
+      }`}
+      onPointerMove={updateDocumentDrag}
+      onPointerUp={finishDocumentDrag}
+      onPointerCancel={cancelDocumentDrag}
+    >
       <aside className="sidebar" aria-label="集合与标签">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
@@ -1375,6 +1655,7 @@ export function LibraryWorkspace({
                 : ""
             }`}
             type="button"
+            data-drop-kind="all-documents"
             onClick={selectAllDocuments}
           >
             <LibraryBig size={18} aria-hidden="true" />
@@ -1413,6 +1694,9 @@ export function LibraryWorkspace({
           <CollectionTree
             collections={collections}
             selectedCollectionId={selectedCollectionId}
+            dragPayloadCount={dragPayloadCount}
+            dropTargetCollectionId={dropTargetCollectionId}
+            dropTargetRejected={dropTargetRejected}
             onSelect={selectCollection}
             onCreateChild={(collection) =>
               setCollectionAction({ type: "create", parent: collection })
@@ -1807,11 +2091,13 @@ export function LibraryWorkspace({
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
                     selectedDocumentIds={selectedDocumentIds}
+                    draggingDocumentIds={draggingDocumentIds}
                     selectionDisabled={Boolean(batchRunning)}
                     highlightedDocumentId={highlightedDocumentId}
                     searchResults={searchResults}
                     retryingIndexIds={retryingIndexIds}
                     onSelectDocument={selectDocument}
+                    onStartDocumentDrag={startDocumentDrag}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
@@ -1828,11 +2114,13 @@ export function LibraryWorkspace({
                     collections={collections}
                     selectedDocumentId={selectedDocumentId}
                     selectedDocumentIds={selectedDocumentIds}
+                    draggingDocumentIds={draggingDocumentIds}
                     selectionDisabled={Boolean(batchRunning)}
                     highlightedDocumentId={highlightedDocumentId}
                     searchResults={searchResults}
                     retryingIndexIds={retryingIndexIds}
                     onSelectDocument={selectDocument}
+                    onStartDocumentDrag={startDocumentDrag}
                     onMoveDocument={(document, targetCollectionId) =>
                       void moveDocument(document, targetCollectionId)
                     }
@@ -1945,6 +2233,28 @@ export function LibraryWorkspace({
           documents={documents}
           onResolve={resolveDecision}
         />
+      ) : null}
+
+      {internalDocumentDrag ? (
+        <div
+          className={`document-drag-ghost${
+            internalDocumentDrag.rejected ? " rejected" : ""
+          }`}
+          style={{
+            left: internalDocumentDrag.x + 14,
+            top: internalDocumentDrag.y + 14
+          }}
+          data-drag-payload={internalDocumentDrag.documentIds.length}
+          aria-hidden="true"
+        >
+          <Files size={16} />
+          <span>{internalDocumentDrag.documentIds.length} 份文档</span>
+          <small>
+            {internalDocumentDrag.rejected
+              ? "禁止放置"
+              : "移动到集合"}
+          </small>
+        </div>
       ) : null}
     </div>
   );

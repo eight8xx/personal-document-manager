@@ -52,7 +52,10 @@ export interface FakeBackendOptions {
   inspections?: Record<string, LibraryLocationInspection>;
   createLibrary?: (path: string) => Promise<LibrarySummary>;
   importDocument?: (path: string) => Promise<DocumentSummary>;
-  startImport?: (paths: string[]) => Promise<ImportBatch>;
+  startImport?: (
+    paths: string[],
+    targetCollectionId?: string | null
+  ) => Promise<ImportBatch>;
   resolveImportItem?: (
     itemId: string,
     decision: ImportDecision
@@ -177,7 +180,10 @@ export class FakeBackendClient implements BackendClient {
     | ((path: string) => Promise<DocumentSummary>)
     | null;
   private readonly startImportImpl:
-    | ((paths: string[]) => Promise<ImportBatch>)
+    | ((
+        paths: string[],
+        targetCollectionId?: string | null
+      ) => Promise<ImportBatch>)
     | null;
   private readonly resolveImportItemImpl:
     | ((
@@ -382,15 +388,42 @@ export class FakeBackendClient implements BackendClient {
     return document;
   }
 
-  async startImport(paths: string[]): Promise<ImportBatch> {
-    this.calls.push(`startImport:${paths.join("|")}`);
+  async startImport(
+    paths: string[],
+    targetCollectionId: string | null = null
+  ): Promise<ImportBatch> {
+    this.calls.push(
+      `startImport:${paths.join("|")}${
+        targetCollectionId ? `:${targetCollectionId}` : ""
+      }`
+    );
     if (this.startImportImpl) {
-      const batch = await this.startImportImpl(paths);
+      const resolved = await this.startImportImpl(paths, targetCollectionId);
+      const batch = {
+        ...resolved,
+        targetCollectionId:
+          resolved.targetCollectionId ?? targetCollectionId,
+        items: resolved.items.map((item) => ({
+          ...item,
+          targetCollectionId: item.targetCollectionId ?? targetCollectionId,
+          collectionId: item.collectionId ?? null,
+          notice: item.notice ?? null
+        }))
+      };
       this.importBatches.set(batch.batchId, structuredClone(batch));
       return structuredClone(batch);
     }
 
     const batchId = `batch-${this.importBatches.size + 1}`;
+    const target = targetCollectionId
+      ? this.collections.find(
+          (collection) => collection.id === targetCollectionId
+        )
+      : this.collections.find((collection) => collection.isInbox);
+    const targetNotice = targetCollectionId && !target
+      ? "目标集合已删除，文档已改为导入收件箱。"
+      : null;
+    const collectionId = target?.id ?? "inbox";
     const items: ImportItemResult[] = [];
     this.emitImportProgress({
       batchId,
@@ -408,6 +441,8 @@ export class FakeBackendClient implements BackendClient {
 
       try {
         const document = await this.importDocument(path);
+        document.collectionId = collectionId;
+        this.refreshCollectionCounts();
         item = {
           itemId: `${batchId}-item-${index + 1}`,
           sourcePath: path,
@@ -418,7 +453,10 @@ export class FakeBackendClient implements BackendClient {
           duplicateDocumentId: null,
           errorStage: null,
           errorMessage: null,
-          retryable: false
+          retryable: false,
+          targetCollectionId: targetCollectionId ?? null,
+          collectionId: document.collectionId,
+          notice: targetNotice
         };
       } catch (caught) {
         item = {
@@ -432,7 +470,10 @@ export class FakeBackendClient implements BackendClient {
           errorStage: "copying",
           errorMessage:
             caught instanceof Error ? caught.message : "无法导入文档。",
-          retryable: true
+          retryable: true,
+          targetCollectionId: targetCollectionId ?? null,
+          collectionId: null,
+          notice: null
         };
       }
 
@@ -451,7 +492,8 @@ export class FakeBackendClient implements BackendClient {
     const batch: ImportBatch = {
       batchId,
       items,
-      ...countsForItems(items)
+      ...countsForItems(items),
+      targetCollectionId: targetCollectionId ?? null
     };
     this.importBatches.set(batchId, structuredClone(batch));
     return structuredClone(batch);
@@ -463,7 +505,16 @@ export class FakeBackendClient implements BackendClient {
   ): Promise<ImportItemResult> {
     this.calls.push(`resolveImportItem:${itemId}:${decision}`);
     if (this.resolveImportItemImpl) {
-      const item = await this.resolveImportItemImpl(itemId, decision);
+      const resolved = await this.resolveImportItemImpl(itemId, decision);
+      const stored = this.findStoredImportItem(itemId);
+      const item = {
+        ...stored,
+        ...resolved,
+        targetCollectionId:
+          resolved.targetCollectionId ?? stored.targetCollectionId,
+        collectionId: resolved.collectionId ?? stored.collectionId,
+        notice: resolved.notice ?? stored.notice
+      };
       this.replaceStoredImportItem(item);
       return structuredClone(item);
     }
@@ -484,7 +535,10 @@ export class FakeBackendClient implements BackendClient {
           : stored.documentId,
       errorStage: null,
       errorMessage: null,
-      retryable: false
+      retryable: false,
+      targetCollectionId: stored.targetCollectionId,
+      collectionId: stored.collectionId,
+      notice: stored.notice
     };
     this.replaceStoredImportItem(item);
     return structuredClone(item);
@@ -493,7 +547,16 @@ export class FakeBackendClient implements BackendClient {
   async retryImportItem(itemId: string): Promise<ImportItemResult> {
     this.calls.push(`retryImportItem:${itemId}`);
     if (this.retryImportItemImpl) {
-      const item = await this.retryImportItemImpl(itemId);
+      const resolved = await this.retryImportItemImpl(itemId);
+      const stored = this.findStoredImportItem(itemId);
+      const item = {
+        ...stored,
+        ...resolved,
+        targetCollectionId:
+          resolved.targetCollectionId ?? stored.targetCollectionId,
+        collectionId: resolved.collectionId ?? stored.collectionId,
+        notice: resolved.notice ?? stored.notice
+      };
       this.replaceStoredImportItem(item);
       return structuredClone(item);
     }
@@ -505,7 +568,10 @@ export class FakeBackendClient implements BackendClient {
       documentId: stored.documentId ?? `retried-${itemId}`,
       errorStage: null,
       errorMessage: null,
-      retryable: false
+      retryable: false,
+      targetCollectionId: stored.targetCollectionId,
+      collectionId: stored.collectionId,
+      notice: stored.notice
     };
     this.replaceStoredImportItem(item);
     return structuredClone(item);
@@ -708,9 +774,13 @@ export class FakeBackendClient implements BackendClient {
     };
   }
 
-  emitFileDrop(paths: string[]) {
+  emitFileDrop(
+    paths: string[],
+    position: { x: number; y: number } | null = null,
+    type: "enter" | "over" | "drop" = "drop"
+  ) {
     for (const handler of this.fileDropHandlers) {
-      handler(paths);
+      handler({ type, paths, position });
     }
   }
 

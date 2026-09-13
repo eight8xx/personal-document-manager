@@ -195,10 +195,11 @@ fn import_document_contract(
 #[tauri::command]
 pub async fn start_import(
     paths: Vec<String>,
+    target_collection_id: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportBatch, CommandError> {
-    spawn_import_task(&state, paths, move |progress| {
+    spawn_import_task(&state, paths, target_collection_id, move |progress| {
         let _ = app.emit("import-progress", progress);
     })
     .await
@@ -211,6 +212,7 @@ pub async fn start_import(
 fn spawn_import_task<F>(
     state: &AppState,
     paths: Vec<String>,
+    target_collection_id: Option<String>,
     on_progress: F,
 ) -> tauri::async_runtime::JoinHandle<Result<ImportBatch, CommandError>>
 where
@@ -220,7 +222,7 @@ where
     tauri::async_runtime::spawn_blocking(move || {
         let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
         service
-            .start_import_with_progress(paths, on_progress)
+            .start_import_to_collection_with_progress(paths, target_collection_id, on_progress)
             .map_err(CommandError::from)
     })
 }
@@ -234,9 +236,22 @@ fn start_import_contract<F>(
 where
     F: FnMut(ImportProgress),
 {
+    start_import_to_collection_contract(state, paths, None, on_progress)
+}
+
+#[cfg(test)]
+fn start_import_to_collection_contract<F>(
+    state: &AppState,
+    paths: Vec<String>,
+    target_collection_id: Option<String>,
+    on_progress: F,
+) -> Result<ImportBatch, CommandError>
+where
+    F: FnMut(ImportProgress),
+{
     let mut service = state.service()?;
     service
-        .start_import_with_progress(paths, on_progress)
+        .start_import_to_collection_with_progress(paths, target_collection_id, on_progress)
         .map_err(CommandError::from)
 }
 
@@ -1190,10 +1205,15 @@ mod tests {
 
         let service_guard = state.service().unwrap();
         let progress = Arc::new(Mutex::new(Vec::new()));
-        let task = spawn_import_task(&state, vec![source_path.to_string_lossy().into_owned()], {
-            let progress = Arc::clone(&progress);
-            move |event| progress.lock().unwrap().push(event)
-        });
+        let task = spawn_import_task(
+            &state,
+            vec![source_path.to_string_lossy().into_owned()],
+            None,
+            {
+                let progress = Arc::clone(&progress);
+                move |event| progress.lock().unwrap().push(event)
+            },
+        );
         assert!(!task.inner().is_finished());
 
         drop(service_guard);

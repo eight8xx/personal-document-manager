@@ -301,6 +301,9 @@ export interface ImportItemResult {
   errorStage: string | null;
   errorMessage: string | null;
   retryable: boolean;
+  targetCollectionId: string | null;
+  collectionId: string | null;
+  notice: string | null;
 }
 
 export interface ImportBatch {
@@ -311,6 +314,7 @@ export interface ImportBatch {
   sourceChangedCount: number;
   failedCount: number;
   ignoredCount: number;
+  targetCollectionId: string | null;
 }
 
 export interface ImportProgress {
@@ -342,7 +346,18 @@ export interface BackendErrorShape {
   message: string;
 }
 
-export type FileDropHandler = (paths: string[]) => void;
+export interface FileDropPosition {
+  x: number;
+  y: number;
+}
+
+export interface FileDropEvent {
+  type: "enter" | "over" | "drop" | "leave";
+  paths: string[];
+  position: FileDropPosition | null;
+}
+
+export type FileDropHandler = (event: FileDropEvent) => void;
 export type ImportProgressHandler = (progress: ImportProgress) => void;
 export type DocumentIndexChangedHandler = (
   event: DocumentIndexChangedEvent
@@ -358,7 +373,10 @@ export interface BackendClient {
   pickDocumentFiles(): Promise<string[]>;
   pickDocumentFolder(): Promise<string | null>;
   importDocument(path: string): Promise<DocumentSummary>;
-  startImport(paths: string[]): Promise<ImportBatch>;
+  startImport(
+    paths: string[],
+    targetCollectionId?: string | null
+  ): Promise<ImportBatch>;
   resolveImportItem(
     itemId: string,
     decision: ImportDecision

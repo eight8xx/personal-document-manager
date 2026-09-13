@@ -34,6 +34,9 @@ function clamp(value: number, minimum: number, maximum: number) {
 interface CollectionTreeProps {
   collections: CollectionSummary[];
   selectedCollectionId: string | null;
+  dragPayloadCount: number;
+  dropTargetCollectionId: string | null;
+  dropTargetRejected: boolean;
   onSelect: (collectionId: string) => void;
   onCreateChild: (collection: CollectionSummary) => void;
   onRename: (collection: CollectionSummary) => void;
@@ -55,6 +58,9 @@ function CollectionNode({
   openMenuId,
   onOpenMenuChange,
   selectedCollectionId,
+  dragPayloadCount,
+  dropTargetCollectionId,
+  dropTargetRejected,
   onSelect,
   onCreateChild,
   onRename,
@@ -69,6 +75,8 @@ function CollectionNode({
   const isSelected = selectedCollectionId === collection.id;
   const CollectionIcon = collection.isInbox ? Inbox : Folder;
   const isMenuOpen = openMenuId === collection.id;
+  const isDropTarget = dropTargetCollectionId === collection.id;
+  const isRejectedDropTarget = isDropTarget && dropTargetRejected;
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const menuPopoverRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
@@ -177,6 +185,17 @@ function CollectionNode({
     };
   }, [isMenuOpen]);
 
+  useEffect(() => {
+    if (!isDropTarget || expanded || !hasChildren) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setExpanded(true);
+    }, 500);
+    return () => window.clearTimeout(timeout);
+  }, [expanded, hasChildren, isDropTarget]);
+
   function toggleMenu(event: ReactMouseEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
@@ -202,7 +221,17 @@ function CollectionNode({
   return (
     <li className="collection-node">
       <div
-        className={`collection-row${isSelected ? " active" : ""}`}
+        className={`collection-row${isSelected ? " active" : ""}${
+          isDropTarget ? " drop-target" : ""
+        }${isRejectedDropTarget ? " drop-rejected" : ""}`}
+        data-collection-id={collection.id}
+        data-drop-target={isDropTarget ? "true" : undefined}
+        data-drop-rejected={isRejectedDropTarget ? "true" : undefined}
+        data-drag-payload-count={
+          isDropTarget && dragPayloadCount > 0
+            ? dragPayloadCount
+            : undefined
+        }
         style={{ paddingInlineStart: `${8 + depth * 15}px` }}
       >
         {hasChildren ? (
@@ -338,6 +367,9 @@ function CollectionNode({
                 openMenuId,
                 onOpenMenuChange,
                 selectedCollectionId,
+                dragPayloadCount,
+                dropTargetCollectionId,
+                dropTargetRejected,
                 onSelect,
                 onCreateChild,
                 onRename,

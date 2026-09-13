@@ -136,6 +136,11 @@ export function ImportBatchPanel({
                       {item.errorMessage ?? "未提供原因"}
                     </small>
                   ) : null}
+                  {item.notice ? (
+                    <small className="import-item-notice">
+                      {item.notice}
+                    </small>
+                  ) : null}
                 </div>
                 {item.status === "failed" && item.retryable ? (
                   <button

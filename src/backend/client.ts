@@ -84,7 +84,8 @@ export const tauriBackendClient: BackendClient = {
   },
   importDocument: (path) =>
     invoke<DocumentSummary>("import_document", { path }),
-  startImport: (paths) => invoke<ImportBatch>("start_import", { paths }),
+  startImport: (paths, targetCollectionId = null) =>
+    invoke<ImportBatch>("start_import", { paths, targetCollectionId }),
   resolveImportItem: (itemId, decision) =>
     invoke<ImportItemResult>("resolve_import_item", { itemId, decision }),
   retryImportItem: (itemId) =>
@@ -94,12 +95,24 @@ export const tauriBackendClient: BackendClient = {
       handler(event.payload);
     }),
   listDocuments: () => invoke<DocumentSummary[]>("list_documents"),
-  subscribeToFileDrops: async (handler) =>
-    getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === "drop") {
-        handler(event.payload.paths);
+  subscribeToFileDrops: async (handler) => {
+    const scaleFactor = window.devicePixelRatio || 1;
+    return getCurrentWebview().onDragDropEvent((event) => {
+      const payload = event.payload;
+      if (payload.type === "leave") {
+        handler({ type: "leave", paths: [], position: null });
+        return;
       }
-    }),
+      handler({
+        type: payload.type,
+        paths: payload.type === "over" ? [] : payload.paths,
+        position: {
+          x: payload.position.x / scaleFactor,
+          y: payload.position.y / scaleFactor
+        }
+      });
+    });
+  },
   getDocumentPreview: (documentId, page) =>
     invoke<DocumentPreview>("get_document_preview", { documentId, page }),
   getDocumentThumbnail: (documentId) =>

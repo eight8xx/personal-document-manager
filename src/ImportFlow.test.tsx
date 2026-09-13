@@ -69,6 +69,9 @@ function result(
     errorStage: null,
     errorMessage: null,
     retryable: status === "failed",
+    targetCollectionId: null,
+    collectionId: null,
+    notice: null,
     ...overrides
   };
 }
@@ -83,7 +86,8 @@ function batch(batchId: string, items: ImportItemResult[]): ImportBatch {
       (item) => item.status === "sourceChanged"
     ).length,
     failedCount: items.filter((item) => item.status === "failed").length,
-    ignoredCount: items.filter((item) => item.status === "ignored").length
+    ignoredCount: items.filter((item) => item.status === "ignored").length,
+    targetCollectionId: null
   };
 }
 

@@ -65,6 +65,7 @@ struct OpenLibrary {
 struct ImportItemContext {
     item: ImportItemResult,
     pending: Option<PendingImport>,
+    target_collection_id: Option<String>,
 }
 
 struct PendingImport {
@@ -76,6 +77,7 @@ struct PendingImport {
     source_identifier: String,
     content_hash: String,
     existing_document_id: String,
+    target_collection_id: Option<String>,
 }
 
 struct StoredDocumentFile {
@@ -631,6 +633,26 @@ impl LibraryService {
     pub fn start_import_with_progress<F>(
         &mut self,
         paths: Vec<String>,
+        on_progress: F,
+    ) -> LibraryResult<ImportBatch>
+    where
+        F: FnMut(ImportProgress),
+    {
+        self.start_import_to_collection_with_progress(paths, None, on_progress)
+    }
+
+    pub fn start_import_to_collection(
+        &mut self,
+        paths: Vec<String>,
+        target_collection_id: Option<String>,
+    ) -> LibraryResult<ImportBatch> {
+        self.start_import_to_collection_with_progress(paths, target_collection_id, |_| {})
+    }
+
+    pub fn start_import_to_collection_with_progress<F>(
+        &mut self,
+        paths: Vec<String>,
+        target_collection_id: Option<String>,
         mut on_progress: F,
     ) -> LibraryResult<ImportBatch>
     where
@@ -638,6 +660,13 @@ impl LibraryService {
     {
         if self.current.is_none() {
             return Err(LibraryError::NoCurrentLibrary);
+        }
+        if let Some(collection_id) = target_collection_id.as_deref() {
+            let library = self
+                .current
+                .as_ref()
+                .ok_or(LibraryError::NoCurrentLibrary)?;
+            ensure_collection_exists(&library.connection, collection_id)?;
         }
 
         let batch_id = Uuid::new_v4().to_string();
@@ -669,7 +698,12 @@ impl LibraryService {
             });
 
             let item = match entry {
-                ScanEntry::File(path) => self.process_import_file(&path, false, None)?,
+                ScanEntry::File(path) => self.process_import_file_with_target(
+                    &path,
+                    false,
+                    None,
+                    target_collection_id.clone(),
+                )?,
                 ScanEntry::Ignored { source_path } => {
                     let file_name = display_file_name(&source_path);
                     ImportItemResult {
@@ -683,20 +717,28 @@ impl LibraryService {
                         error_stage: None,
                         error_message: None,
                         retryable: false,
+                        target_collection_id: target_collection_id.clone(),
+                        collection_id: None,
+                        notice: None,
                     }
                 }
                 ScanEntry::Failed {
                     source_path,
                     message,
-                } => self.failure_item(
-                    Uuid::new_v4().to_string(),
-                    source_path,
-                    None,
-                    None,
-                    "scan",
-                    message,
-                    true,
-                ),
+                } => {
+                    let mut item = self.failure_item(
+                        Uuid::new_v4().to_string(),
+                        source_path,
+                        None,
+                        None,
+                        "scan",
+                        message,
+                        true,
+                    );
+                    item.target_collection_id = target_collection_id.clone();
+                    self.remember_import_target(&item.item_id, &target_collection_id);
+                    item
+                }
             };
 
             on_progress(ImportProgress {
@@ -735,6 +777,7 @@ impl LibraryService {
             source_changed_count,
             failed_count,
             ignored_count,
+            target_collection_id,
         })
     }
 
@@ -812,18 +855,41 @@ impl LibraryService {
             ));
         }
 
-        self.process_import_file(
+        let target_collection_id = context.target_collection_id.clone();
+        self.process_import_file_with_target(
             Path::new(&context.item.source_path),
             false,
             Some(item_id.to_string()),
+            target_collection_id,
         )
     }
 
-    fn process_import_file(
+    fn process_import_file_with_target(
         &mut self,
         source_path: &Path,
         force_import: bool,
         existing_item_id: Option<String>,
+        target_collection_id: Option<String>,
+    ) -> LibraryResult<ImportItemResult> {
+        let mut item = self.process_import_file_impl(
+            source_path,
+            force_import,
+            existing_item_id,
+            target_collection_id.clone(),
+        )?;
+        if item.target_collection_id.is_none() {
+            item.target_collection_id = target_collection_id.clone();
+        }
+        self.remember_import_target(&item.item_id, &target_collection_id);
+        Ok(item)
+    }
+
+    fn process_import_file_impl(
+        &mut self,
+        source_path: &Path,
+        force_import: bool,
+        existing_item_id: Option<String>,
+        target_collection_id: Option<String>,
     ) -> LibraryResult<ImportItemResult> {
         let item_id = existing_item_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let original_source_path = source_path.to_string_lossy().into_owned();
@@ -975,6 +1041,7 @@ impl LibraryService {
                         content_hash,
                         status,
                         existing_document_id,
+                        target_collection_id,
                     ));
                 }
                 Ok(None) => {}
@@ -1003,8 +1070,45 @@ impl LibraryService {
                 source_identifier: prepared.source_identifier,
                 content_hash,
                 existing_document_id: String::new(),
+                target_collection_id,
             },
         )
+    }
+
+    fn resolve_target_collection(
+        &self,
+        target_collection_id: Option<&str>,
+    ) -> LibraryResult<(String, Option<String>)> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let Some(target_collection_id) = target_collection_id else {
+            return Ok(("inbox".to_string(), None));
+        };
+        let exists = library.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
+            params![target_collection_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if exists {
+            Ok((target_collection_id.to_string(), None))
+        } else {
+            Ok((
+                "inbox".to_string(),
+                Some("目标集合已删除，文档已改为导入收件箱。".to_string()),
+            ))
+        }
+    }
+
+    fn remember_import_target(&mut self, item_id: &str, target_collection_id: &Option<String>) {
+        if target_collection_id.is_none() {
+            return;
+        }
+        if let Some(context) = self.import_items.get_mut(item_id) {
+            context.target_collection_id = target_collection_id.clone();
+            context.item.target_collection_id = target_collection_id.clone();
+        }
     }
 
     fn create_new_document(
@@ -1012,6 +1116,8 @@ impl LibraryService {
         item_id: String,
         pending: PendingImport,
     ) -> LibraryResult<ImportItemResult> {
+        let (collection_id, target_notice) =
+            self.resolve_target_collection(pending.target_collection_id.as_deref())?;
         let library_root = self
             .current
             .as_ref()
@@ -1113,7 +1219,7 @@ impl LibraryService {
             file_type: pending.file_type.clone(),
             file_size: pending.file_size,
             content_hash: Some(copied_hash),
-            collection_id: "inbox".to_string(),
+            collection_id,
             tags: Vec::new(),
             processing_status: DocumentProcessingStatus::Ready,
             index_status: IndexStatus::Pending,
@@ -1210,6 +1316,9 @@ impl LibraryService {
             error_stage: None,
             error_message: None,
             retryable: false,
+            target_collection_id: pending.target_collection_id,
+            collection_id: Some(document.collection_id),
+            notice: target_notice,
         })
     }
 
@@ -1551,6 +1660,9 @@ impl LibraryService {
             error_stage: None,
             error_message: None,
             retryable: false,
+            target_collection_id: pending.target_collection_id,
+            collection_id: Some(document.collection_id),
+            notice: None,
         })
     }
 
@@ -1561,6 +1673,7 @@ impl LibraryService {
         content_hash: String,
         status: ImportItemStatus,
         existing_document_id: String,
+        target_collection_id: Option<String>,
     ) -> ImportItemResult {
         let item = ImportItemResult {
             item_id: item_id.clone(),
@@ -1573,11 +1686,15 @@ impl LibraryService {
             error_stage: None,
             error_message: None,
             retryable: false,
+            target_collection_id: target_collection_id.clone(),
+            collection_id: None,
+            notice: None,
         };
         self.import_items.insert(
             item_id,
             ImportItemContext {
                 item: item.clone(),
+                target_collection_id: target_collection_id.clone(),
                 pending: Some(PendingImport {
                     path: prepared.path,
                     source_path: prepared.source_path,
@@ -1587,6 +1704,7 @@ impl LibraryService {
                     source_identifier: prepared.source_identifier,
                     content_hash,
                     existing_document_id,
+                    target_collection_id,
                 }),
             },
         );
@@ -1616,12 +1734,16 @@ impl LibraryService {
             error_stage: Some(error_stage.to_string()),
             error_message: Some(error_message),
             retryable,
+            target_collection_id: None,
+            collection_id: None,
+            notice: None,
         };
         self.import_items.insert(
             item_id,
             ImportItemContext {
                 item: item.clone(),
                 pending: None,
+                target_collection_id: None,
             },
         );
         item

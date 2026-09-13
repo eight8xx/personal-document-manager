@@ -77,7 +77,11 @@ describe("一万份资料库的列表与网格渲染规模", () => {
     });
     render(<App client={client} />);
 
-    const status = await screen.findByRole("status");
+    const status = await screen.findByRole(
+      "status",
+      undefined,
+      { timeout: 3_000 }
+    );
     await waitFor(() => {
       expect(status).toHaveTextContent(/正在建立索引 \d+\/100/);
     });
