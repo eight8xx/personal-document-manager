@@ -9,10 +9,27 @@ import {
   Pencil,
   Trash2
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type {
+  CSSProperties,
+  MouseEvent as ReactMouseEvent
+} from "react";
+import { createPortal } from "react-dom";
 
 import type { CollectionSummary } from "../backend/types";
+
+const MENU_GAP = 4;
+const MENU_VIEWPORT_MARGIN = 8;
+
+interface CollectionMenuPosition {
+  top: number;
+  left: number;
+  placement: "top" | "bottom";
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
 
 interface CollectionTreeProps {
   collections: CollectionSummary[];
@@ -52,8 +69,11 @@ function CollectionNode({
   const isSelected = selectedCollectionId === collection.id;
   const CollectionIcon = collection.isInbox ? Inbox : Folder;
   const isMenuOpen = openMenuId === collection.id;
-  const menuRef = useRef<HTMLDivElement>(null);
+  const menuContainerRef = useRef<HTMLDivElement>(null);
+  const menuPopoverRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
+  const [menuPosition, setMenuPosition] =
+    useState<CollectionMenuPosition | null>(null);
 
   useEffect(() => {
     if (!isMenuOpen) {
@@ -61,7 +81,11 @@ function CollectionNode({
     }
 
     function handlePointerDown(event: MouseEvent) {
-      if (!menuRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (
+        !menuContainerRef.current?.contains(target) &&
+        !menuPopoverRef.current?.contains(target)
+      ) {
         onOpenMenuChange(null);
       }
     }
@@ -84,6 +108,75 @@ function CollectionNode({
     };
   }, [isMenuOpen, onOpenMenuChange]);
 
+  useLayoutEffect(() => {
+    if (!isMenuOpen) {
+      setMenuPosition(null);
+      return;
+    }
+
+    function updateMenuPosition() {
+      const trigger = menuTriggerRef.current;
+      const menu = menuPopoverRef.current;
+      if (!trigger || !menu) {
+        return;
+      }
+
+      const triggerRect = trigger.getBoundingClientRect();
+      const menuRect = menu.getBoundingClientRect();
+      const viewportWidth =
+        document.documentElement.clientWidth || window.innerWidth;
+      const viewportHeight =
+        document.documentElement.clientHeight || window.innerHeight;
+      if (
+        triggerRect.bottom < 0 ||
+        triggerRect.top > viewportHeight ||
+        triggerRect.right < 0 ||
+        triggerRect.left > viewportWidth
+      ) {
+        onOpenMenuChange(null);
+        return;
+      }
+      const spaceBelow =
+        viewportHeight -
+        MENU_VIEWPORT_MARGIN -
+        triggerRect.bottom -
+        MENU_GAP;
+      const spaceAbove =
+        triggerRect.top - MENU_VIEWPORT_MARGIN - MENU_GAP;
+      const opensAbove =
+        menuRect.height > spaceBelow && spaceAbove > spaceBelow;
+      const preferredTop = opensAbove
+        ? triggerRect.top - MENU_GAP - menuRect.height
+        : triggerRect.bottom + MENU_GAP;
+      const maximumTop =
+        viewportHeight - MENU_VIEWPORT_MARGIN - menuRect.height;
+      const maximumLeft =
+        viewportWidth - MENU_VIEWPORT_MARGIN - menuRect.width;
+
+      setMenuPosition({
+        top: Math.round(
+          clamp(preferredTop, MENU_VIEWPORT_MARGIN, maximumTop)
+        ),
+        left: Math.round(
+          clamp(
+            triggerRect.right - menuRect.width,
+            MENU_VIEWPORT_MARGIN,
+            maximumLeft
+          )
+        ),
+        placement: opensAbove ? "top" : "bottom"
+      });
+    }
+
+    updateMenuPosition();
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
+    };
+  }, [isMenuOpen]);
+
   function toggleMenu(event: ReactMouseEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
@@ -99,6 +192,12 @@ function CollectionNode({
     onOpenMenuChange(null);
     action();
   }
+
+  const menuPopoverStyle: CSSProperties = {
+    top: menuPosition?.top ?? 0,
+    left: menuPosition?.left ?? 0,
+    visibility: menuPosition ? "visible" : "hidden"
+  };
 
   return (
     <li className="collection-node">
@@ -144,7 +243,7 @@ function CollectionNode({
           <em>{collection.documentCount}</em>
         </button>
 
-        <div className="collection-menu" ref={menuRef}>
+        <div className="collection-menu" ref={menuContainerRef}>
           <button
             ref={menuTriggerRef}
             className="icon-button compact collection-menu-trigger"
@@ -157,59 +256,73 @@ function CollectionNode({
           >
             <MoreHorizontal size={15} aria-hidden="true" />
           </button>
-          {isMenuOpen ? (
-            <div
-              className="collection-menu-popover"
-              role="menu"
-              aria-label={`管理 ${collection.name}`}
-            >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={(event) =>
-                  chooseMenuAction(event, () => onCreateChild(collection))
-                }
-              >
-                <FolderPlus size={14} aria-hidden="true" />
-                创建子集合
-              </button>
-              {!collection.isInbox ? (
-                <>
+          {isMenuOpen
+            ? createPortal(
+                <div
+                  ref={menuPopoverRef}
+                  className="collection-menu-popover"
+                  role="menu"
+                  aria-label={`管理 ${collection.name}`}
+                  data-placement={menuPosition?.placement}
+                  style={menuPopoverStyle}
+                >
                   <button
                     type="button"
                     role="menuitem"
                     onClick={(event) =>
-                      chooseMenuAction(event, () => onRename(collection))
+                      chooseMenuAction(event, () =>
+                        onCreateChild(collection)
+                      )
                     }
                   >
-                    <Pencil size={14} aria-hidden="true" />
-                    重命名
+                    <FolderPlus size={14} aria-hidden="true" />
+                    创建子集合
                   </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={(event) =>
-                      chooseMenuAction(event, () => onMove(collection))
-                    }
-                  >
-                    <FolderInput size={14} aria-hidden="true" />
-                    移动
-                  </button>
-                  <button
-                    className="danger"
-                    type="button"
-                    role="menuitem"
-                    onClick={(event) =>
-                      chooseMenuAction(event, () => onDelete(collection))
-                    }
-                  >
-                    <Trash2 size={14} aria-hidden="true" />
-                    删除
-                  </button>
-                </>
-              ) : null}
-            </div>
-          ) : null}
+                  {!collection.isInbox ? (
+                    <>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={(event) =>
+                          chooseMenuAction(event, () =>
+                            onRename(collection)
+                          )
+                        }
+                      >
+                        <Pencil size={14} aria-hidden="true" />
+                        重命名
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={(event) =>
+                          chooseMenuAction(event, () =>
+                            onMove(collection)
+                          )
+                        }
+                      >
+                        <FolderInput size={14} aria-hidden="true" />
+                        移动
+                      </button>
+                      <button
+                        className="danger"
+                        type="button"
+                        role="menuitem"
+                        onClick={(event) =>
+                          chooseMenuAction(event, () =>
+                            onDelete(collection)
+                          )
+                        }
+                      >
+                        <Trash2 size={14} aria-hidden="true" />
+                        删除
+                      </button>
+                    </>
+                  ) : null}
+                </div>,
+                document.body
+              )
+            : null}
         </div>
       </div>
 

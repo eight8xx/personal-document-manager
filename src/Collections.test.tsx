@@ -116,6 +116,24 @@ describe("集合管理流程", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
+  it("renders the collection menu outside the collection scroll container", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections,
+      documents: [projectDocument]
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("button", { name: "管理 项目" });
+    const menu = await openCollectionMenu(user, "项目");
+    const scrollContainer = document.querySelector(".collection-tree");
+
+    expect(scrollContainer).not.toBeNull();
+    expect(scrollContainer).not.toContainElement(menu);
+    expect(menu.parentElement).toBe(document.body);
+  });
+
   it("creates nested collections, renames them, and moves them", async () => {
     const user = userEvent.setup();
     const client = new FakeBackendClient({

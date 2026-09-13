@@ -619,12 +619,14 @@ p {
 }
 
 .collection-menu-popover {
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
-  z-index: 30;
+  position: fixed;
+  z-index: 60;
   width: 148px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
   display: grid;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 5px;
   border: 1px solid var(--border-strong);
   border-radius: 7px;
