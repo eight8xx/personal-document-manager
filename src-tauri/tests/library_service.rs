@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use personal_document_manager_lib::library::{
-    DocumentProcessingStatus, ImportDecision, ImportItemStatus, IndexStatus, LibraryService,
-    LocationStatus,
+    DocumentMetadataUpdate, DocumentProcessingStatus, ImportDecision, ImportItemStatus,
+    IndexStatus, LibraryService, LocationStatus,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -690,6 +690,167 @@ fn deleting_a_collection_reparents_children_and_moves_direct_documents_to_inbox(
         .move_document_to_collection(&document_id, "missing-collection")
         .unwrap_err();
     assert_eq!(missing_target.code(), "collectionNotFound");
+}
+
+#[test]
+fn manages_tag_lifecycle_and_multiple_document_tags_without_deleting_documents() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("project.md");
+    fs::write(&source_path, "project metadata").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    let original_file_name = imported.file_name.clone();
+    let original_source_path = imported.source_path.clone();
+    let original_source_identifier = imported.source_identifier.clone();
+
+    let work = service.create_tag("工作".to_string()).unwrap();
+    let important = service.create_tag("重要".to_string()).unwrap();
+    assert_eq!(work.document_count, 0);
+    assert!(service.create_tag("工作".to_string()).is_err());
+    assert!(service.create_tag("   ".to_string()).is_err());
+
+    let updated = service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "项目规划".to_string(),
+                description: Some("第一版规划".to_string()),
+                document_date: Some("2024-03-18".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: vec![work.id.clone(), important.id.clone()],
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.title, "项目规划");
+    assert_eq!(updated.description.as_deref(), Some("第一版规划"));
+    assert_eq!(updated.document_date.as_deref(), Some("2024-03-18"));
+    assert_eq!(updated.file_name, original_file_name);
+    assert_eq!(updated.source_path, original_source_path);
+    assert_eq!(updated.source_identifier, original_source_identifier);
+    assert_eq!(
+        updated
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["工作", "重要"]
+    );
+
+    let renamed = service.rename_tag(&work.id, "项目".to_string()).unwrap();
+    assert_eq!(renamed.name, "项目");
+    assert_eq!(renamed.document_count, 1);
+    let documents = service.list_documents().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert!(documents[0].tags.iter().any(|tag| tag.name == "项目"));
+
+    let without_important = service
+        .remove_tag_from_document(&imported.id, &important.id)
+        .unwrap();
+    assert_eq!(without_important.tags.len(), 1);
+    let with_important_again = service
+        .add_tag_to_document(&imported.id, &important.id)
+        .unwrap();
+    assert_eq!(with_important_again.tags.len(), 2);
+
+    service.delete_tag(&important.id).unwrap();
+    let remaining_tags = service.list_tags().unwrap();
+    assert_eq!(remaining_tags.len(), 1);
+    assert_eq!(remaining_tags[0].name, "项目");
+    assert_eq!(remaining_tags[0].document_count, 1);
+
+    let remaining_document = service.list_documents().unwrap().remove(0);
+    assert_eq!(remaining_document.title, "项目规划");
+    assert_eq!(remaining_document.tags.len(), 1);
+    assert_eq!(remaining_document.tags[0].name, "项目");
+    let library_copy = library_dir
+        .join("documents")
+        .join(&remaining_document.id)
+        .join(&remaining_document.file_name);
+    assert!(library_copy.is_file());
+}
+
+#[test]
+fn updates_all_document_metadata_and_allows_an_empty_document_date() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("report.txt");
+    fs::write(&source_path, "report contents").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    let tag = service.create_tag("报告".to_string()).unwrap();
+
+    let dated = service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "年度报告".to_string(),
+                description: Some("2025 年总结".to_string()),
+                document_date: Some("2019-12-31".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: vec![tag.id.clone()],
+            },
+        )
+        .unwrap();
+    assert_eq!(dated.document_date.as_deref(), Some("2019-12-31"));
+    assert_ne!(
+        dated.document_date.as_deref(),
+        dated.imported_at.get(..10),
+        "文档日期必须独立于导入时间"
+    );
+
+    let undated = service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "年度报告（未定稿）".to_string(),
+                description: None,
+                document_date: None,
+                collection_id: "inbox".to_string(),
+                tag_ids: vec![tag.id],
+            },
+        )
+        .unwrap();
+    assert_eq!(undated.title, "年度报告（未定稿）");
+    assert_eq!(undated.description, None);
+    assert_eq!(undated.document_date, None);
+    assert_eq!(undated.file_name, imported.file_name);
+    assert_eq!(undated.source_path, imported.source_path);
+    assert_eq!(undated.tags.len(), 1);
+
+    let invalid_date = service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "报告".to_string(),
+                description: None,
+                document_date: Some("2024-13-40".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: Vec::new(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(invalid_date.code(), "invalidDocumentMetadata");
+
+    let empty_title = service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "  ".to_string(),
+                description: None,
+                document_date: None,
+                collection_id: "inbox".to_string(),
+                tag_ids: Vec::new(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(empty_title.code(), "invalidDocumentMetadata");
 }
 
 fn is_library(path: &Path) -> bool {

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
-    BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentSummary, ImportBatch,
-    ImportDecision, ImportItemResult, ImportProgress, LibraryError, LibraryResult, LibraryService,
-    LibrarySummary, RecentLibrary,
+    BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate,
+    DocumentSummary, ImportBatch, ImportDecision, ImportItemResult, ImportProgress, LibraryError,
+    LibraryResult, LibraryService, LibrarySummary, RecentLibrary, TagSummary,
 };
 
 pub struct AppState {
@@ -305,6 +305,119 @@ fn move_document_to_collection_contract(
 }
 
 #[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagSummary>, CommandError> {
+    list_tags_contract(&state)
+}
+
+fn list_tags_contract(state: &AppState) -> Result<Vec<TagSummary>, CommandError> {
+    state.service()?.list_tags().map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn create_tag(name: String, state: State<'_, AppState>) -> Result<TagSummary, CommandError> {
+    create_tag_contract(&state, name)
+}
+
+fn create_tag_contract(state: &AppState, name: String) -> Result<TagSummary, CommandError> {
+    state
+        .service()?
+        .create_tag(name)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn rename_tag(
+    tag_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<TagSummary, CommandError> {
+    rename_tag_contract(&state, tag_id, name)
+}
+
+fn rename_tag_contract(
+    state: &AppState,
+    tag_id: String,
+    name: String,
+) -> Result<TagSummary, CommandError> {
+    state
+        .service()?
+        .rename_tag(&tag_id, name)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn delete_tag(tag_id: String, state: State<'_, AppState>) -> Result<(), CommandError> {
+    delete_tag_contract(&state, tag_id)
+}
+
+fn delete_tag_contract(state: &AppState, tag_id: String) -> Result<(), CommandError> {
+    state
+        .service()?
+        .delete_tag(&tag_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn add_tag_to_document(
+    document_id: String,
+    tag_id: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentSummary, CommandError> {
+    add_tag_to_document_contract(&state, document_id, tag_id)
+}
+
+fn add_tag_to_document_contract(
+    state: &AppState,
+    document_id: String,
+    tag_id: String,
+) -> Result<DocumentSummary, CommandError> {
+    state
+        .service()?
+        .add_tag_to_document(&document_id, &tag_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn remove_tag_from_document(
+    document_id: String,
+    tag_id: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentSummary, CommandError> {
+    remove_tag_from_document_contract(&state, document_id, tag_id)
+}
+
+fn remove_tag_from_document_contract(
+    state: &AppState,
+    document_id: String,
+    tag_id: String,
+) -> Result<DocumentSummary, CommandError> {
+    state
+        .service()?
+        .remove_tag_from_document(&document_id, &tag_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn update_document_metadata(
+    document_id: String,
+    update: DocumentMetadataUpdate,
+    state: State<'_, AppState>,
+) -> Result<DocumentSummary, CommandError> {
+    update_document_metadata_contract(&state, document_id, update)
+}
+
+fn update_document_metadata_contract(
+    state: &AppState,
+    document_id: String,
+    update: DocumentMetadataUpdate,
+) -> Result<DocumentSummary, CommandError> {
+    state
+        .service()?
+        .update_document_metadata(&document_id, update)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
 pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<DocumentSummary>, CommandError> {
     list_documents_contract(&state)
 }
@@ -365,14 +478,17 @@ fn emit_library_changed(app: &AppHandle, action: &str, library: LibrarySummary) 
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_contract, create_collection_contract, create_library_contract,
-        delete_collection_contract, inspect_library_location_contract, list_collections_contract,
-        move_collection_contract, move_document_to_collection_contract, rename_collection_contract,
-        resolve_import_item_contract, retry_import_item_contract, start_import_contract, AppState,
-        CommandError, LibraryChangedEvent,
+        add_tag_to_document_contract, bootstrap_contract, create_collection_contract,
+        create_library_contract, create_tag_contract, delete_collection_contract,
+        delete_tag_contract, inspect_library_location_contract, list_collections_contract,
+        list_tags_contract, move_collection_contract, move_document_to_collection_contract,
+        remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
+        resolve_import_item_contract, retry_import_item_contract, start_import_contract,
+        update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
     };
     use crate::library::{
-        ImportDecision, ImportItemStatus, LibraryService, LibrarySummary, LocationStatus,
+        DocumentMetadataUpdate, ImportDecision, ImportItemStatus, LibraryService, LibrarySummary,
+        LocationStatus,
     };
     use tempfile::tempdir;
 
@@ -544,5 +660,58 @@ mod tests {
         assert!(delete_value.get("collectionId").is_some());
         assert!(delete_value.get("targetCollectionId").is_some());
         assert!(delete_value.get("movedDocumentCount").is_some());
+    }
+
+    #[test]
+    fn tag_and_metadata_commands_use_camel_case_contract() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let library_path = root.path().join("Library");
+        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let source_path = root.path().join("document.txt");
+        std::fs::write(&source_path, "document").unwrap();
+        let document_id = start_import_contract(
+            &state,
+            vec![source_path.to_string_lossy().into_owned()],
+            |_| {},
+        )
+        .unwrap()
+        .items
+        .remove(0)
+        .document_id
+        .unwrap();
+
+        let work = create_tag_contract(&state, "工作".to_string()).unwrap();
+        let important = create_tag_contract(&state, "重要".to_string()).unwrap();
+        let renamed = rename_tag_contract(&state, work.id.clone(), "项目".to_string()).unwrap();
+        assert_eq!(renamed.name, "项目");
+        assert_eq!(list_tags_contract(&state).unwrap().len(), 2);
+
+        let updated = update_document_metadata_contract(
+            &state,
+            document_id.clone(),
+            DocumentMetadataUpdate {
+                title: "项目文档".to_string(),
+                description: Some("说明".to_string()),
+                document_date: Some("2025-02-03".to_string()),
+                collection_id: "inbox".to_string(),
+                tag_ids: vec![renamed.id.clone(), important.id.clone()],
+            },
+        )
+        .unwrap();
+        let value = serde_json::to_value(updated).unwrap();
+        assert_eq!(value["documentDate"], "2025-02-03");
+        assert_eq!(value["tags"].as_array().unwrap().len(), 2);
+        assert!(value.get("sourcePath").is_some());
+
+        let removed =
+            remove_tag_from_document_contract(&state, document_id.clone(), important.id.clone())
+                .unwrap();
+        assert_eq!(removed.tags.len(), 1);
+        let added =
+            add_tag_to_document_contract(&state, document_id, important.id.clone()).unwrap();
+        assert_eq!(added.tags.len(), 2);
+        delete_tag_contract(&state, important.id).unwrap();
+        assert_eq!(list_tags_contract(&state).unwrap().len(), 1);
     }
 }

@@ -36,6 +36,16 @@ pub enum LibraryError {
     ProtectedCollection(String),
     #[error("{0}")]
     CollectionCycle(String),
+    #[error("{0}")]
+    InvalidTag(String),
+    #[error("{0}")]
+    TagNotFound(String),
+    #[error("{0}")]
+    TagAlreadyExists(String),
+    #[error("{0}")]
+    InvalidDocumentMetadata(String),
+    #[error("{0}")]
+    DocumentNotFound(String),
     #[error("无法打开目录：{0}")]
     OpenDirectory(String),
     #[error("资料库状态锁已损坏")]
@@ -60,6 +70,11 @@ impl LibraryError {
             Self::CollectionNotFound(_) => "collectionNotFound",
             Self::ProtectedCollection(_) => "protectedCollection",
             Self::CollectionCycle(_) => "collectionCycle",
+            Self::InvalidTag(_) => "invalidTag",
+            Self::TagNotFound(_) => "tagNotFound",
+            Self::TagAlreadyExists(_) => "tagAlreadyExists",
+            Self::InvalidDocumentMetadata(_) => "invalidDocumentMetadata",
+            Self::DocumentNotFound(_) => "documentNotFound",
             Self::OpenDirectory(_) => "openDirectory",
             Self::StateLock => "stateLock",
         }

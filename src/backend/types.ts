@@ -38,11 +38,14 @@ export type IndexStatus = "pending" | "searchable" | "failed";
 export interface DocumentSummary {
   id: string;
   title: string;
+  description: string | null;
+  documentDate: string | null;
   fileName: string;
   fileType: string;
   fileSize: number;
   contentHash: string | null;
   collectionId: string;
+  tags: TagSummary[];
   processingStatus: DocumentProcessingStatus;
   indexStatus: IndexStatus;
   errorStage: string | null;
@@ -51,6 +54,20 @@ export interface DocumentSummary {
   sourcePath: string;
   sourceIdentifier: string;
   lastImportedAt: string;
+}
+
+export interface TagSummary {
+  id: string;
+  name: string;
+  documentCount: number;
+}
+
+export interface DocumentMetadataUpdate {
+  title: string;
+  description: string | null;
+  documentDate: string | null;
+  collectionId: string;
+  tagIds: string[];
 }
 
 export type ImportItemStatus =
@@ -164,5 +181,21 @@ export interface BackendClient {
   moveDocumentToCollection(
     documentId: string,
     collectionId: string
+  ): Promise<DocumentSummary>;
+  listTags(): Promise<TagSummary[]>;
+  createTag(name: string): Promise<TagSummary>;
+  renameTag(tagId: string, name: string): Promise<TagSummary>;
+  deleteTag(tagId: string): Promise<void>;
+  addTagToDocument(
+    documentId: string,
+    tagId: string
+  ): Promise<DocumentSummary>;
+  removeTagFromDocument(
+    documentId: string,
+    tagId: string
+  ): Promise<DocumentSummary>;
+  updateDocumentMetadata(
+    documentId: string,
+    update: DocumentMetadataUpdate
   ): Promise<DocumentSummary>;
 }

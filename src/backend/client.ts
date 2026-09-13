@@ -8,6 +8,7 @@ import type {
   BootstrapState,
   CollectionDeleteResult,
   CollectionSummary,
+  DocumentMetadataUpdate,
   DocumentSummary,
   ImportBatch,
   ImportDecision,
@@ -15,7 +16,8 @@ import type {
   ImportProgress,
   LibraryLocationInspection,
   LibrarySummary,
-  RecentLibrary
+  RecentLibrary,
+  TagSummary
 } from "./types";
 
 export const tauriBackendClient: BackendClient = {
@@ -129,5 +131,22 @@ export const tauriBackendClient: BackendClient = {
     invoke<DocumentSummary>("move_document_to_collection", {
       documentId,
       collectionId
+    }),
+  listTags: () => invoke<TagSummary[]>("list_tags"),
+  createTag: (name) => invoke<TagSummary>("create_tag", { name }),
+  renameTag: (tagId, name) =>
+    invoke<TagSummary>("rename_tag", { tagId, name }),
+  deleteTag: (tagId) => invoke<void>("delete_tag", { tagId }),
+  addTagToDocument: (documentId, tagId) =>
+    invoke<DocumentSummary>("add_tag_to_document", { documentId, tagId }),
+  removeTagFromDocument: (documentId, tagId) =>
+    invoke<DocumentSummary>("remove_tag_from_document", {
+      documentId,
+      tagId
+    }),
+  updateDocumentMetadata: (documentId, update: DocumentMetadataUpdate) =>
+    invoke<DocumentSummary>("update_document_metadata", {
+      documentId,
+      update
     })
 };

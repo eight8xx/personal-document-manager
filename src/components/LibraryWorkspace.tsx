@@ -8,8 +8,12 @@ import {
   Inbox,
   LibraryBig,
   LoaderCircle,
+  Pencil,
+  Plus,
   Search,
   Settings,
+  Tag as TagIcon,
+  Trash2,
   X
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -19,12 +23,14 @@ import type {
   BackendClient,
   CollectionDeleteResult,
   CollectionSummary,
+  DocumentMetadataUpdate,
   DocumentSummary,
   ImportBatch,
   ImportDecision,
   ImportItemResult,
   ImportProgress,
-  LibrarySummary
+  LibrarySummary,
+  TagSummary
 } from "../backend/types";
 import {
   CollectionActionDialog,
@@ -32,8 +38,14 @@ import {
 } from "./CollectionDialog";
 import type { CollectionAction } from "./CollectionDialog";
 import { CollectionTree } from "./CollectionTree";
+import { DocumentMetadataDialog } from "./DocumentMetadataDialog";
 import { ImportBatchPanel } from "./ImportBatchPanel";
 import { ImportDecisionDialog } from "./ImportDecisionDialog";
+import {
+  DeleteTagDialog,
+  TagActionDialog
+} from "./TagDialog";
+import type { TagAction } from "./TagDialog";
 
 interface LibraryWorkspaceProps {
   client: BackendClient;
@@ -83,6 +95,7 @@ function mergeById<T>(
 
 const documentId = (document: DocumentSummary) => document.id;
 const collectionId = (collection: CollectionSummary) => collection.id;
+const tagId = (tag: TagSummary) => tag.id;
 const importItemId = (item: ImportItemResult) => item.itemId;
 
 function replaceImportItem(
@@ -114,6 +127,7 @@ export function LibraryWorkspace({
 }: LibraryWorkspaceProps) {
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
+  const [tags, setTags] = useState<TagSummary[]>([]);
   const [selectedCollectionId, setSelectedCollectionId] = useState<
     string | null
   >(null);
@@ -130,6 +144,12 @@ export function LibraryWorkspace({
     useState<CollectionAction | null>(null);
   const [deleteTarget, setDeleteTarget] =
     useState<CollectionSummary | null>(null);
+  const [tagAction, setTagAction] = useState<TagAction | null>(null);
+  const [deleteTagTarget, setDeleteTagTarget] = useState<TagSummary | null>(
+    null
+  );
+  const [metadataTarget, setMetadataTarget] =
+    useState<DocumentSummary | null>(null);
   const [highlightedDocumentId, setHighlightedDocumentId] = useState<
     string | null
   >(null);
@@ -147,20 +167,35 @@ export function LibraryWorkspace({
     return items;
   }, [client]);
 
+  const refreshTags = useCallback(async () => {
+    const items = await client.listTags();
+    setTags(items);
+    return items;
+  }, [client]);
+
   const refreshLibraryData = useCallback(async () => {
-    await Promise.all([refreshDocuments(), refreshCollections()]);
-  }, [refreshCollections, refreshDocuments]);
+    await Promise.all([
+      refreshDocuments(),
+      refreshCollections(),
+      refreshTags()
+    ]);
+  }, [refreshCollections, refreshDocuments, refreshTags]);
 
   useEffect(() => {
     let active = true;
     setLoading(true);
     setDocuments([]);
     setCollections([]);
+    setTags([]);
     setError("");
     setSelectedCollectionId(null);
 
-    void Promise.all([client.listDocuments(), client.listCollections()])
-      .then(([documentItems, collectionItems]) => {
+    void Promise.all([
+      client.listDocuments(),
+      client.listCollections(),
+      client.listTags()
+    ])
+      .then(([documentItems, collectionItems, tagItems]) => {
         if (!active) {
           return;
         }
@@ -168,6 +203,7 @@ export function LibraryWorkspace({
         setCollections((current) =>
           mergeById(current, collectionItems, collectionId)
         );
+        setTags((current) => mergeById(current, tagItems, tagId));
       })
       .catch((caught) => {
         if (active) {
@@ -451,6 +487,80 @@ export function LibraryWorkspace({
     }
   }
 
+  async function submitTagAction(name: string) {
+    if (!tagAction) {
+      return;
+    }
+
+    setError("");
+    if (tagAction.type === "create") {
+      const created = await client.createTag(name);
+      setTags((current) =>
+        [...current.filter((tag) => tag.id !== created.id), created].sort(
+          (left, right) => left.name.localeCompare(right.name, "zh-CN")
+        )
+      );
+    } else {
+      const renamed = await client.renameTag(tagAction.tag.id, name);
+      setTags((current) =>
+        current
+          .map((tag) => (tag.id === renamed.id ? renamed : tag))
+          .sort((left, right) => left.name.localeCompare(right.name, "zh-CN"))
+      );
+      setDocuments((current) =>
+        current.map((document) => ({
+          ...document,
+          tags: document.tags.map((tag) =>
+            tag.id === renamed.id ? renamed : tag
+          )
+        }))
+      );
+    }
+    setTagAction(null);
+  }
+
+  async function deleteTag() {
+    if (!deleteTagTarget) {
+      return;
+    }
+
+    setError("");
+    const target = deleteTagTarget;
+    await client.deleteTag(target.id);
+    setTags((current) => current.filter((tag) => tag.id !== target.id));
+    setDocuments((current) =>
+      current.map((document) => ({
+        ...document,
+        tags: document.tags.filter((tag) => tag.id !== target.id)
+      }))
+    );
+    setDeleteTagTarget(null);
+  }
+
+  async function saveDocumentMetadata(update: DocumentMetadataUpdate) {
+    if (!metadataTarget) {
+      return;
+    }
+
+    setError("");
+    const updated = await client.updateDocumentMetadata(
+      metadataTarget.id,
+      update
+    );
+    setDocuments((current) =>
+      current.map((document) =>
+        document.id === updated.id ? updated : document
+      )
+    );
+    setMetadataTarget(null);
+    void refreshCollections().catch((caught) => {
+      setError(toBackendError(caught).message);
+    });
+    void refreshTags().catch((caught) => {
+      setError(toBackendError(caught).message);
+    });
+  }
+
   async function moveDocument(document: DocumentSummary, collectionId: string) {
     if (document.collectionId === collectionId) {
       return;
@@ -547,6 +657,54 @@ export function LibraryWorkspace({
             }
             onDelete={setDeleteTarget}
           />
+        </section>
+
+        <section className="tag-section" aria-labelledby="tags-title">
+          <div className="tag-section-header">
+            <h2 id="tags-title">标签</h2>
+            <button
+              className="icon-button compact"
+              type="button"
+              onClick={() => setTagAction({ type: "create" })}
+              aria-label="创建标签"
+              title="创建标签"
+            >
+              <Plus size={15} aria-hidden="true" />
+            </button>
+          </div>
+          {tags.length === 0 ? (
+            <p className="tag-section-empty">暂无标签</p>
+          ) : (
+            <ul className="tag-list">
+              {tags.map((tag) => (
+                <li className="tag-row" key={tag.id}>
+                  <TagIcon size={14} aria-hidden="true" />
+                  <span title={tag.name}>{tag.name}</span>
+                  <em>{tag.documentCount}</em>
+                  <div className="tag-actions">
+                    <button
+                      className="icon-button compact"
+                      type="button"
+                      onClick={() => setTagAction({ type: "rename", tag })}
+                      aria-label={`重命名标签 ${tag.name}`}
+                      title="重命名标签"
+                    >
+                      <Pencil size={13} aria-hidden="true" />
+                    </button>
+                    <button
+                      className="icon-button compact danger"
+                      type="button"
+                      onClick={() => setDeleteTagTarget(tag)}
+                      aria-label={`删除标签 ${tag.name}`}
+                      title="删除标签"
+                    >
+                      <Trash2 size={13} aria-hidden="true" />
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
 
         <div className="sidebar-spacer" />
@@ -680,7 +838,10 @@ export function LibraryWorkspace({
               <span>标题</span>
               <span>类型</span>
               <span>状态</span>
+              <span>文档日期</span>
               <span>集合</span>
+              <span>标签</span>
+              <span aria-hidden="true" />
             </div>
             <div className="document-list">
               {visibleDocuments.map((document) => {
@@ -714,6 +875,13 @@ export function LibraryWorkspace({
                     >
                       {status.label}
                     </span>
+                    <span
+                      className={`document-date${
+                        document.documentDate ? "" : " unset"
+                      }`}
+                    >
+                      {document.documentDate ?? "未设置"}
+                    </span>
                     <label className="document-collection">
                       <span className="visually-hidden">
                         移动 {document.title} 到集合
@@ -732,6 +900,29 @@ export function LibraryWorkspace({
                         ))}
                       </select>
                     </label>
+                    <div
+                      className="document-tags"
+                      aria-label={`${document.title} 的标签`}
+                    >
+                      {document.tags.length === 0 ? (
+                        <span className="document-tag-empty">无标签</span>
+                      ) : (
+                        document.tags.map((tag) => (
+                          <span className="document-tag" key={tag.id}>
+                            {tag.name}
+                          </span>
+                        ))
+                      )}
+                    </div>
+                    <button
+                      className="icon-button compact"
+                      type="button"
+                      onClick={() => setMetadataTarget(document)}
+                      aria-label={`编辑 ${document.title} 元数据`}
+                      title="编辑元数据"
+                    >
+                      <Pencil size={14} aria-hidden="true" />
+                    </button>
                   </article>
                 );
               })}
@@ -754,6 +945,32 @@ export function LibraryWorkspace({
           collection={deleteTarget}
           onClose={() => setDeleteTarget(null)}
           onConfirm={deleteCollection}
+        />
+      ) : null}
+
+      {tagAction ? (
+        <TagActionDialog
+          action={tagAction}
+          onClose={() => setTagAction(null)}
+          onSubmit={submitTagAction}
+        />
+      ) : null}
+
+      {deleteTagTarget ? (
+        <DeleteTagDialog
+          tag={deleteTagTarget}
+          onClose={() => setDeleteTagTarget(null)}
+          onConfirm={deleteTag}
+        />
+      ) : null}
+
+      {metadataTarget ? (
+        <DocumentMetadataDialog
+          document={metadataTarget}
+          collections={collections}
+          tags={tags}
+          onClose={() => setMetadataTarget(null)}
+          onSave={saveDocumentMetadata}
         />
       ) : null}
 

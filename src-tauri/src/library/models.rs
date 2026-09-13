@@ -109,11 +109,14 @@ impl IndexStatus {
 pub struct DocumentSummary {
     pub id: String,
     pub title: String,
+    pub description: Option<String>,
+    pub document_date: Option<String>,
     pub file_name: String,
     pub file_type: String,
     pub file_size: i64,
     pub content_hash: Option<String>,
     pub collection_id: String,
+    pub tags: Vec<TagSummary>,
     pub processing_status: DocumentProcessingStatus,
     pub index_status: IndexStatus,
     pub error_stage: Option<String>,
@@ -122,6 +125,24 @@ pub struct DocumentSummary {
     pub source_path: String,
     pub source_identifier: String,
     pub last_imported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagSummary {
+    pub id: String,
+    pub name: String,
+    pub document_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentMetadataUpdate {
+    pub title: String,
+    pub description: Option<String>,
+    pub document_date: Option<String>,
+    pub collection_id: String,
+    pub tag_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

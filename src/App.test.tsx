@@ -27,12 +27,15 @@ const currentLibrary: LibrarySummary = {
 const importedDocument: DocumentSummary = {
   id: "document-1",
   title: "项目说明",
+  description: null,
+  documentDate: null,
   fileName: "项目说明.md",
   fileType: "Markdown",
   fileSize: 24,
   contentHash:
     "f0e90aeef1ad3ef3666f7cf73a7938d958078cddb1dcfc6eed65a394d9940e18",
   collectionId: "inbox",
+  tags: [],
   processingStatus: "ready",
   indexStatus: "pending",
   errorStage: null,

@@ -4,6 +4,7 @@ import type {
   BootstrapState,
   CollectionDeleteResult,
   CollectionSummary,
+  DocumentMetadataUpdate,
   DocumentSummary,
   FileDropHandler,
   ImportBatch,
@@ -13,7 +14,8 @@ import type {
   ImportProgressHandler,
   LibraryLocationInspection,
   LibrarySummary,
-  RecentLibrary
+  RecentLibrary,
+  TagSummary
 } from "./types";
 
 export interface FakeBackendOptions {
@@ -24,6 +26,7 @@ export interface FakeBackendOptions {
   selectedFolder?: string | null;
   documents?: DocumentSummary[];
   collections?: CollectionSummary[];
+  tags?: TagSummary[];
   inspections?: Record<string, LibraryLocationInspection>;
   createLibrary?: (path: string) => Promise<LibrarySummary>;
   importDocument?: (path: string) => Promise<DocumentSummary>;
@@ -68,11 +71,14 @@ function defaultDocument(path: string): DocumentSummary {
   return {
     id: `document-${fileName}`,
     title: fileName.replace(/\.[^.]+$/, ""),
+    description: null,
+    documentDate: null,
     fileName,
     fileType,
     fileSize: 0,
     contentHash: null,
     collectionId: "inbox",
+    tags: [],
     processingStatus: "ready",
     indexStatus: "pending",
     errorStage: null,
@@ -129,6 +135,7 @@ export class FakeBackendClient implements BackendClient {
   private state: BootstrapState;
   private documents: DocumentSummary[];
   private collections: CollectionSummary[];
+  private tags: TagSummary[];
   private readonly selectedDirectory: string | null;
   private readonly selectedDocument: string | null;
   private readonly selectedDocuments: string[];
@@ -154,11 +161,13 @@ export class FakeBackendClient implements BackendClient {
   private importProgressHandlers = new Set<ImportProgressHandler>();
   private importBatches = new Map<string, ImportBatch>();
   private nextCollectionId = 1;
+  private nextTagId = 1;
 
   constructor(options: FakeBackendOptions = {}) {
     this.state = structuredClone(options.bootstrap ?? emptyBootstrap);
     this.documents = structuredClone(options.documents ?? []);
     this.collections = structuredClone(options.collections ?? [inbox]);
+    this.tags = structuredClone(options.tags ?? []);
     if (!this.collections.some((collection) => collection.isInbox)) {
       this.collections.unshift(structuredClone(inbox));
     }
@@ -174,6 +183,7 @@ export class FakeBackendClient implements BackendClient {
     this.resolveImportItemImpl = options.resolveImportItem ?? null;
     this.retryImportItemImpl = options.retryImportItem ?? null;
     this.refreshCollectionCounts();
+    this.refreshTagCounts();
   }
 
   async bootstrap(): Promise<BootstrapState> {
@@ -619,6 +629,149 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(document);
   }
 
+  async listTags(): Promise<TagSummary[]> {
+    this.calls.push("listTags");
+    return structuredClone(this.tags);
+  }
+
+  async createTag(name: string): Promise<TagSummary> {
+    this.calls.push(`createTag:${name}`);
+    const trimmedName = name.trim();
+    this.validateTagName(trimmedName);
+    if (
+      this.tags.some(
+        (tag) => tag.name.toLocaleLowerCase() === trimmedName.toLocaleLowerCase()
+      )
+    ) {
+      throw new BackendError({
+        code: "tagAlreadyExists",
+        message: "标签已存在。"
+      });
+    }
+
+    const tag: TagSummary = {
+      id: `tag-${this.nextTagId++}`,
+      name: trimmedName,
+      documentCount: 0
+    };
+    this.tags.push(tag);
+    this.sortTags();
+    return structuredClone(tag);
+  }
+
+  async renameTag(tagId: string, name: string): Promise<TagSummary> {
+    this.calls.push(`renameTag:${tagId}:${name}`);
+    const trimmedName = name.trim();
+    this.validateTagName(trimmedName);
+    const tag = this.requireTag(tagId);
+    if (
+      this.tags.some(
+        (candidate) =>
+          candidate.id !== tagId &&
+          candidate.name.toLocaleLowerCase() ===
+            trimmedName.toLocaleLowerCase()
+      )
+    ) {
+      throw new BackendError({
+        code: "tagAlreadyExists",
+        message: "标签已存在。"
+      });
+    }
+
+    tag.name = trimmedName;
+    for (const document of this.documents) {
+      document.tags = document.tags.map((candidate) =>
+        candidate.id === tagId ? { ...candidate, name: trimmedName } : candidate
+      );
+    }
+    this.sortTags();
+    return structuredClone(tag);
+  }
+
+  async deleteTag(tagId: string): Promise<void> {
+    this.calls.push(`deleteTag:${tagId}`);
+    this.requireTag(tagId);
+    this.tags = this.tags.filter((tag) => tag.id !== tagId);
+    for (const document of this.documents) {
+      document.tags = document.tags.filter((tag) => tag.id !== tagId);
+    }
+  }
+
+  async addTagToDocument(
+    documentId: string,
+    tagId: string
+  ): Promise<DocumentSummary> {
+    this.calls.push(`addTagToDocument:${documentId}:${tagId}`);
+    const document = this.requireDocument(documentId);
+    const tag = this.requireTag(tagId);
+    if (!document.tags.some((candidate) => candidate.id === tagId)) {
+      document.tags.push({ ...tag, documentCount: 0 });
+    }
+    this.refreshTagCounts();
+    return structuredClone(this.requireDocument(documentId));
+  }
+
+  async removeTagFromDocument(
+    documentId: string,
+    tagId: string
+  ): Promise<DocumentSummary> {
+    this.calls.push(`removeTagFromDocument:${documentId}:${tagId}`);
+    const document = this.requireDocument(documentId);
+    this.requireTag(tagId);
+    document.tags = document.tags.filter((tag) => tag.id !== tagId);
+    this.refreshTagCounts();
+    return structuredClone(document);
+  }
+
+  async updateDocumentMetadata(
+    documentId: string,
+    update: DocumentMetadataUpdate
+  ): Promise<DocumentSummary> {
+    this.calls.push(
+      `updateDocumentMetadata:${documentId}:${update.title}:${
+        update.documentDate ?? "null"
+      }:${update.collectionId}:${update.tagIds.join("|")}`
+    );
+    const title = update.title.trim();
+    if (!title) {
+      throw new BackendError({
+        code: "invalidDocumentMetadata",
+        message: "文档标题不能为空。"
+      });
+    }
+    if (
+      update.documentDate &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(update.documentDate)
+    ) {
+      throw new BackendError({
+        code: "invalidDocumentMetadata",
+        message: "文档日期必须使用 YYYY-MM-DD 格式。"
+      });
+    }
+    const document = this.requireDocument(documentId);
+    if (!this.collections.some((item) => item.id === update.collectionId)) {
+      throw new BackendError({
+        code: "collectionNotFound",
+        message: "目标集合不存在。"
+      });
+    }
+    const selectedTags = [...new Set(update.tagIds)].map((tagId) =>
+      this.requireTag(tagId)
+    );
+
+    document.title = title;
+    document.description = update.description?.trim() || null;
+    document.documentDate = update.documentDate || null;
+    document.collectionId = update.collectionId;
+    document.tags = selectedTags.map((tag) => ({
+      ...tag,
+      documentCount: 0
+    }));
+    this.refreshCollectionCounts();
+    this.refreshTagCounts();
+    return structuredClone(document);
+  }
+
   private snapshot(): BootstrapState {
     return {
       currentLibrary: this.state.currentLibrary,
@@ -669,6 +822,57 @@ export class FakeBackendClient implements BackendClient {
       });
     }
     return collection;
+  }
+
+  private requireDocument(documentId: string): DocumentSummary {
+    const document = this.documents.find((item) => item.id === documentId);
+    if (!document) {
+      throw new BackendError({
+        code: "documentNotFound",
+        message: "文档不存在。"
+      });
+    }
+    return document;
+  }
+
+  private requireTag(tagId: string): TagSummary {
+    const tag = this.tags.find((item) => item.id === tagId);
+    if (!tag) {
+      throw new BackendError({
+        code: "tagNotFound",
+        message: "标签不存在。"
+      });
+    }
+    return tag;
+  }
+
+  private validateTagName(name: string) {
+    if (!name) {
+      throw new BackendError({
+        code: "invalidTag",
+        message: "标签名称不能为空。"
+      });
+    }
+    if ([...name].length > 50) {
+      throw new BackendError({
+        code: "invalidTag",
+        message: "标签名称不能超过 50 个字符。"
+      });
+    }
+  }
+
+  private sortTags() {
+    this.tags.sort((left, right) =>
+      left.name.localeCompare(right.name, "zh-CN")
+    );
+  }
+
+  private refreshTagCounts() {
+    for (const tag of this.tags) {
+      tag.documentCount = this.documents.filter((document) =>
+        document.tags.some((candidate) => candidate.id === tag.id)
+      ).length;
+    }
   }
 
   private collectionDescendantIds(collectionId: string): Set<string> {

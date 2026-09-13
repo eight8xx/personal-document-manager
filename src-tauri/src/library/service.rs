@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{NaiveDate, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -11,9 +11,10 @@ use uuid::Uuid;
 use super::error::{LibraryError, LibraryResult};
 use super::models::{
     BootstrapState, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
-    DocumentProcessingStatus, DocumentSummary, ImportBatch, ImportDecision, ImportItemResult,
-    ImportItemStatus, ImportProgress, IndexStatus, LibraryLocationInspection, LibraryMetadata,
-    LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
+    DocumentMetadataUpdate, DocumentProcessingStatus, DocumentSummary, ImportBatch, ImportDecision,
+    ImportItemResult, ImportItemStatus, ImportProgress, IndexStatus, LibraryLocationInspection,
+    LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
+    TagSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -359,11 +360,14 @@ impl LibraryService {
         let document = DocumentSummary {
             id: document_id.clone(),
             title,
+            description: None,
+            document_date: None,
             file_name,
             file_type: file_type.to_string(),
             file_size,
             content_hash,
             collection_id: "inbox".to_string(),
+            tags: Vec::new(),
             processing_status,
             index_status,
             error_stage,
@@ -921,11 +925,14 @@ impl LibraryService {
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .filter(|stem| !stem.is_empty())
                 .unwrap_or_else(|| pending.file_name.clone()),
+            description: None,
+            document_date: None,
             file_name: pending.file_name.clone(),
             file_type: pending.file_type.clone(),
             file_size: pending.file_size,
             content_hash: Some(copied_hash),
             collection_id: "inbox".to_string(),
+            tags: Vec::new(),
             processing_status: DocumentProcessingStatus::Ready,
             index_status: IndexStatus::Pending,
             error_stage: None,
@@ -1607,6 +1614,196 @@ impl LibraryService {
         })
     }
 
+    pub fn list_tags(&self) -> LibraryResult<Vec<TagSummary>> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let mut statement = library.connection.prepare(
+            "
+            SELECT
+                t.id,
+                t.name,
+                (
+                    SELECT COUNT(*)
+                    FROM document_tags dt
+                    JOIN documents d ON d.id = dt.document_id
+                    WHERE dt.tag_id = t.id AND d.deleted_at IS NULL
+                )
+            FROM tags t
+            ORDER BY LOWER(t.name), t.id
+            ",
+        )?;
+        let tags = statement
+            .query_map([], tag_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tags)
+    }
+
+    pub fn create_tag(&mut self, name: String) -> LibraryResult<TagSummary> {
+        let name = validate_tag_name(&name)?;
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        if tag_name_exists(&library.connection, &name, None)? {
+            return Err(LibraryError::TagAlreadyExists(format!(
+                "标签已存在：{name}"
+            )));
+        }
+
+        let id = Uuid::new_v4().to_string();
+        library.connection.execute(
+            "INSERT INTO tags (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![&id, &name, now()],
+        )?;
+        load_tag_summary(&library.connection, &id)
+    }
+
+    pub fn rename_tag(&mut self, tag_id: &str, name: String) -> LibraryResult<TagSummary> {
+        let name = validate_tag_name(&name)?;
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        ensure_tag_exists(&library.connection, tag_id)?;
+        if tag_name_exists(&library.connection, &name, Some(tag_id))? {
+            return Err(LibraryError::TagAlreadyExists(format!(
+                "标签已存在：{name}"
+            )));
+        }
+
+        library.connection.execute(
+            "UPDATE tags SET name = ?1 WHERE id = ?2",
+            params![&name, tag_id],
+        )?;
+        load_tag_summary(&library.connection, tag_id)
+    }
+
+    pub fn delete_tag(&mut self, tag_id: &str) -> LibraryResult<()> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        ensure_tag_exists(&library.connection, tag_id)?;
+        library
+            .connection
+            .execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
+        Ok(())
+    }
+
+    pub fn add_tag_to_document(
+        &mut self,
+        document_id: &str,
+        tag_id: &str,
+    ) -> LibraryResult<DocumentSummary> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        ensure_document_exists(&library.connection, document_id)?;
+        ensure_tag_exists(&library.connection, tag_id)?;
+        library.connection.execute(
+            "
+            INSERT OR IGNORE INTO document_tags (document_id, tag_id)
+            VALUES (?1, ?2)
+            ",
+            params![document_id, tag_id],
+        )?;
+        library.connection.execute(
+            "UPDATE documents SET updated_at = ?1 WHERE id = ?2",
+            params![now(), document_id],
+        )?;
+        load_document_summary(&library.connection, document_id)
+    }
+
+    pub fn remove_tag_from_document(
+        &mut self,
+        document_id: &str,
+        tag_id: &str,
+    ) -> LibraryResult<DocumentSummary> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        ensure_document_exists(&library.connection, document_id)?;
+        ensure_tag_exists(&library.connection, tag_id)?;
+        library.connection.execute(
+            "DELETE FROM document_tags WHERE document_id = ?1 AND tag_id = ?2",
+            params![document_id, tag_id],
+        )?;
+        library.connection.execute(
+            "UPDATE documents SET updated_at = ?1 WHERE id = ?2",
+            params![now(), document_id],
+        )?;
+        load_document_summary(&library.connection, document_id)
+    }
+
+    pub fn update_document_metadata(
+        &mut self,
+        document_id: &str,
+        update: DocumentMetadataUpdate,
+    ) -> LibraryResult<DocumentSummary> {
+        let title = validate_document_title(&update.title)?;
+        let description = normalize_optional_text(update.description);
+        let document_date = normalize_optional_text(update.document_date);
+        if let Some(date) = document_date.as_deref() {
+            validate_document_date(date)?;
+        }
+
+        let mut seen_tag_ids = HashSet::new();
+        let tag_ids = update
+            .tag_ids
+            .into_iter()
+            .filter(|tag_id| seen_tag_ids.insert(tag_id.clone()))
+            .collect::<Vec<_>>();
+
+        let library = self
+            .current
+            .as_mut()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let transaction = library.connection.transaction()?;
+        ensure_document_exists(&transaction, document_id)?;
+        ensure_collection_exists(&transaction, &update.collection_id)?;
+        for tag_id in &tag_ids {
+            ensure_tag_exists(&transaction, tag_id)?;
+        }
+
+        let timestamp = now();
+        transaction.execute(
+            "
+            UPDATE documents
+            SET title = ?1,
+                description = ?2,
+                document_date = ?3,
+                collection_id = ?4,
+                updated_at = ?5
+            WHERE id = ?6 AND deleted_at IS NULL
+            ",
+            params![
+                &title,
+                description.as_deref(),
+                document_date.as_deref(),
+                &update.collection_id,
+                &timestamp,
+                document_id,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM document_tags WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        for tag_id in &tag_ids {
+            transaction.execute(
+                "INSERT INTO document_tags (document_id, tag_id) VALUES (?1, ?2)",
+                params![document_id, tag_id],
+            )?;
+        }
+        transaction.commit()?;
+
+        load_document_summary(&library.connection, document_id)
+    }
+
     pub fn move_document_to_collection(
         &mut self,
         document_id: &str,
@@ -1671,16 +1868,22 @@ impl LibraryService {
                 d.imported_at,
                 COALESCE(s.source_path, ''),
                 COALESCE(s.source_identifier, ''),
-                COALESCE(s.last_imported_at, d.imported_at)
+                COALESCE(s.last_imported_at, d.imported_at),
+                d.description,
+                d.document_date
             FROM documents d
             LEFT JOIN sources s ON s.document_id = d.id
             WHERE d.deleted_at IS NULL
             ORDER BY d.imported_at DESC, d.id DESC
             ",
         )?;
-        let documents = statement
+        let mut documents = statement
             .query_map([], document_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for document in &mut documents {
+            document.tags = load_document_tags(&library.connection, &document.id)?;
+        }
         Ok(documents)
     }
 
@@ -1980,6 +2183,159 @@ fn collection_is_descendant(
         .map_err(LibraryError::from)
 }
 
+fn validate_tag_name(name: &str) -> LibraryResult<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(LibraryError::InvalidTag("标签名称不能为空。".to_string()));
+    }
+    if name.chars().count() > 50 {
+        return Err(LibraryError::InvalidTag(
+            "标签名称不能超过 50 个字符。".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn tag_name_exists(
+    connection: &Connection,
+    name: &str,
+    excluded_tag_id: Option<&str>,
+) -> LibraryResult<bool> {
+    connection
+        .query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM tags
+                WHERE name = ?1 COLLATE NOCASE
+                  AND (?2 IS NULL OR id <> ?2)
+            )
+            ",
+            params![name, excluded_tag_id],
+            |row| row.get(0),
+        )
+        .map_err(LibraryError::from)
+}
+
+fn ensure_tag_exists(connection: &Connection, tag_id: &str) -> LibraryResult<()> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+        params![tag_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(LibraryError::TagNotFound(format!("标签不存在：{tag_id}")));
+    }
+    Ok(())
+}
+
+fn ensure_document_exists(connection: &Connection, document_id: &str) -> LibraryResult<()> {
+    let exists = connection.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM documents
+            WHERE id = ?1 AND deleted_at IS NULL
+        )
+        ",
+        params![document_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(LibraryError::DocumentNotFound(format!(
+            "文档不存在或已删除：{document_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_document_title(title: &str) -> LibraryResult<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(LibraryError::InvalidDocumentMetadata(
+            "文档标题不能为空。".to_string(),
+        ));
+    }
+    if title.chars().count() > 500 {
+        return Err(LibraryError::InvalidDocumentMetadata(
+            "文档标题不能超过 500 个字符。".to_string(),
+        ));
+    }
+    Ok(title.to_string())
+}
+
+fn validate_document_date(date: &str) -> LibraryResult<()> {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
+        LibraryError::InvalidDocumentMetadata("文档日期必须使用 YYYY-MM-DD 格式。".to_string())
+    })?;
+    Ok(())
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    })
+}
+
+fn tag_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TagSummary> {
+    Ok(TagSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        document_count: row.get(2)?,
+    })
+}
+
+fn load_tag_summary(connection: &Connection, tag_id: &str) -> LibraryResult<TagSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                t.id,
+                t.name,
+                (
+                    SELECT COUNT(*)
+                    FROM document_tags dt
+                    JOIN documents d ON d.id = dt.document_id
+                    WHERE dt.tag_id = t.id AND d.deleted_at IS NULL
+                )
+            FROM tags t
+            WHERE t.id = ?1
+            ",
+            params![tag_id],
+            tag_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| LibraryError::TagNotFound(format!("标签不存在：{tag_id}")))
+}
+
+fn load_document_tags(
+    connection: &Connection,
+    document_id: &str,
+) -> LibraryResult<Vec<TagSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            t.id,
+            t.name,
+            (
+                SELECT COUNT(*)
+                FROM document_tags count_dt
+                JOIN documents count_d ON count_d.id = count_dt.document_id
+                WHERE count_dt.tag_id = t.id AND count_d.deleted_at IS NULL
+            )
+        FROM tags t
+        JOIN document_tags dt ON dt.tag_id = t.id
+        WHERE dt.document_id = ?1
+        ORDER BY LOWER(t.name), t.id
+        ",
+    )?;
+    let tags = statement
+        .query_map(params![document_id], tag_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(tags)
+}
+
 fn collection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionSummary> {
     Ok(CollectionSummary {
         id: row.get(0)?,
@@ -2021,7 +2377,7 @@ fn load_document_summary(
     connection: &Connection,
     document_id: &str,
 ) -> LibraryResult<DocumentSummary> {
-    connection
+    let mut document = connection
         .query_row(
             "
             SELECT
@@ -2039,7 +2395,9 @@ fn load_document_summary(
                 d.imported_at,
                 COALESCE(s.source_path, ''),
                 COALESCE(s.source_identifier, ''),
-                COALESCE(s.last_imported_at, d.imported_at)
+                COALESCE(s.last_imported_at, d.imported_at),
+                d.description,
+                d.document_date
             FROM documents d
             LEFT JOIN sources s ON s.document_id = d.id
             WHERE d.id = ?1 AND d.deleted_at IS NULL
@@ -2048,7 +2406,11 @@ fn load_document_summary(
             document_from_row,
         )
         .optional()?
-        .ok_or_else(|| LibraryError::ImportFile(format!("文档不存在或已删除：{document_id}")))
+        .ok_or_else(|| {
+            LibraryError::DocumentNotFound(format!("文档不存在或已删除：{document_id}"))
+        })?;
+    document.tags = load_document_tags(connection, document_id)?;
+    Ok(document)
 }
 
 pub fn open_directory(path: impl AsRef<Path>) -> LibraryResult<()> {
@@ -2347,11 +2709,14 @@ fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentSummar
     Ok(DocumentSummary {
         id: row.get(0)?,
         title: row.get(1)?,
+        description: row.get(15)?,
+        document_date: row.get(16)?,
         file_name: row.get(2)?,
         file_type: row.get(3)?,
         file_size: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
         content_hash: row.get(5)?,
         collection_id: row.get(6)?,
+        tags: Vec::new(),
         processing_status,
         index_status,
         error_stage: row.get(9)?,
