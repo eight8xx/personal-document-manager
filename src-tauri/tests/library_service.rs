@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -431,6 +430,7 @@ fn pptx_thumbnail_accepts_only_real_images_and_invalidates_on_hash_change() {
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
     let imported = service.import_document(&source_path).unwrap();
+    let imported_hash = imported.content_hash.clone().unwrap();
     assert!(matches!(
         service.get_document_thumbnail(&imported.id).unwrap(),
         DocumentThumbnail::Fallback { .. }
@@ -439,6 +439,7 @@ fn pptx_thumbnail_accepts_only_real_images_and_invalidates_on_hash_change() {
     let invalid = service
         .save_document_thumbnail(
             &imported.id,
+            &imported_hash,
             &format!(
                 "data:image/png;base64,{}",
                 BASE64.encode(png_fixture(32, 32))
@@ -453,7 +454,7 @@ fn pptx_thumbnail_accepts_only_real_images_and_invalidates_on_hash_change() {
         BASE64.encode(png_fixture(320, 180))
     );
     let DocumentThumbnail::Pptx { data_url } = service
-        .save_document_thumbnail(&imported.id, &thumbnail_data_url)
+        .save_document_thumbnail(&imported.id, &imported_hash, &thumbnail_data_url)
         .unwrap()
     else {
         panic!("valid PPTX thumbnail should be cached as an image");
@@ -494,6 +495,20 @@ fn pptx_thumbnail_accepts_only_real_images_and_invalidates_on_hash_change() {
         restarted.get_document_thumbnail(&imported.id).unwrap(),
         DocumentThumbnail::Fallback { .. }
     ));
+
+    let stale = restarted
+        .save_document_thumbnail(&imported.id, &imported_hash, &thumbnail_data_url)
+        .unwrap_err();
+    assert_eq!(stale.code(), "staleThumbnail");
+    assert!(stale.to_string().contains("内容版本已变化"));
+    assert!(fs::read_dir(library_dir.join("thumbnails"))
+        .map(|entries| entries.flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{}-", imported.id))
+        }))
+        .unwrap_or(true));
 }
 
 #[test]
@@ -1955,11 +1970,7 @@ fn pdf_preview_rejects_active_content_and_invalidates_temporary_page_cache() {
         .is_file());
 
     let unsafe_path = root.path().join("unsafe.pdf");
-    fs::write(
-        &unsafe_path,
-        b"%PDF-1.4\n1 0 obj << /OpenAction 2 0 R /JavaScript (app.alert('blocked')) >> endobj\n%%EOF",
-    )
-    .unwrap();
+    fs::write(&unsafe_path, pdf_with_open_action("JavaScript")).unwrap();
     let unsafe_document = restarted.import_document(&unsafe_path).unwrap();
     let DocumentPreview::Failure { code, message } = restarted
         .get_document_preview(&unsafe_document.id, None)
@@ -1977,11 +1988,7 @@ fn pdf_preview_rejects_active_objects_inside_a_compressed_object_stream() {
     let state_dir = root.path().join("app-state");
     let library_dir = root.path().join("Library");
     let source_path = root.path().join("compressed-active.pdf");
-    fs::write(
-        &source_path,
-        pdf_with_compressed_object_stream(b"7 0 << /Type /Action /S /JavaScript /JS (alert(1)) >>"),
-    )
-    .unwrap();
+    fs::write(&source_path, compressed_pdf_with_nested_javascript()).unwrap();
 
     let mut service = LibraryService::new(&state_dir).unwrap();
     service.create_library(&library_dir).unwrap();
@@ -3136,17 +3143,80 @@ fn valid_pdf_with_text(text: &str) -> Vec<u8> {
     pdf
 }
 
-fn pdf_with_compressed_object_stream(contents: &[u8]) -> Vec<u8> {
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(contents).unwrap();
-    let compressed = encoder.finish().unwrap();
-    let mut pdf =
-        b"%PDF-1.7\n6 0 obj << /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length ".to_vec();
-    pdf.extend_from_slice(compressed.len().to_string().as_bytes());
-    pdf.extend_from_slice(b" >>\nstream\n");
-    pdf.extend_from_slice(&compressed);
-    pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
-    pdf
+fn pdf_with_open_action(action: &str) -> Vec<u8> {
+    let mut document = base_pdf_document();
+    let mut action_dictionary = lopdf::Dictionary::new();
+    action_dictionary.set("Type", "Action");
+    action_dictionary.set("S", action);
+    if action == "JavaScript" {
+        action_dictionary.set("JS", lopdf::Object::string_literal("app.alert('blocked')"));
+    }
+    document
+        .get_dictionary_mut((1, 0))
+        .unwrap()
+        .set("OpenAction", lopdf::Object::Dictionary(action_dictionary));
+    save_compressed_pdf(document)
+}
+
+fn compressed_pdf_with_nested_javascript() -> Vec<u8> {
+    let mut document = base_pdf_document();
+    let mut nested = lopdf::Dictionary::new();
+    nested.set("Name", lopdf::Object::Name(b"JavaScript".to_vec()));
+    nested.set("JS", lopdf::Object::string_literal("app.alert('nested')"));
+    let mut wrapper = lopdf::Dictionary::new();
+    wrapper.set("Nested", lopdf::Object::Dictionary(nested));
+    document
+        .get_dictionary_mut((1, 0))
+        .unwrap()
+        .set("CustomData", lopdf::Object::Dictionary(wrapper));
+    save_compressed_pdf(document)
+}
+
+fn base_pdf_document() -> lopdf::Document {
+    let mut document = lopdf::Document::with_version("1.7");
+    let mut catalog = lopdf::Dictionary::new();
+    catalog.set("Type", "Catalog");
+    catalog.set("Pages", lopdf::Object::Reference((2, 0)));
+
+    let mut pages = lopdf::Dictionary::new();
+    pages.set("Type", "Pages");
+    pages.set("Kids", vec![lopdf::Object::Reference((3, 0))]);
+    pages.set("Count", 1);
+
+    let mut page = lopdf::Dictionary::new();
+    page.set("Type", "Page");
+    page.set("Parent", lopdf::Object::Reference((2, 0)));
+    page.set("MediaBox", vec![0.into(), 0.into(), 200.into(), 200.into()]);
+
+    document
+        .objects
+        .insert((1, 0), lopdf::Object::Dictionary(catalog));
+    document
+        .objects
+        .insert((2, 0), lopdf::Object::Dictionary(pages));
+    document
+        .objects
+        .insert((3, 0), lopdf::Object::Dictionary(page));
+    document
+        .trailer
+        .set("Root", lopdf::Object::Reference((1, 0)));
+    document.max_id = 3;
+    document
+}
+
+fn save_compressed_pdf(mut document: lopdf::Document) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    document
+        .save_with_options(
+            &mut bytes,
+            lopdf::SaveOptions {
+                use_object_streams: true,
+                use_xref_streams: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    bytes
 }
 
 fn escape_pdf_text(text: &str) -> String {

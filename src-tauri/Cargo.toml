@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
+lopdf = "0.45.0"
 open = "5"
 quick-xml = "0.42"
 rusqlite = { version = "0.32", features = ["bundled-full"] }

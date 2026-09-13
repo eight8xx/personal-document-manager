@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,6 +8,7 @@ import type {
   BootstrapState,
   DocumentPreview,
   DocumentSummary,
+  DocumentThumbnail,
   LibrarySummary
 } from "./backend/types";
 import { PptxPreview, PptxThumbnail } from "./components/PptxPreview";
@@ -395,10 +396,12 @@ describe("PPTX 导入与版式预览", () => {
       left: 0,
       toJSON: () => ({})
     } as DOMRect);
-    const saveDocumentThumbnail = vi.fn(async (_id, dataUrl: string) => ({
-      kind: "pptx" as const,
-      dataUrl
-    }));
+    const saveDocumentThumbnail = vi.fn(
+      async (_id, _contentHash, dataUrl: string) => ({
+        kind: "pptx" as const,
+        dataUrl
+      })
+    );
     const client = new FakeBackendClient({
       bootstrap,
       getDocumentThumbnail: async () => ({
@@ -451,14 +454,147 @@ describe("PPTX 导入与版式预览", () => {
     await waitFor(() => {
       expect(saveDocumentThumbnail).toHaveBeenCalledWith(
         documentSummary.id,
+        documentSummary.contentHash,
         thumbnailDataUrl
       );
     });
     expect(embeddedThumbnail).toHaveBeenCalled();
     expect(saveDocumentThumbnail).not.toHaveBeenCalledWith(
       documentSummary.id,
+      documentSummary.contentHash,
       "data:image/jpeg;base64,embedded-thumbnail"
     );
+  });
+
+  it("ignores a stale thumbnail task that finishes after the content hash changes", async () => {
+    const oldDocument = {
+      ...documentSummary,
+      id: "pptx-race",
+      contentHash: "hash-race-old"
+    };
+    const newDocument = {
+      ...oldDocument,
+      contentHash: "hash-race-new",
+      lastImportedAt: "2026-09-13T10:00:00Z"
+    };
+    const thumbnailDataUrl =
+      "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==";
+    let resolveOldThumbnail!: (
+      thumbnail: DocumentThumbnail
+    ) => void;
+    const oldThumbnail = new Promise<DocumentThumbnail>((resolve) => {
+      resolveOldThumbnail = resolve;
+    });
+    const getDocumentThumbnail = vi
+      .fn<(documentId: string) => Promise<DocumentThumbnail>>()
+      .mockReturnValueOnce(oldThumbnail)
+      .mockResolvedValue({
+        kind: "fallback",
+        reason: "PPTX 缩略图尚未生成。"
+      });
+    const saveDocumentThumbnail = vi.fn(
+      async (_id, _contentHash, dataUrl: string) => ({
+        kind: "pptx" as const,
+        dataUrl
+      })
+    );
+
+    vi.stubGlobal(
+      "Image",
+      class {
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+
+        set src(_value: string) {
+          queueMicrotask(() => this.onload?.());
+        }
+      }
+    );
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      fillStyle: "#ffffff",
+      fillRect: vi.fn(),
+      drawImage: vi.fn()
+    } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue(
+      thumbnailDataUrl
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      width: 800,
+      height: 450,
+      top: 0,
+      right: 800,
+      bottom: 450,
+      left: 0,
+      toJSON: () => ({})
+    } as DOMRect);
+    pptxMocks.open.mockImplementation(
+      async (_buffer: ArrayBuffer, host: HTMLElement, options: MockRendererOptions) => {
+        const slide = document.createElement("section");
+        slide.className = "slide";
+        slide.style.width = "800px";
+        slide.style.height = "450px";
+        slide.textContent = "竞态缩略图";
+        let content = host.querySelector<HTMLElement>(".flyfish-pptx-content");
+        if (!content) {
+          content = document.createElement("div");
+          content.className = "flyfish-pptx-content";
+          host.append(content);
+        }
+        content.append(slide);
+        options.onRenderComplete?.();
+        return {
+          slideCount: 1,
+          ensureSlideRendered: () => slide,
+          setZoom: vi.fn(async () => undefined),
+          refreshLayout: vi.fn(),
+          destroy: vi.fn()
+        };
+      }
+    );
+
+    const client = new FakeBackendClient({
+      bootstrap,
+      getDocumentThumbnail,
+      getDocumentPreview: async () => pptxPreview,
+      saveDocumentThumbnail
+    });
+    const { container, rerender } = render(
+      <PptxThumbnail client={client} document={oldDocument} />
+    );
+    await waitFor(() => expect(getDocumentThumbnail).toHaveBeenCalledTimes(1));
+
+    rerender(<PptxThumbnail client={client} document={newDocument} />);
+    await waitFor(() => {
+      expect(saveDocumentThumbnail).toHaveBeenCalledTimes(1);
+      expect(saveDocumentThumbnail).toHaveBeenCalledWith(
+        newDocument.id,
+        newDocument.contentHash,
+        thumbnailDataUrl
+      );
+    });
+
+    await act(async () => {
+      resolveOldThumbnail({
+        kind: "fallback",
+        reason: "旧缩略图任务已完成。"
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(
+        container.querySelector<HTMLImageElement>(".pptx-generated img")
+      ).toHaveAttribute("src", thumbnailDataUrl);
+    });
+    expect(saveDocumentThumbnail).toHaveBeenCalledTimes(1);
+    expect(saveDocumentThumbnail).not.toHaveBeenCalledWith(
+      oldDocument.id,
+      oldDocument.contentHash,
+      expect.any(String)
+    );
+    expect(pptxMocks.open).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the PPTX type icon when thumbnail rendering fails", async () => {

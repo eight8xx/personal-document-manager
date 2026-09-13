@@ -53,6 +53,8 @@ pub enum LibraryError {
     #[error("{0}")]
     UnsafePreview(String),
     #[error("{0}")]
+    StaleThumbnail(String),
+    #[error("{0}")]
     InvalidExternalUrl(String),
     #[error("无法打开目录：{0}")]
     OpenDirectory(String),
@@ -88,6 +90,7 @@ impl LibraryError {
             Self::DocumentFileMissing(_) => "documentFileMissing",
             Self::Preview(_) => "preview",
             Self::UnsafePreview(_) => "unsafePreview",
+            Self::StaleThumbnail(_) => "staleThumbnail",
             Self::InvalidExternalUrl(_) => "invalidExternalUrl",
             Self::OpenDirectory(_) => "openDirectory",
             Self::OpenDocument(_) => "openDocument",

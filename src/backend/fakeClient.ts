@@ -72,6 +72,7 @@ export interface FakeBackendOptions {
   getDocumentThumbnail?: (documentId: string) => Promise<DocumentThumbnail>;
   saveDocumentThumbnail?: (
     documentId: string,
+    contentHash: string,
     thumbnailDataUrl: string
   ) => Promise<DocumentThumbnail>;
   openDocument?: (documentId: string) => Promise<void>;
@@ -208,6 +209,7 @@ export class FakeBackendClient implements BackendClient {
   private readonly saveDocumentThumbnailImpl:
     | ((
         documentId: string,
+        contentHash: string,
         thumbnailDataUrl: string
       ) => Promise<DocumentThumbnail>)
     | null;
@@ -925,19 +927,27 @@ export class FakeBackendClient implements BackendClient {
 
   async saveDocumentThumbnail(
     documentId: string,
+    contentHash: string,
     thumbnailDataUrl: string
   ): Promise<DocumentThumbnail> {
-    this.calls.push(`saveDocumentThumbnail:${documentId}`);
+    this.calls.push(`saveDocumentThumbnail:${documentId}:${contentHash}`);
     if (this.saveDocumentThumbnailImpl) {
       const thumbnail = await this.saveDocumentThumbnailImpl(
         documentId,
+        contentHash,
         thumbnailDataUrl
       );
       this.documentThumbnails[documentId] = structuredClone(thumbnail);
       return structuredClone(thumbnail);
     }
 
-    this.requireDocument(documentId);
+    const document = this.requireDocument(documentId);
+    if (document.contentHash !== contentHash) {
+      throw new BackendError({
+        code: "staleThumbnail",
+        message: "缩略图已过期：文档内容版本已变化，已拒绝写入缓存。"
+      });
+    }
     if (!/^data:image\/(?:png|jpeg|jpg);base64,/i.test(thumbnailDataUrl)) {
       throw new BackendError({
         code: "preview",

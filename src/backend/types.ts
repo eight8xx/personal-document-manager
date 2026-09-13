@@ -397,6 +397,7 @@ export interface BackendClient {
   getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail>;
   saveDocumentThumbnail(
     documentId: string,
+    contentHash: string,
     thumbnailDataUrl: string
   ): Promise<DocumentThumbnail>;
   openDocument(documentId: string): Promise<void>;

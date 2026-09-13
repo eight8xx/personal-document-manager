@@ -803,6 +803,7 @@ pub async fn get_document_thumbnail(
 #[tauri::command]
 pub async fn save_document_thumbnail(
     document_id: String,
+    content_hash: String,
     thumbnail_data_url: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentThumbnail, CommandError> {
@@ -811,7 +812,7 @@ pub async fn save_document_thumbnail(
         service
             .lock()
             .map_err(|_| LibraryError::StateLock)?
-            .save_document_thumbnail(&document_id, &thumbnail_data_url)
+            .save_document_thumbnail(&document_id, &content_hash, &thumbnail_data_url)
             .map_err(CommandError::from)
     })
     .await

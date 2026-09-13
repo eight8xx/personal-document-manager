@@ -733,12 +733,14 @@ const thumbnailCache = new Map<string, Promise<DocumentPreview>>();
 
 async function loadPptxPreview(
   client: BackendClient,
-  document: DocumentSummary
+  documentId: string,
+  contentHash: string,
+  lastImportedAt: string
 ) {
-  const key = `${document.id}:${document.contentHash ?? document.lastImportedAt}`;
+  const key = `${documentId}:${contentHash || lastImportedAt}`;
   let pending = thumbnailCache.get(key);
   if (!pending) {
-    pending = client.getDocumentPreview(document.id);
+    pending = client.getDocumentPreview(documentId);
     thumbnailCache.set(key, pending);
     void pending.catch(() => thumbnailCache.delete(key));
   }
@@ -753,115 +755,201 @@ export function PptxThumbnail({
   document: DocumentSummary;
 }) {
   const containerRef = useRef<HTMLSpanElement | null>(null);
-  const startedRef = useRef(false);
+  const generationRef = useRef(0);
+  const startedGenerationRef = useRef(0);
   const [dataUrl, setDataUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
-  const generate = useCallback(async () => {
-    const container = containerRef.current;
-    if (!container) {
-      return;
-    }
-    const viewerState = { current: null as PptxViewer | null };
-    let timer: number | null = null;
-    try {
-      const cached = await client.getDocumentThumbnail(document.id);
-      if (cached.kind === "pptx" || cached.kind === "image" || cached.kind === "pdf") {
-        setDataUrl(cached.dataUrl);
+  const generate = useCallback(
+    async (
+      documentId: string,
+      contentHash: string,
+      lastImportedAt: string,
+      signal: AbortSignal,
+      generation: number
+    ) => {
+      const container = containerRef.current;
+      if (!container) {
         return;
       }
-
-      const preview = await loadPptxPreview(client, document);
-      if (preview.kind !== "pptx") {
-        throw new Error("PPTX 预览数据不可用。");
+      const isCurrent = () =>
+        !signal.aborted && generationRef.current === generation;
+      if (!isCurrent()) {
+        return;
       }
-      const buffer = await blobToArrayBuffer(blobFromDataUrl(preview.dataUrl));
+      const viewerState = { current: null as PptxViewer | null };
       const host = globalThis.document.createElement("div");
       host.className = "pptx-thumbnail-render-host";
       host.setAttribute("aria-hidden", "true");
-      container.append(host);
+      let timer: number | null = null;
+      let removeAbortListener: () => void = () => undefined;
+      try {
+        const cached = await client.getDocumentThumbnail(documentId);
+        if (!isCurrent()) {
+          return;
+        }
+        if (
+          cached.kind === "pptx" ||
+          cached.kind === "image" ||
+          cached.kind === "pdf"
+        ) {
+          setDataUrl(cached.dataUrl);
+          return;
+        }
 
-      const thumb = await new Promise<string | null>((resolve, reject) => {
-        let settled = false;
-        const settle = (value: string | null) => {
-          if (settled) {
+        const preview = await loadPptxPreview(
+          client,
+          documentId,
+          contentHash,
+          lastImportedAt
+        );
+        if (!isCurrent()) {
+          return;
+        }
+        if (preview.kind !== "pptx") {
+          throw new Error("PPTX 预览数据不可用。");
+        }
+        const buffer = await blobToArrayBuffer(blobFromDataUrl(preview.dataUrl));
+        if (!isCurrent()) {
+          return;
+        }
+        container.append(host);
+
+        const thumb = await new Promise<string | null>((resolve, reject) => {
+          let settled = false;
+          const settle = (value: string | null) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            resolve(value);
+          };
+          const abort = () => settle(null);
+          signal.addEventListener("abort", abort, { once: true });
+          removeAbortListener = () =>
+            signal.removeEventListener("abort", abort);
+          if (signal.aborted) {
+            settle(null);
             return;
           }
-          settled = true;
-          resolve(value);
-        };
-        timer = window.setTimeout(
-          () => reject(new Error("PPTX 缩略图生成超时。")),
-          THUMBNAIL_TIMEOUT_MS
-        );
-        void import("@file-viewer/pptx")
-          .then(({ PptxViewer }) =>
-            PptxViewer.open(buffer, host, {
-              fitMode: "contain",
-              zoomPercent: 100,
-              lazySlides: false,
-              lazyMedia: false,
-              engineOptions: {
-                mediaProcess: false,
-                keyBoardShortCut: false
-              },
-              async onRenderComplete() {
-                if (!settled) {
-                  settle(await captureFirstSlideThumbnail(host));
+          timer = window.setTimeout(
+            () => reject(new Error("PPTX 缩略图生成超时。")),
+            THUMBNAIL_TIMEOUT_MS
+          );
+          void import("@file-viewer/pptx")
+            .then(({ PptxViewer }) =>
+              PptxViewer.open(buffer, host, {
+                fitMode: "contain",
+                zoomPercent: 100,
+                lazySlides: false,
+                lazyMedia: false,
+                engineOptions: {
+                  mediaProcess: false,
+                  keyBoardShortCut: false
+                },
+                async onRenderComplete() {
+                  if (settled || !isCurrent()) {
+                    return;
+                  }
+                  const captured = await captureFirstSlideThumbnail(host);
+                  settle(isCurrent() ? captured : null);
+                },
+                onError(error) {
+                  if (!isCurrent()) {
+                    settle(null);
+                    return;
+                  }
+                  reject(
+                    error instanceof Error
+                      ? error
+                      : new Error(rendererErrorMessage(error))
+                  );
                 }
-              },
-              onError(error) {
-                reject(
-                  error instanceof Error
-                    ? error
-                    : new Error(rendererErrorMessage(error))
-                );
+              })
+            )
+            .then((opened) => {
+              viewerState.current = opened;
+              if (settled || !isCurrent()) {
+                opened.destroy();
               }
             })
-          )
-          .then((opened) => {
-            viewerState.current = opened;
-            if (settled) {
-              opened.destroy();
-            }
-          })
-          .catch(reject);
-      });
+            .catch((error) => {
+              if (isCurrent()) {
+                reject(error);
+              } else {
+                settle(null);
+              }
+            });
+        });
+        removeAbortListener();
 
-      if (!thumb || !/^data:image\/(?:png|jpeg|jpg);base64,/i.test(thumb)) {
-        throw new Error("PPTX 渲染器没有生成有效图片。");
+        if (!isCurrent()) {
+          return;
+        }
+        if (!thumb || !/^data:image\/(?:png|jpeg|jpg);base64,/i.test(thumb)) {
+          throw new Error("PPTX 渲染器没有生成有效图片。");
+        }
+        const saved = await client.saveDocumentThumbnail(
+          documentId,
+          contentHash,
+          thumb
+        );
+        if (!isCurrent()) {
+          return;
+        }
+        if (saved.kind === "fallback") {
+          throw new Error(saved.reason);
+        }
+        setDataUrl(saved.dataUrl);
+      } catch {
+        if (isCurrent()) {
+          setFailed(true);
+        }
+      } finally {
+        removeAbortListener();
+        if (timer !== null) {
+          window.clearTimeout(timer);
+        }
+        viewerState.current?.destroy();
+        host.remove();
       }
-      const saved = await client.saveDocumentThumbnail(document.id, thumb);
-      if (saved.kind === "fallback") {
-        throw new Error(saved.reason);
-      }
-      setDataUrl(saved.dataUrl);
-    } catch {
-      setFailed(true);
-    } finally {
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
-      viewerState.current?.destroy();
-      container.querySelector(".pptx-thumbnail-render-host")?.remove();
-    }
-  }, [client, document]);
+    },
+    [client]
+  );
 
   useEffect(() => {
-    startedRef.current = false;
+    const generation = generationRef.current + 1;
+    generationRef.current = generation;
     setDataUrl(null);
     setFailed(false);
     const container = containerRef.current;
     if (!container) {
       return;
     }
+    const documentId = document.id;
+    const contentHash = document.contentHash?.trim() ?? "";
+    const lastImportedAt = document.lastImportedAt;
+    const abortController = new AbortController();
 
     const start = () => {
-      if (startedRef.current) {
+      if (
+        abortController.signal.aborted ||
+        startedGenerationRef.current === generation
+      ) {
         return;
       }
-      startedRef.current = true;
-      void generate();
+      startedGenerationRef.current = generation;
+      if (!contentHash) {
+        setFailed(true);
+        return;
+      }
+      void generate(
+        documentId,
+        contentHash,
+        lastImportedAt,
+        abortController.signal,
+        generation
+      );
     };
     if (typeof IntersectionObserver !== "function") {
       start();
@@ -877,7 +965,10 @@ export function PptxThumbnail({
       { rootMargin: "160px" }
     );
     observer.observe(container);
-    return () => observer.disconnect();
+    return () => {
+      abortController.abort();
+      observer.disconnect();
+    };
   }, [document.contentHash, document.id, document.lastImportedAt, generate]);
 
   if (dataUrl) {

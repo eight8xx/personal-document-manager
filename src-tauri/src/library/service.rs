@@ -3033,9 +3033,15 @@ impl LibraryService {
     pub fn save_document_thumbnail(
         &self,
         document_id: &str,
+        expected_content_hash: &str,
         thumbnail_data_url: &str,
     ) -> LibraryResult<DocumentThumbnail> {
         let stored = self.load_stored_document_file(document_id)?;
+        if stored.content_hash.as_deref() != Some(expected_content_hash) {
+            return Err(LibraryError::StaleThumbnail(
+                "缩略图已过期：文档内容版本已变化，已拒绝写入缓存。".to_string(),
+            ));
+        }
         let capability = require_capability_for_file_type(&stored.file_type)?;
         if capability.thumbnail != ThumbnailStrategy::PptxFirstPage {
             return Err(LibraryError::Preview(format!(
