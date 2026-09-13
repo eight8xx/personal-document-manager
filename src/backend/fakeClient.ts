@@ -11,6 +11,7 @@ import type {
   DocumentSearchResult,
   DocumentSummary,
   DocumentThumbnail,
+  EmptyTrashResult,
   FileDropHandler,
   ImportBatch,
   ImportDecision,
@@ -21,7 +22,8 @@ import type {
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
-  TagSummary
+  TagSummary,
+  TrashDocumentSummary
 } from "./types";
 
 export interface FakeBackendOptions {
@@ -31,6 +33,7 @@ export interface FakeBackendOptions {
   selectedDocuments?: string[];
   selectedFolder?: string | null;
   documents?: DocumentSummary[];
+  trashDocuments?: TrashDocumentSummary[];
   collections?: CollectionSummary[];
   tags?: TagSummary[];
   inspections?: Record<string, LibraryLocationInspection>;
@@ -167,6 +170,7 @@ export class FakeBackendClient implements BackendClient {
   calls: string[] = [];
   private state: BootstrapState;
   private documents: DocumentSummary[];
+  private trashDocuments: TrashDocumentSummary[];
   private collections: CollectionSummary[];
   private tags: TagSummary[];
   private readonly selectedDirectory: string | null;
@@ -223,6 +227,7 @@ export class FakeBackendClient implements BackendClient {
   constructor(options: FakeBackendOptions = {}) {
     this.state = structuredClone(options.bootstrap ?? emptyBootstrap);
     this.documents = structuredClone(options.documents ?? []);
+    this.trashDocuments = structuredClone(options.trashDocuments ?? []);
     this.collections = structuredClone(options.collections ?? [inbox]);
     this.tags = structuredClone(options.tags ?? []);
     if (!this.collections.some((collection) => collection.isInbox)) {
@@ -936,6 +941,86 @@ export class FakeBackendClient implements BackendClient {
     document.collectionId = collectionId;
     this.refreshCollectionCounts();
     return structuredClone(document);
+  }
+
+  async moveDocumentToTrash(documentId: string): Promise<void> {
+    this.calls.push(`moveDocumentToTrash:${documentId}`);
+    const document = this.requireDocument(documentId);
+    this.documents = this.documents.filter((item) => item.id !== documentId);
+    this.trashDocuments = [
+      {
+        document: structuredClone(document),
+        originalCollectionId: document.collectionId,
+        originalCollectionName:
+          this.collections.find(
+            (collection) => collection.id === document.collectionId
+          )?.name ?? null,
+        deletedAt: "2026-09-13T09:00:00Z"
+      },
+      ...this.trashDocuments.filter(
+        (item) => item.document.id !== documentId
+      )
+    ];
+    this.refreshCollectionCounts();
+    this.refreshTagCounts();
+  }
+
+  async listTrashDocuments(): Promise<TrashDocumentSummary[]> {
+    this.calls.push("listTrashDocuments");
+    return structuredClone(this.trashDocuments);
+  }
+
+  async restoreDocument(documentId: string): Promise<DocumentSummary> {
+    this.calls.push(`restoreDocument:${documentId}`);
+    const trashDocument = this.trashDocuments.find(
+      (item) => item.document.id === documentId
+    );
+    if (!trashDocument) {
+      throw new BackendError({
+        code: "documentNotFound",
+        message: "回收站中不存在文档。"
+      });
+    }
+    const collectionId = this.collections.some(
+      (collection) => collection.id === trashDocument.originalCollectionId
+    )
+      ? trashDocument.originalCollectionId!
+      : "inbox";
+    const restored = {
+      ...structuredClone(trashDocument.document),
+      collectionId
+    };
+    this.trashDocuments = this.trashDocuments.filter(
+      (item) => item.document.id !== documentId
+    );
+    this.documents = [restored, ...this.documents];
+    this.refreshCollectionCounts();
+    this.refreshTagCounts();
+    return structuredClone(restored);
+  }
+
+  async permanentlyDeleteDocument(documentId: string): Promise<void> {
+    this.calls.push(`permanentlyDeleteDocument:${documentId}`);
+    if (
+      !this.trashDocuments.some((item) => item.document.id === documentId)
+    ) {
+      throw new BackendError({
+        code: "documentNotFound",
+        message: "回收站中不存在文档。"
+      });
+    }
+    this.trashDocuments = this.trashDocuments.filter(
+      (item) => item.document.id !== documentId
+    );
+    this.refreshTagCounts();
+  }
+
+  async emptyTrash(): Promise<EmptyTrashResult> {
+    this.calls.push("emptyTrash");
+    const deletedCount = this.trashDocuments.length;
+    this.trashDocuments = [];
+    this.refreshTagCounts();
+    return { deletedCount };
   }
 
   async listTags(): Promise<TagSummary[]> {

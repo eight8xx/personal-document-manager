@@ -1492,10 +1492,15 @@ p {
   color: var(--text-muted);
 }
 
+.document-trash {
+  color: var(--danger);
+}
+
 .document-actions-cell {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 4px;
 }
 
 .document-grid {
@@ -1664,6 +1669,161 @@ p {
   color: var(--danger);
 }
 
+.grid-move-to-trash {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--border));
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  color: var(--danger);
+}
+
+.trash-list-scroll {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.trash-list-header,
+.trash-row {
+  display: grid;
+  grid-template-columns:
+    minmax(220px, 1.5fr) minmax(62px, 0.45fr) minmax(120px, 0.8fr)
+    minmax(138px, 0.8fr) minmax(204px, auto);
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+}
+
+.trash-list-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  min-height: 40px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.trash-row {
+  min-height: 76px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.trash-row:last-child {
+  border-bottom: 0;
+}
+
+.trash-row:hover {
+  background: var(--surface-subtle);
+}
+
+.trash-title-cell {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.trash-type-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  color: var(--danger);
+}
+
+.trash-title-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.trash-title-copy strong,
+.trash-title-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-title-copy strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.trash-title-copy span,
+.trash-deleted-at,
+.trash-collection {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.trash-collection {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-collection.missing {
+  color: var(--danger);
+}
+
+.trash-deleted-at {
+  font-variant-numeric: tabular-nums;
+}
+
+.trash-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.trash-actions .button {
+  min-width: 84px;
+  padding-inline: 10px;
+}
+
+.trash-empty-state {
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 34px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.trash-empty-state > svg {
+  margin-bottom: 4px;
+  color: var(--danger);
+}
+
+.trash-empty-state h2 {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.trash-empty-state p {
+  max-width: 420px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .details-panel {
   min-width: 0;
   min-height: 0;
@@ -1751,6 +1911,10 @@ p {
 
 .details-edit {
   width: 100%;
+}
+
+.details-trash {
+  grid-column: 1 / -1;
 }
 
 .details-actions {
@@ -2374,6 +2538,18 @@ p {
 @media (max-width: 1180px) {
   .search-filter-panel {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .trash-list-header,
+  .trash-row {
+    grid-template-columns:
+      minmax(190px, 1.4fr) minmax(60px, 0.45fr) minmax(110px, 0.8fr)
+      minmax(204px, auto);
+  }
+
+  .trash-list-header > :nth-child(4),
+  .trash-deleted-at {
+    display: none;
   }
 
   .clear-filters {

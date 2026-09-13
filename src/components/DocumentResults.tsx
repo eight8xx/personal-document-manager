@@ -3,7 +3,8 @@ import {
   Image as ImageIcon,
   LoaderCircle,
   Pencil,
-  RotateCcw
+  RotateCcw,
+  Trash2
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -33,6 +34,7 @@ interface DocumentResultsProps {
     collectionId: string
   ) => void;
   onEditDocument: (document: DocumentSummary) => void;
+  onMoveDocumentToTrash: (document: DocumentSummary) => void;
   onRetryIndex: (document: DocumentSummary) => void;
 }
 
@@ -183,6 +185,7 @@ function DocumentRow({
   onSelect,
   onMove,
   onEdit,
+  onMoveToTrash,
   onRetryIndex
 }: {
   document: DocumentSummary;
@@ -194,6 +197,7 @@ function DocumentRow({
   onSelect: () => void;
   onMove: (collectionId: string) => void;
   onEdit: () => void;
+  onMoveToTrash: () => void;
   onRetryIndex: () => void;
 }) {
   const status = documentStatusPresentation(document);
@@ -295,6 +299,15 @@ function DocumentRow({
       </div>
       <div className="document-actions-cell" role="cell">
         <button
+          className="icon-button compact document-trash"
+          type="button"
+          onClick={onMoveToTrash}
+          aria-label={`将 ${document.title} 移入回收站`}
+          title="移入回收站"
+        >
+          <Trash2 size={14} aria-hidden="true" />
+        </button>
+        <button
           className="icon-button compact document-edit"
           type="button"
           onClick={onEdit}
@@ -318,6 +331,7 @@ export function DocumentList({
   onSelectDocument,
   onMoveDocument,
   onEditDocument,
+  onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps) {
   return (
@@ -362,6 +376,7 @@ export function DocumentList({
                 onMoveDocument(document, collectionId)
               }
               onEdit={() => onEditDocument(document)}
+              onMoveToTrash={() => onMoveDocumentToTrash(document)}
               onRetryIndex={() => onRetryIndex(document)}
             />
           ))}
@@ -380,6 +395,7 @@ export function DocumentGrid({
   searchResults,
   retryingIndexIds,
   onSelectDocument,
+  onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps & { client: BackendClient }) {
   return (
@@ -461,6 +477,15 @@ export function DocumentGrid({
                   )}
                 </button>
               ) : null}
+              <button
+                className="icon-button compact grid-move-to-trash"
+                type="button"
+                onClick={() => onMoveDocumentToTrash(document)}
+                aria-label={`将 ${document.title} 移入回收站`}
+                title="移入回收站"
+              >
+                <Trash2 size={14} aria-hidden="true" />
+              </button>
             </article>
           );
         })}

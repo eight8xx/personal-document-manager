@@ -9,7 +9,8 @@ import {
   LoaderCircle,
   Pencil,
   RotateCcw,
-  Tags
+  Tags,
+  Trash2
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -32,6 +33,7 @@ interface DocumentDetailsProps {
   collections: CollectionSummary[];
   retryingIndex: boolean;
   onEditDocument: (document: DocumentSummary) => void;
+  onMoveDocumentToTrash: (document: DocumentSummary) => void;
   onRetryIndex: (document: DocumentSummary) => void;
 }
 
@@ -124,6 +126,7 @@ export function DocumentDetails({
   collections,
   retryingIndex,
   onEditDocument,
+  onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentDetailsProps) {
   const TypeIcon = document ? documentTypeIcon(document) : FileText;
@@ -236,6 +239,15 @@ export function DocumentDetails({
                   <ExternalLink size={15} aria-hidden="true" />
                 )}
                 外部打开
+              </button>
+              <button
+                className="button danger-quiet details-trash"
+                type="button"
+                onClick={() => onMoveDocumentToTrash(document)}
+                aria-label={`将 ${document.title} 移入回收站`}
+              >
+                <Trash2 size={15} aria-hidden="true" />
+                移入回收站
               </button>
             </div>
             {openError ? (

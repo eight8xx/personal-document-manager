@@ -18,10 +18,10 @@ use super::models::{
     BootstrapState, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
     DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
     DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
-    DocumentThumbnail, ImportBatch, ImportDecision, ImportItemResult, ImportItemStatus,
-    ImportProgress, IndexRunResult, IndexStatus, LibraryLocationInspection, LibraryMetadata,
-    LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord, SearchMatchKind,
-    TagSummary,
+    DocumentThumbnail, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
+    ImportItemStatus, ImportProgress, IndexRunResult, IndexStatus, LibraryLocationInspection,
+    LibraryMetadata, LibrarySummary, LocationStatus, RecentLibrary, RecentLibraryRecord,
+    SearchMatchKind, TagSummary, TrashDocumentSummary,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -1868,6 +1868,216 @@ impl LibraryService {
         load_document_summary(&library.connection, document_id)
     }
 
+    pub fn move_document_to_trash(&mut self, document_id: &str) -> LibraryResult<()> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let timestamp = now();
+        let updated = library.connection.execute(
+            "
+            UPDATE documents
+            SET original_collection_id = collection_id,
+                deleted_at = ?1,
+                updated_at = ?1
+            WHERE id = ?2 AND deleted_at IS NULL
+            ",
+            params![&timestamp, document_id],
+        )?;
+        if updated == 0 {
+            return Err(LibraryError::DocumentNotFound(format!(
+                "文档不存在或已在回收站中：{document_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn list_trash_documents(&self) -> LibraryResult<Vec<TrashDocumentSummary>> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let mut statement = library.connection.prepare(
+            "
+            SELECT
+                d.id,
+                d.title,
+                d.file_name,
+                d.file_type,
+                d.file_size,
+                d.content_hash,
+                d.collection_id,
+                d.processing_status,
+                d.index_status,
+                d.error_stage,
+                d.error_message,
+                d.imported_at,
+                COALESCE(s.source_path, ''),
+                COALESCE(s.source_identifier, ''),
+                COALESCE(s.last_imported_at, d.imported_at),
+                d.description,
+                d.document_date,
+                d.original_collection_id,
+                c.name,
+                d.deleted_at
+            FROM documents d
+            LEFT JOIN sources s ON s.document_id = d.id
+            LEFT JOIN collections c ON c.id = d.original_collection_id
+            WHERE d.deleted_at IS NOT NULL
+            ORDER BY d.deleted_at DESC, d.id DESC
+            ",
+        )?;
+        let mut documents = statement
+            .query_map([], |row| {
+                Ok(TrashDocumentSummary {
+                    document: document_from_row(row)?,
+                    original_collection_id: row.get(17)?,
+                    original_collection_name: row.get(18)?,
+                    deleted_at: row.get(19)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for document in &mut documents {
+            document.document.tags =
+                load_document_tags(&library.connection, &document.document.id)?;
+        }
+        Ok(documents)
+    }
+
+    pub fn restore_document(&mut self, document_id: &str) -> LibraryResult<DocumentSummary> {
+        let library = self
+            .current
+            .as_mut()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let transaction = library.connection.transaction()?;
+        let original_collection_id = transaction
+            .query_row(
+                "
+                SELECT original_collection_id
+                FROM documents
+                WHERE id = ?1 AND deleted_at IS NOT NULL
+                ",
+                params![document_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                LibraryError::DocumentNotFound(format!("回收站中不存在文档：{document_id}"))
+            })?;
+        let collection_id = match original_collection_id {
+            Some(collection_id) => {
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
+                    params![&collection_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if exists {
+                    collection_id
+                } else {
+                    "inbox".to_string()
+                }
+            }
+            None => "inbox".to_string(),
+        };
+        let updated = transaction.execute(
+            "
+            UPDATE documents
+            SET collection_id = ?1,
+                original_collection_id = NULL,
+                deleted_at = NULL,
+                updated_at = ?2
+            WHERE id = ?3 AND deleted_at IS NOT NULL
+            ",
+            params![&collection_id, now(), document_id],
+        )?;
+        if updated == 0 {
+            return Err(LibraryError::DocumentNotFound(format!(
+                "回收站中不存在文档：{document_id}"
+            )));
+        }
+        transaction.commit()?;
+        load_document_summary(&library.connection, document_id)
+    }
+
+    pub fn permanently_delete_document(&mut self, document_id: &str) -> LibraryResult<()> {
+        self.permanently_delete_trashed_document(document_id)
+    }
+
+    pub fn empty_trash(&mut self) -> LibraryResult<EmptyTrashResult> {
+        let document_ids = {
+            let library = self
+                .current
+                .as_ref()
+                .ok_or(LibraryError::NoCurrentLibrary)?;
+            let mut statement = library.connection.prepare(
+                "
+                    SELECT id
+                    FROM documents
+                    WHERE deleted_at IS NOT NULL
+                    ORDER BY deleted_at, id
+                    ",
+            )?;
+            let document_ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            document_ids
+        };
+
+        let mut deleted_count = 0;
+        for document_id in document_ids {
+            self.permanently_delete_trashed_document(&document_id)?;
+            deleted_count += 1;
+        }
+        Ok(EmptyTrashResult { deleted_count })
+    }
+
+    fn permanently_delete_trashed_document(&self, document_id: &str) -> LibraryResult<()> {
+        let library = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let stored = library
+            .connection
+            .query_row(
+                "
+                SELECT file_name, file_type, library_path
+                FROM documents
+                WHERE id = ?1 AND deleted_at IS NOT NULL
+                ",
+                params![document_id],
+                |row| {
+                    Ok(StoredDocumentFile {
+                        file_name: row.get(0)?,
+                        file_type: row.get(1)?,
+                        library_path: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                LibraryError::DocumentNotFound(format!("回收站中不存在文档：{document_id}"))
+            })?;
+        let copy_path = self.document_copy_path(&stored)?;
+        let transaction = library.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM document_search WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM documents WHERE id = ?1 AND deleted_at IS NOT NULL",
+            params![document_id],
+        )?;
+        if deleted == 0 {
+            return Err(LibraryError::DocumentNotFound(format!(
+                "回收站中不存在文档：{document_id}"
+            )));
+        }
+        remove_library_copy(&copy_path)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn load_collection_summary(&self, collection_id: &str) -> LibraryResult<CollectionSummary> {
         let library = self
             .current
@@ -2441,6 +2651,26 @@ fn remove_previous_copies(previous_copies: &[(PathBuf, PathBuf)]) {
     }
 }
 
+fn remove_library_copy(path: &Path) -> LibraryResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LibraryError::Io(error)),
+    }
+    if let Some(parent) = path.parent() {
+        match fs::remove_dir(parent) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(LibraryError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
 fn import_item_not_found(item_id: &str) -> LibraryError {
     LibraryError::ImportItemNotFound(format!("导入项不存在或已处理：{item_id}"))
 }
@@ -2863,7 +3093,8 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
             imported_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            deleted_at TEXT
+            deleted_at TEXT,
+            original_collection_id TEXT
         );
 
         CREATE INDEX IF NOT EXISTS documents_collection_idx
@@ -2908,6 +3139,12 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
         ",
     )?;
 
+    ensure_column(connection, "documents", "original_collection_id", "TEXT")?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS documents_deleted_at_idx ON documents(deleted_at)",
+        [],
+    )?;
+
     let timestamp = now();
     connection.execute(
         "
@@ -2925,6 +3162,29 @@ fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
         params![timestamp],
     )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
+        params![timestamp],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> LibraryResult<()> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        params![table, column],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
     Ok(())
 }
 

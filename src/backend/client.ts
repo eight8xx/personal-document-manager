@@ -14,6 +14,7 @@ import type {
   DocumentSearchResponse,
   DocumentSummary,
   DocumentThumbnail,
+  EmptyTrashResult,
   ImportBatch,
   ImportDecision,
   ImportItemResult,
@@ -22,7 +23,8 @@ import type {
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
-  TagSummary
+  TagSummary,
+  TrashDocumentSummary
 } from "./types";
 
 export const tauriBackendClient: BackendClient = {
@@ -143,6 +145,15 @@ export const tauriBackendClient: BackendClient = {
       documentId,
       collectionId
     }),
+  moveDocumentToTrash: (documentId) =>
+    invoke<void>("move_document_to_trash", { documentId }),
+  listTrashDocuments: () =>
+    invoke<TrashDocumentSummary[]>("list_trash_documents"),
+  restoreDocument: (documentId) =>
+    invoke<DocumentSummary>("restore_document", { documentId }),
+  permanentlyDeleteDocument: (documentId) =>
+    invoke<void>("permanently_delete_document", { documentId }),
+  emptyTrash: () => invoke<EmptyTrashResult>("empty_trash"),
   listTags: () => invoke<TagSummary[]>("list_tags"),
   createTag: (name) => invoke<TagSummary>("create_tag", { name }),
   renameTag: (tagId, name) =>

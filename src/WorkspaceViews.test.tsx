@@ -296,11 +296,22 @@ describe("三栏工作台与列表、网格视图", () => {
     await user.click(selection);
     selection.focus();
     expect(selection).toHaveFocus();
+    const row = selection.closest("article");
+    if (!row) {
+      throw new Error("无法找到文档行。");
+    }
 
     await user.tab();
     expect(
       screen.getByRole("combobox", {
         name: `移动 ${longTitle} 到集合`
+      })
+    ).toHaveFocus();
+
+    await user.tab();
+    expect(
+      within(row).getByRole("button", {
+        name: `将 ${longTitle} 移入回收站`
       })
     ).toHaveFocus();
 

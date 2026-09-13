@@ -56,6 +56,17 @@ export interface DocumentSummary {
   lastImportedAt: string;
 }
 
+export interface TrashDocumentSummary {
+  document: DocumentSummary;
+  originalCollectionId: string | null;
+  originalCollectionName: string | null;
+  deletedAt: string;
+}
+
+export interface EmptyTrashResult {
+  deletedCount: number;
+}
+
 export type DocumentPreview =
   | {
       kind: "pdf";
@@ -250,6 +261,11 @@ export interface BackendClient {
     documentId: string,
     collectionId: string
   ): Promise<DocumentSummary>;
+  moveDocumentToTrash(documentId: string): Promise<void>;
+  listTrashDocuments(): Promise<TrashDocumentSummary[]>;
+  restoreDocument(documentId: string): Promise<DocumentSummary>;
+  permanentlyDeleteDocument(documentId: string): Promise<void>;
+  emptyTrash(): Promise<EmptyTrashResult>;
   listTags(): Promise<TagSummary[]>;
   createTag(name: string): Promise<TagSummary>;
   renameTag(tagId: string, name: string): Promise<TagSummary>;

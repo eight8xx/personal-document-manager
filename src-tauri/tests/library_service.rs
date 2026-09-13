@@ -6,6 +6,7 @@ use personal_document_manager_lib::library::{
     DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail, ImportDecision,
     ImportItemStatus, IndexStatus, LibraryService, LocationStatus, SearchMatchKind,
 };
+use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -1193,6 +1194,215 @@ fn updates_metadata_search_results_and_marks_failed_index_retryable() {
         1
     );
     assert!(search(&service, "旧说明文本", DocumentSearchFilters::default()).is_empty());
+}
+
+#[test]
+fn soft_deletes_restores_and_keeps_trash_across_restarts() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("plan.txt");
+    let source_bytes = "项目计划正文，可被搜索。".as_bytes();
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let collection = service.create_collection("项目".to_string(), None).unwrap();
+    let tag = service.create_tag("重要".to_string()).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service.index_pending_documents().unwrap();
+    service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "项目计划".to_string(),
+                description: None,
+                document_date: None,
+                collection_id: collection.id.clone(),
+                tag_ids: vec![tag.id.clone()],
+            },
+        )
+        .unwrap();
+    let library_copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    assert!(library_copy.is_file());
+    assert_eq!(
+        search(&service, "项目计划正文", DocumentSearchFilters::default()).len(),
+        1
+    );
+
+    service.move_document_to_trash(&imported.id).unwrap();
+
+    assert!(service.list_documents().unwrap().is_empty());
+    assert!(search(&service, "项目计划正文", DocumentSearchFilters::default()).is_empty());
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+    assert!(library_copy.is_file());
+    let collections = service.list_collections().unwrap();
+    let project = collections
+        .iter()
+        .find(|item| item.id == collection.id)
+        .unwrap();
+    assert_eq!(project.document_count, 0);
+    assert_eq!(service.list_tags().unwrap()[0].document_count, 0);
+
+    let trash = service.list_trash_documents().unwrap();
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].document.id, imported.id);
+    assert_eq!(
+        trash[0].original_collection_id.as_deref(),
+        Some(collection.id.as_str())
+    );
+    assert_eq!(trash[0].original_collection_name.as_deref(), Some("项目"));
+    assert_eq!(trash[0].document.tags.len(), 1);
+
+    drop(service);
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    restarted.bootstrap().unwrap();
+    assert_eq!(restarted.list_trash_documents().unwrap().len(), 1);
+
+    let restored = restarted.restore_document(&imported.id).unwrap();
+    assert_eq!(restored.collection_id, collection.id);
+    assert!(restarted.list_trash_documents().unwrap().is_empty());
+    assert_eq!(
+        search(&restarted, "项目计划正文", DocumentSearchFilters::default()).len(),
+        1
+    );
+    assert!(library_copy.is_file());
+}
+
+#[test]
+fn restores_to_inbox_when_the_original_collection_was_deleted() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("archive.txt");
+    fs::write(&source_path, "待归档正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let collection = service
+        .create_collection("临时集合".to_string(), None)
+        .unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service
+        .move_document_to_collection(&imported.id, &collection.id)
+        .unwrap();
+    service.move_document_to_trash(&imported.id).unwrap();
+    service.delete_collection(&collection.id).unwrap();
+
+    let trash = service.list_trash_documents().unwrap();
+    assert_eq!(trash.len(), 1);
+    assert_eq!(
+        trash[0].original_collection_id.as_deref(),
+        Some(collection.id.as_str())
+    );
+    assert_eq!(trash[0].original_collection_name, None);
+
+    let restored = service.restore_document(&imported.id).unwrap();
+    assert_eq!(restored.collection_id, "inbox");
+    let inbox = service
+        .list_collections()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == "inbox")
+        .unwrap();
+    assert_eq!(inbox.document_count, 1);
+}
+
+#[test]
+fn permanently_deletes_records_index_tags_and_library_copy_but_not_source() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let source_path = root.path().join("report.txt");
+    let source_bytes = "永久删除前必须索引到的正文。".as_bytes();
+    fs::write(&source_path, source_bytes).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let tag = service.create_tag("报告".to_string()).unwrap();
+    let imported = service.import_document(&source_path).unwrap();
+    service
+        .update_document_metadata(
+            &imported.id,
+            DocumentMetadataUpdate {
+                title: "年度报告".to_string(),
+                description: Some("删除测试".to_string()),
+                document_date: None,
+                collection_id: "inbox".to_string(),
+                tag_ids: vec![tag.id.clone()],
+            },
+        )
+        .unwrap();
+    service.index_pending_documents().unwrap();
+    let library_copy = library_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name);
+    assert!(library_copy.is_file());
+
+    service.move_document_to_trash(&imported.id).unwrap();
+    service.permanently_delete_document(&imported.id).unwrap();
+
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+    assert!(!library_copy.exists());
+    assert!(!library_copy.parent().unwrap().exists());
+    assert!(service.list_documents().unwrap().is_empty());
+    assert!(service.list_trash_documents().unwrap().is_empty());
+    assert!(search(
+        &service,
+        "永久删除前必须索引到的正文",
+        DocumentSearchFilters::default()
+    )
+    .is_empty());
+    assert_eq!(service.list_tags().unwrap()[0].document_count, 0);
+
+    let connection = Connection::open(library_dir.join(".pdm").join("library.sqlite3")).unwrap();
+    for table in ["documents", "document_tags", "document_search", "sources"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be empty");
+    }
+}
+
+#[test]
+fn empties_trash_and_removes_every_library_copy() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let first_source = root.path().join("first.txt");
+    let second_source = root.path().join("second.md");
+    fs::write(&first_source, "first").unwrap();
+    fs::write(&second_source, "second").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let first = service.import_document(&first_source).unwrap();
+    let second = service.import_document(&second_source).unwrap();
+    let first_copy = library_dir
+        .join("documents")
+        .join(&first.id)
+        .join(&first.file_name);
+    let second_copy = library_dir
+        .join("documents")
+        .join(&second.id)
+        .join(&second.file_name);
+
+    service.move_document_to_trash(&first.id).unwrap();
+    service.move_document_to_trash(&second.id).unwrap();
+    let result = service.empty_trash().unwrap();
+
+    assert_eq!(result.deleted_count, 2);
+    assert!(service.list_trash_documents().unwrap().is_empty());
+    assert!(!first_copy.exists());
+    assert!(!second_copy.exists());
+    assert!(first_source.is_file());
+    assert!(second_source.is_file());
 }
 
 fn search(

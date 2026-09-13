@@ -6,9 +6,9 @@ use tauri::{AppHandle, Emitter, State};
 use crate::library::{
     BootstrapState, CollectionDeleteResult, CollectionSummary, DocumentMetadataUpdate,
     DocumentPreview, DocumentSearchQuery, DocumentSearchResponse, DocumentSummary,
-    DocumentThumbnail, ImportBatch, ImportDecision, ImportItemResult, ImportProgress,
-    IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService, LibrarySummary,
-    RecentLibrary, TagSummary,
+    DocumentThumbnail, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
+    ImportProgress, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
+    LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
@@ -311,6 +311,85 @@ fn move_document_to_collection_contract(
 }
 
 #[tauri::command]
+pub fn move_document_to_trash(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    move_document_to_trash_contract(&state, document_id)
+}
+
+fn move_document_to_trash_contract(
+    state: &AppState,
+    document_id: String,
+) -> Result<(), CommandError> {
+    state
+        .service()?
+        .move_document_to_trash(&document_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn list_trash_documents(
+    state: State<'_, AppState>,
+) -> Result<Vec<TrashDocumentSummary>, CommandError> {
+    list_trash_documents_contract(&state)
+}
+
+fn list_trash_documents_contract(
+    state: &AppState,
+) -> Result<Vec<TrashDocumentSummary>, CommandError> {
+    state
+        .service()?
+        .list_trash_documents()
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn restore_document(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<DocumentSummary, CommandError> {
+    restore_document_contract(&state, document_id)
+}
+
+fn restore_document_contract(
+    state: &AppState,
+    document_id: String,
+) -> Result<DocumentSummary, CommandError> {
+    state
+        .service()?
+        .restore_document(&document_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn permanently_delete_document(
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    permanently_delete_document_contract(&state, document_id)
+}
+
+fn permanently_delete_document_contract(
+    state: &AppState,
+    document_id: String,
+) -> Result<(), CommandError> {
+    state
+        .service()?
+        .permanently_delete_document(&document_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn empty_trash(state: State<'_, AppState>) -> Result<EmptyTrashResult, CommandError> {
+    empty_trash_contract(&state)
+}
+
+fn empty_trash_contract(state: &AppState) -> Result<EmptyTrashResult, CommandError> {
+    state.service()?.empty_trash().map_err(CommandError::from)
+}
+
+#[tauri::command]
 pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagSummary>, CommandError> {
     list_tags_contract(&state)
 }
@@ -606,11 +685,14 @@ mod tests {
     use super::{
         add_tag_to_document_contract, bootstrap_contract, create_collection_contract,
         create_library_contract, create_tag_contract, delete_collection_contract,
-        delete_tag_contract, inspect_library_location_contract, list_collections_contract,
-        list_tags_contract, move_collection_contract, move_document_to_collection_contract,
+        delete_tag_contract, empty_trash_contract, inspect_library_location_contract,
+        list_collections_contract, list_tags_contract, list_trash_documents_contract,
+        move_collection_contract, move_document_to_collection_contract,
+        move_document_to_trash_contract, permanently_delete_document_contract,
         remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
-        resolve_import_item_contract, retry_import_item_contract, start_import_contract,
-        update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
+        resolve_import_item_contract, restore_document_contract, retry_import_item_contract,
+        start_import_contract, update_document_metadata_contract, AppState, CommandError,
+        LibraryChangedEvent,
     };
     use crate::library::{
         DocumentMetadataUpdate, DocumentPreview, DocumentSearchFilters, DocumentSearchQuery,
@@ -916,5 +998,47 @@ mod tests {
         assert_eq!(added.tags.len(), 2);
         delete_tag_contract(&state, important.id).unwrap();
         assert_eq!(list_tags_contract(&state).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn trash_commands_use_camel_case_contract_and_restore_to_the_original_collection() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let library_path = root.path().join("Library");
+        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let collection = create_collection_contract(&state, "归档".to_string(), None).unwrap();
+        let source_path = root.path().join("document.txt");
+        std::fs::write(&source_path, "document").unwrap();
+        let document_id = start_import_contract(
+            &state,
+            vec![source_path.to_string_lossy().into_owned()],
+            |_| {},
+        )
+        .unwrap()
+        .items
+        .remove(0)
+        .document_id
+        .unwrap();
+        move_document_to_collection_contract(&state, document_id.clone(), collection.id.clone())
+            .unwrap();
+
+        move_document_to_trash_contract(&state, document_id.clone()).unwrap();
+        let trash = list_trash_documents_contract(&state).unwrap();
+        assert_eq!(trash.len(), 1);
+        let value = serde_json::to_value(&trash[0]).unwrap();
+        assert_eq!(value["originalCollectionId"], collection.id);
+        assert_eq!(value["originalCollectionName"], "归档");
+        assert!(value.get("deletedAt").is_some());
+
+        let restored = restore_document_contract(&state, document_id.clone()).unwrap();
+        assert_eq!(restored.collection_id, collection.id);
+
+        move_document_to_trash_contract(&state, document_id.clone()).unwrap();
+        permanently_delete_document_contract(&state, document_id).unwrap();
+        assert!(list_trash_documents_contract(&state).unwrap().is_empty());
+
+        let empty = empty_trash_contract(&state).unwrap();
+        let value = serde_json::to_value(empty).unwrap();
+        assert_eq!(value["deletedCount"], 0);
     }
 }

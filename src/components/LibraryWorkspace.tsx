@@ -33,7 +33,8 @@ import type {
   ImportItemResult,
   ImportProgress,
   LibrarySummary,
-  TagSummary
+  TagSummary,
+  TrashDocumentSummary
 } from "../backend/types";
 import {
   CollectionActionDialog,
@@ -56,6 +57,12 @@ import {
   TagActionDialog
 } from "./TagDialog";
 import type { TagAction } from "./TagDialog";
+import { TrashDocumentList } from "./TrashDocumentList";
+import {
+  EmptyTrashDialog,
+  MoveDocumentToTrashDialog,
+  PermanentDeleteDocumentDialog
+} from "./TrashDialogs";
 
 interface LibraryWorkspaceProps {
   client: BackendClient;
@@ -138,6 +145,9 @@ export function LibraryWorkspace({
   onOpenSettings
 }: LibraryWorkspaceProps) {
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
+  const [trashDocuments, setTrashDocuments] = useState<
+    TrashDocumentSummary[]
+  >([]);
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
   const [tags, setTags] = useState<TagSummary[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -161,6 +171,7 @@ export function LibraryWorkspace({
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(
     null
   );
+  const [showingTrash, setShowingTrash] = useState(false);
   const [documentView, setDocumentView] =
     useState<DocumentView>(storedDocumentView);
   const [loading, setLoading] = useState(true);
@@ -185,6 +196,17 @@ export function LibraryWorkspace({
   );
   const [metadataTarget, setMetadataTarget] =
     useState<DocumentSummary | null>(null);
+  const [moveToTrashTarget, setMoveToTrashTarget] =
+    useState<DocumentSummary | null>(null);
+  const [permanentDeleteTarget, setPermanentDeleteTarget] =
+    useState<DocumentSummary | null>(null);
+  const [emptyTrashOpen, setEmptyTrashOpen] = useState(false);
+  const [restoringTrashIds, setRestoringTrashIds] = useState<Set<string>>(
+    new Set()
+  );
+  const [permanentlyDeletingIds, setPermanentlyDeletingIds] = useState<
+    Set<string>
+  >(new Set());
   const [highlightedDocumentId, setHighlightedDocumentId] = useState<
     string | null
   >(null);
@@ -193,6 +215,12 @@ export function LibraryWorkspace({
   const refreshDocuments = useCallback(async () => {
     const items = await client.listDocuments();
     setDocuments((current) => mergeById(current, items, documentId));
+    return items;
+  }, [client]);
+
+  const refreshTrashDocuments = useCallback(async () => {
+    const items = await client.listTrashDocuments();
+    setTrashDocuments(items);
     return items;
   }, [client]);
 
@@ -211,10 +239,16 @@ export function LibraryWorkspace({
   const refreshLibraryData = useCallback(async () => {
     await Promise.all([
       refreshDocuments(),
+      refreshTrashDocuments(),
       refreshCollections(),
       refreshTags()
     ]);
-  }, [refreshCollections, refreshDocuments, refreshTags]);
+  }, [
+    refreshCollections,
+    refreshDocuments,
+    refreshTags,
+    refreshTrashDocuments
+  ]);
 
   const runPendingIndexing = useCallback(async () => {
     if (indexingRef.current) {
@@ -240,23 +274,27 @@ export function LibraryWorkspace({
     let active = true;
     setLoading(true);
     setDocuments([]);
+    setTrashDocuments([]);
     setCollections([]);
     setTags([]);
     setError("");
     setSelectedCollectionId(null);
     setSelectedTagId(null);
     setSelectedDocumentId(null);
+    setShowingTrash(false);
 
     void Promise.all([
       client.listDocuments(),
+      client.listTrashDocuments(),
       client.listCollections(),
       client.listTags()
     ])
-      .then(([documentItems, collectionItems, tagItems]) => {
+      .then(([documentItems, trashItems, collectionItems, tagItems]) => {
         if (!active) {
           return;
         }
         setDocuments((current) => mergeById(current, documentItems, documentId));
+        setTrashDocuments(trashItems);
         setCollections((current) =>
           mergeById(current, collectionItems, collectionId)
         );
@@ -737,6 +775,85 @@ export function LibraryWorkspace({
     }
   }
 
+  async function moveDocumentToTrash() {
+    if (!moveToTrashTarget) {
+      return;
+    }
+
+    setError("");
+    try {
+      await client.moveDocumentToTrash(moveToTrashTarget.id);
+      if (selectedDocumentId === moveToTrashTarget.id) {
+        setSelectedDocumentId(null);
+      }
+      if (highlightedDocumentId === moveToTrashTarget.id) {
+        setHighlightedDocumentId(null);
+      }
+      setDocuments((current) =>
+        current.filter((document) => document.id !== moveToTrashTarget.id)
+      );
+      setMoveToTrashTarget(null);
+      await refreshLibraryData();
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+      throw caught;
+    }
+  }
+
+  async function restoreTrashDocument(document: DocumentSummary) {
+    setRestoringTrashIds((current) => new Set(current).add(document.id));
+    setError("");
+    try {
+      await client.restoreDocument(document.id);
+      await refreshLibraryData();
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+    } finally {
+      setRestoringTrashIds((current) => {
+        const next = new Set(current);
+        next.delete(document.id);
+        return next;
+      });
+    }
+  }
+
+  async function permanentlyDeleteTrashDocument() {
+    if (!permanentDeleteTarget) {
+      return;
+    }
+
+    setPermanentlyDeletingIds((current) =>
+      new Set(current).add(permanentDeleteTarget.id)
+    );
+    setError("");
+    try {
+      await client.permanentlyDeleteDocument(permanentDeleteTarget.id);
+      setPermanentDeleteTarget(null);
+      await refreshLibraryData();
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+      throw caught;
+    } finally {
+      setPermanentlyDeletingIds((current) => {
+        const next = new Set(current);
+        next.delete(permanentDeleteTarget.id);
+        return next;
+      });
+    }
+  }
+
+  async function emptyTrash() {
+    setError("");
+    try {
+      await client.emptyTrash();
+      setEmptyTrashOpen(false);
+      await refreshLibraryData();
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+      throw caught;
+    }
+  }
+
   const selectedCollection = selectedCollectionId
     ? collections.find(
         (collection) => collection.id === selectedCollectionId
@@ -821,17 +938,26 @@ export function LibraryWorkspace({
     ) ?? null;
 
   function selectAllDocuments() {
+    setShowingTrash(false);
     clearSearchFilters();
   }
 
   function selectCollection(collectionId: string) {
+    setShowingTrash(false);
     setSelectedCollectionId(collectionId);
     setSelectedDocumentId(null);
   }
 
   function selectTag(tagId: string) {
+    setShowingTrash(false);
     setSelectedTagId(tagId);
     setSelectedDocumentId(null);
+  }
+
+  function selectTrash() {
+    clearSearchFilters();
+    setHighlightedDocumentId(null);
+    setShowingTrash(true);
   }
 
   function changeSearchFilters(change: {
@@ -889,7 +1015,7 @@ export function LibraryWorkspace({
         <nav className="primary-nav" aria-label="资料库导航">
           <button
             className={`nav-item${
-              !hasActiveFilters
+              !showingTrash && !hasActiveFilters
                 ? " active"
                 : ""
             }`}
@@ -899,6 +1025,15 @@ export function LibraryWorkspace({
             <LibraryBig size={18} aria-hidden="true" />
             <span>全部文档</span>
             <em>{documents.length}</em>
+          </button>
+          <button
+            className={`nav-item${showingTrash ? " active" : ""}`}
+            type="button"
+            onClick={selectTrash}
+          >
+            <Trash2 size={18} aria-hidden="true" />
+            <span>回收站</span>
+            <em>{trashDocuments.length}</em>
           </button>
         </nav>
 
@@ -1011,7 +1146,9 @@ export function LibraryWorkspace({
       <section className="workspace">
         <header className="workspace-header">
           <div className="library-heading">
-            {selectedTag ? (
+            {showingTrash ? (
+              <Trash2 size={19} aria-hidden="true" />
+            ) : selectedTag ? (
               <TagIcon size={19} aria-hidden="true" />
             ) : selectedCollection?.isInbox ? (
               <Inbox size={19} aria-hidden="true" />
@@ -1022,90 +1159,120 @@ export function LibraryWorkspace({
             )}
             <div>
               <strong>
-                {selectedTag?.name ?? selectedCollection?.name ?? "全部文档"}
+                {showingTrash
+                  ? "回收站"
+                  : selectedTag?.name ??
+                    selectedCollection?.name ??
+                    "全部文档"}
               </strong>
-              <span>{visibleDocuments.length} 份文档</span>
+              <span>
+                {showingTrash
+                  ? `${trashDocuments.length} 份文档`
+                  : `${visibleDocuments.length} 份文档`}
+              </span>
             </div>
           </div>
           <div className="header-actions">
-            <form
-              className="search-form"
-              role="search"
-              onSubmit={(event) => event.preventDefault()}
-            >
-              <Search size={17} aria-hidden="true" />
-              <input
-                type="search"
-                aria-label="搜索文档"
-                placeholder="搜索标题、描述和正文"
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
-              />
-              {searchQuery ? (
-                <button
-                  className="icon-button compact"
-                  type="button"
-                  onClick={() => setSearchQuery("")}
-                  aria-label="清除搜索词"
-                  title="清除搜索词"
+            {!showingTrash ? (
+              <>
+                <form
+                  className="search-form"
+                  role="search"
+                  onSubmit={(event) => event.preventDefault()}
                 >
-                  <X size={14} aria-hidden="true" />
+                  <Search size={17} aria-hidden="true" />
+                  <input
+                    type="search"
+                    aria-label="搜索文档"
+                    placeholder="搜索标题、描述和正文"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                  />
+                  {searchQuery ? (
+                    <button
+                      className="icon-button compact"
+                      type="button"
+                      onClick={() => setSearchQuery("")}
+                      aria-label="清除搜索词"
+                      title="清除搜索词"
+                    >
+                      <X size={14} aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </form>
+                <button
+                  className={`button secondary filter-button${
+                    hasActiveFilters ? " active" : ""
+                  }`}
+                  type="button"
+                  onClick={() => setFiltersOpen((current) => !current)}
+                  aria-expanded={filtersOpen || hasActiveFilters}
+                  aria-controls="search-filter-panel"
+                >
+                  <SlidersHorizontal size={16} aria-hidden="true" />
+                  筛选
+                  {hasActiveFilters ? (
+                    <span className="filter-count" aria-hidden="true">
+                      {
+                        [
+                          selectedCollectionId,
+                          selectedTagId,
+                          fileTypeFilter,
+                          documentDateFrom,
+                          documentDateTo
+                        ].filter(Boolean).length
+                      }
+                    </span>
+                  ) : null}
                 </button>
-              ) : null}
-            </form>
-            <button
-              className={`button secondary filter-button${
-                hasActiveFilters ? " active" : ""
-              }`}
-              type="button"
-              onClick={() => setFiltersOpen((current) => !current)}
-              aria-expanded={filtersOpen || hasActiveFilters}
-              aria-controls="search-filter-panel"
-            >
-              <SlidersHorizontal size={16} aria-hidden="true" />
-              筛选
-              {hasActiveFilters ? (
-                <span className="filter-count" aria-hidden="true">
-                  {
-                    [
-                      selectedCollectionId,
-                      selectedTagId,
-                      fileTypeFilter,
-                      documentDateFrom,
-                      documentDateTo
-                    ].filter(Boolean).length
-                  }
-                </span>
-              ) : null}
-            </button>
-            {indexing ? (
-              <span className="indexing-status" role="status">
-                <LoaderCircle className="spin" size={15} aria-hidden="true" />
-                正在建立索引
-              </span>
-            ) : null}
-            <button
-              className="button secondary import-button"
-              type="button"
-              onClick={() => void chooseFolder()}
-              disabled={loading || importing}
-            >
-              <FolderPlus size={17} aria-hidden="true" />
-              导入文件夹
-            </button>
-            <button
-              className="button primary import-button"
-              type="button"
-              onClick={() => void chooseDocuments()}
-              disabled={loading || importing}
-            >
-              {importing ? (
-                <LoaderCircle className="spin" size={17} aria-hidden="true" />
-              ) : (
-                <FilePlus2 size={17} aria-hidden="true" />
-              )}
-              {importing ? "正在导入" : "导入文档"}
-            </button>
+                {indexing ? (
+                  <span className="indexing-status" role="status">
+                    <LoaderCircle
+                      className="spin"
+                      size={15}
+                      aria-hidden="true"
+                    />
+                    正在建立索引
+                  </span>
+                ) : null}
+                <button
+                  className="button secondary import-button"
+                  type="button"
+                  onClick={() => void chooseFolder()}
+                  disabled={loading || importing}
+                >
+                  <FolderPlus size={17} aria-hidden="true" />
+                  导入文件夹
+                </button>
+                <button
+                  className="button primary import-button"
+                  type="button"
+                  onClick={() => void chooseDocuments()}
+                  disabled={loading || importing}
+                >
+                  {importing ? (
+                    <LoaderCircle
+                      className="spin"
+                      size={17}
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <FilePlus2 size={17} aria-hidden="true" />
+                  )}
+                  {importing ? "正在导入" : "导入文档"}
+                </button>
+              </>
+            ) : (
+              <button
+                className="button danger"
+                type="button"
+                onClick={() => setEmptyTrashOpen(true)}
+                disabled={trashDocuments.length === 0}
+              >
+                <Trash2 size={16} aria-hidden="true" />
+                清空回收站
+              </button>
+            )}
             <button
               className="icon-button"
               type="button"
@@ -1118,7 +1285,7 @@ export function LibraryWorkspace({
           </div>
         </header>
 
-        {filtersOpen || hasActiveFilters ? (
+        {!showingTrash && (filtersOpen || hasActiveFilters) ? (
           <div id="search-filter-panel">
             <SearchFilters
               collections={collections}
@@ -1169,7 +1336,17 @@ export function LibraryWorkspace({
           </main>
         ) : (
           <>
-            {searchError ? (
+            {showingTrash ? (
+              <TrashDocumentList
+                documents={trashDocuments}
+                restoringIds={restoringTrashIds}
+                permanentlyDeletingIds={permanentlyDeletingIds}
+                onRestore={(document) =>
+                  void restoreTrashDocument(document)
+                }
+                onPermanentlyDelete={setPermanentDeleteTarget}
+              />
+            ) : searchError ? (
               <main className="search-error-state" aria-label="搜索失败">
                 <AlertCircle size={22} aria-hidden="true" />
                 <strong>搜索失败</strong>
@@ -1239,6 +1416,7 @@ export function LibraryWorkspace({
                       void moveDocument(document, targetCollectionId)
                     }
                     onEditDocument={setMetadataTarget}
+                    onMoveDocumentToTrash={setMoveToTrashTarget}
                     onRetryIndex={(document) =>
                       void retryDocumentIndex(document)
                     }
@@ -1257,6 +1435,7 @@ export function LibraryWorkspace({
                       void moveDocument(document, targetCollectionId)
                     }
                     onEditDocument={setMetadataTarget}
+                    onMoveDocumentToTrash={setMoveToTrashTarget}
                     onRetryIndex={(document) =>
                       void retryDocumentIndex(document)
                     }
@@ -1270,12 +1449,13 @@ export function LibraryWorkspace({
 
       <DocumentDetails
         client={client}
-        document={selectedDocument}
+        document={showingTrash ? null : selectedDocument}
         collections={collections}
         retryingIndex={
           selectedDocument ? retryingIndexIds.has(selectedDocument.id) : false
         }
         onEditDocument={setMetadataTarget}
+        onMoveDocumentToTrash={setMoveToTrashTarget}
         onRetryIndex={(document) => void retryDocumentIndex(document)}
       />
 
@@ -1319,6 +1499,30 @@ export function LibraryWorkspace({
           tags={tags}
           onClose={() => setMetadataTarget(null)}
           onSave={saveDocumentMetadata}
+        />
+      ) : null}
+
+      {moveToTrashTarget ? (
+        <MoveDocumentToTrashDialog
+          document={moveToTrashTarget}
+          onClose={() => setMoveToTrashTarget(null)}
+          onConfirm={moveDocumentToTrash}
+        />
+      ) : null}
+
+      {permanentDeleteTarget ? (
+        <PermanentDeleteDocumentDialog
+          document={permanentDeleteTarget}
+          onClose={() => setPermanentDeleteTarget(null)}
+          onConfirm={permanentlyDeleteTrashDocument}
+        />
+      ) : null}
+
+      {emptyTrashOpen ? (
+        <EmptyTrashDialog
+          count={trashDocuments.length}
+          onClose={() => setEmptyTrashOpen(false)}
+          onConfirm={emptyTrash}
         />
       ) : null}
 

@@ -128,6 +128,21 @@ pub struct DocumentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashDocumentSummary {
+    pub document: DocumentSummary,
+    pub original_collection_id: Option<String>,
+    pub original_collection_name: Option<String>,
+    pub deleted_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmptyTrashResult {
+    pub deleted_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
