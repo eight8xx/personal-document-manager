@@ -192,16 +192,39 @@ fn import_document_contract(
 }
 
 #[tauri::command]
-pub fn start_import(
+pub async fn start_import(
     paths: Vec<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportBatch, CommandError> {
-    start_import_contract(&state, paths, |progress| {
+    spawn_import_task(&state, paths, move |progress| {
         let _ = app.emit("import-progress", progress);
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "importTask".to_string(),
+        message: format!("导入任务无法完成：{error}"),
+    })?
+}
+
+fn spawn_import_task<F>(
+    state: &AppState,
+    paths: Vec<String>,
+    on_progress: F,
+) -> tauri::async_runtime::JoinHandle<Result<ImportBatch, CommandError>>
+where
+    F: FnMut(ImportProgress) + Send + 'static,
+{
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service
+            .start_import_with_progress(paths, on_progress)
+            .map_err(CommandError::from)
     })
 }
 
+#[cfg(test)]
 fn start_import_contract<F>(
     state: &AppState,
     paths: Vec<String>,
@@ -810,14 +833,16 @@ mod tests {
         move_document_to_trash_contract, pending_index_count_contract,
         permanently_delete_document_contract, remove_tag_from_document_contract,
         rename_collection_contract, rename_tag_contract, resolve_import_item_contract,
-        restore_document_contract, retry_import_item_contract, start_import_contract,
-        update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
+        restore_document_contract, retry_import_item_contract, spawn_import_task,
+        start_import_contract, update_document_metadata_contract, AppState, CommandError,
+        LibraryChangedEvent,
     };
     use crate::library::{
         BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
         DocumentPreview, DocumentSearchFilters, DocumentSearchQuery, DocumentThumbnail,
         ImportDecision, ImportItemStatus, LibraryService, LibrarySummary, LocationStatus,
     };
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[test]
@@ -1080,6 +1105,36 @@ mod tests {
         let value = serde_json::to_value(retried).unwrap();
         assert_eq!(value["status"], "imported");
         assert!(value.get("retryable").is_some());
+    }
+
+    #[test]
+    fn start_import_task_returns_while_the_service_is_locked() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        create_library_contract(
+            &state,
+            root.path().join("Library").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        let source_path = root.path().join("source.txt");
+        std::fs::write(&source_path, "async import contents").unwrap();
+
+        let service_guard = state.service().unwrap();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let task = spawn_import_task(&state, vec![source_path.to_string_lossy().into_owned()], {
+            let progress = Arc::clone(&progress);
+            move |event| progress.lock().unwrap().push(event)
+        });
+        assert!(!task.inner().is_finished());
+
+        drop(service_guard);
+        let batch = tauri::async_runtime::block_on(task)
+            .expect("import task should join")
+            .expect("import should succeed");
+        assert_eq!(batch.imported_count, 1);
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.first().unwrap().completed, 0);
+        assert!(progress.last().unwrap().finished);
     }
 
     #[test]

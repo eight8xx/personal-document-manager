@@ -191,6 +191,9 @@ export function DocumentDetails({
   const TypeIcon = document ? documentTypeIcon(document) : FileText;
   const status = document ? documentStatusPresentation(document) : null;
   const documentId = document?.id ?? null;
+  const documentContentHash = document?.contentHash ?? null;
+  const documentFileSize = document?.fileSize ?? null;
+  const documentLastImportedAt = document?.lastImportedAt ?? null;
   const [preview, setPreview] = useState<DocumentPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
@@ -235,7 +238,14 @@ export function DocumentDetails({
     return () => {
       active = false;
     };
-  }, [client, documentId, reloadToken]);
+  }, [
+    client,
+    documentId,
+    documentContentHash,
+    documentFileSize,
+    documentLastImportedAt,
+    reloadToken
+  ]);
 
   async function openDocument() {
     if (!documentId) {

@@ -159,7 +159,14 @@ function DocumentThumbnailVisual({
     return () => {
       active = false;
     };
-  }, [client, document.id, usesGeneratedThumbnail]);
+  }, [
+    client,
+    document.id,
+    document.contentHash,
+    document.fileSize,
+    document.lastImportedAt,
+    usesGeneratedThumbnail
+  ]);
 
   if (thumbnail?.kind === "image" || thumbnail?.kind === "pdf") {
     return (
