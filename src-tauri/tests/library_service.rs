@@ -4107,11 +4107,227 @@ fn write_sparse_archive(path: &Path, size: u64) {
     file.sync_all().unwrap();
 }
 
+/// 分步导入原语与单次调用必须给出完全相同的进度序列与汇总结果。
+#[test]
+fn stepwise_import_reports_the_same_progress_and_result_as_a_single_call() {
+    let root = tempdir().unwrap();
+    let sources = root.path().join("sources");
+    fs::create_dir_all(&sources).unwrap();
+    let first_source = sources.join("first.txt");
+    let missing_source = sources.join("missing.txt");
+    fs::write(&first_source, "第一份正文").unwrap();
+    let mixed = sources.join("mixed");
+    fs::create_dir_all(&mixed).unwrap();
+    fs::write(mixed.join("inside.txt"), "文件夹内正文").unwrap();
+    fs::write(mixed.join("skip.xyz"), "不支持的类型").unwrap();
+    let paths = vec![
+        first_source.to_string_lossy().into_owned(),
+        missing_source.to_string_lossy().into_owned(),
+        mixed.to_string_lossy().into_owned(),
+    ];
+
+    fn summarize(progress: &personal_document_manager_lib::library::ImportProgress) -> String {
+        let item = progress
+            .item
+            .as_ref()
+            .map(|item| format!("{:?}:{}", item.status, item.file_name))
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "{}|{}|{}|{}|{}",
+            progress.completed,
+            progress.total,
+            progress.finished,
+            progress.current_file_name.clone().unwrap_or_default(),
+            item
+        )
+    }
+
+    let run = |stepwise: bool, state_dir: &Path, library_dir: &Path| {
+        let mut service = LibraryService::new(state_dir).unwrap();
+        service.create_library(library_dir).unwrap();
+        let mut events = Vec::new();
+        let batch = if stepwise {
+            let first = service
+                .begin_import_batch(paths.clone(), None, ImportSource::FilePicker)
+                .unwrap();
+            let batch_id = first.batch_id.clone();
+            events.push(summarize(&first));
+            while let Some(before) = service.peek_import_progress(&batch_id).unwrap() {
+                events.push(summarize(&before));
+                events.push(summarize(&service.import_batch_step(&batch_id).unwrap()));
+            }
+            events.push(summarize(
+                &service.import_batch_finished_progress(&batch_id).unwrap(),
+            ));
+            service.finish_import_batch(&batch_id).unwrap()
+        } else {
+            service
+                .start_import_to_collection_with_progress(
+                    paths.clone(),
+                    None,
+                    ImportSource::FilePicker,
+                    |progress| events.push(summarize(&progress)),
+                )
+                .unwrap()
+        };
+        let counts = format!(
+            "{}/{}/{}/{}/{}",
+            batch.imported_count,
+            batch.duplicate_count,
+            batch.source_changed_count,
+            batch.failed_count,
+            batch.ignored_count
+        );
+        let documents = service.list_documents().unwrap().len();
+        (events, counts, documents)
+    };
+
+    let single = run(
+        false,
+        &root.path().join("state-single"),
+        &root.path().join("Single"),
+    );
+    let stepwise = run(true, &root.path().join("state-step"), &root.path().join("Step"));
+    assert_eq!(
+        stepwise.0, single.0,
+        "分步推进的进度事件序列应与单次调用一致"
+    );
+    assert_eq!(stepwise.1, single.1, "汇总计数应一致");
+    assert_eq!(stepwise.2, single.2, "落库文档数应一致");
+    assert_eq!(single.1, "2/0/0/1/1");
+    assert_eq!(single.2, 2);
+    assert_eq!(single.0.len(), 10, "1 个开始 + 4 项 × 2 + 1 个结束");
+}
+
+/// 导入进行中切换资料库：从下一项起该批被拒绝，原库保留已提交的项，新库零写入。
+#[test]
+fn switching_libraries_between_items_stops_the_batch_without_writing_to_the_new_library() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&first_dir).unwrap();
+    service.create_library(&second_dir).unwrap();
+    service.open_library(&first_dir).unwrap();
+
+    let mut paths = Vec::new();
+    for index in 0..3 {
+        let path = root.path().join(format!("switch-{index}.txt"));
+        fs::write(&path, format!("切库批次正文 {index}")).unwrap();
+        paths.push(path.to_string_lossy().into_owned());
+    }
+
+    let first = service
+        .begin_import_batch(paths.clone(), None, ImportSource::FilePicker)
+        .unwrap();
+    let batch_id = first.batch_id.clone();
+    assert_eq!(
+        service
+            .peek_import_progress(&batch_id)
+            .unwrap()
+            .unwrap()
+            .completed,
+        0
+    );
+
+    // 第一项在旧库正常落库。
+    let step = service.import_batch_step(&batch_id).unwrap();
+    assert_eq!(step.completed, 1);
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+
+    // 导入尚未结束时切库：下一项必须被拒绝，而不是写进新库。
+    service.open_library(&second_dir).unwrap();
+    let error = service.import_batch_step(&batch_id).unwrap_err();
+    assert_eq!(error.code(), "invalidLibrary");
+    assert!(
+        service.list_documents().unwrap().is_empty(),
+        "切库后的资料库不应出现该批次的文档"
+    );
+    assert_eq!(
+        fs::read_dir(second_dir.join("documents")).unwrap().count(),
+        0,
+        "新库不应写入任何副本"
+    );
+
+    // 旧库保留已经提交的第一项，且源文件未被改动。
+    service.open_library(&first_dir).unwrap();
+    let documents = service.list_documents().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].file_name, "switch-0.txt");
+    assert_eq!(fs::read(&paths[0]).unwrap(), "切库批次正文 0".as_bytes());
+
+    // 中止后的批次不再可用，也不会留下可继续推进的状态。
+    service.abort_import_batch(&batch_id).unwrap();
+    assert!(service.import_batch_step(&batch_id).is_err());
+    assert!(service.peek_import_progress(&batch_id).is_err());
+}
+
+/// 同一批次被两个线程同时推进时，每个条目只会被处理一次，不会出现两个写者写同一项。
+#[test]
+fn concurrent_steps_of_one_batch_never_process_the_same_item_twice() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+
+    let mut paths = Vec::new();
+    for index in 0..4 {
+        let path = root.path().join(format!("parallel-{index}.txt"));
+        fs::write(&path, format!("并发批次正文 {index}")).unwrap();
+        paths.push(path.to_string_lossy().into_owned());
+    }
+    let first = service
+        .begin_import_batch(paths, None, ImportSource::FilePicker)
+        .unwrap();
+    let batch_id = first.batch_id.clone();
+    let service = Arc::new(Mutex::new(service));
+
+    let workers = (0..2)
+        .map(|_| {
+            let service = Arc::clone(&service);
+            let batch_id = batch_id.clone();
+            thread::spawn(move || {
+                let mut processed = Vec::new();
+                for _ in 0..2 {
+                    let step = service.lock().unwrap().import_batch_step(&batch_id);
+                    if let Ok(progress) = step {
+                        processed.push(
+                            progress.item.expect("每一步都应带条目结果").source_path,
+                        );
+                    }
+                }
+                processed
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut processed = Vec::new();
+    for worker in workers {
+        processed.extend(worker.join().unwrap());
+    }
+    assert_eq!(processed.len(), 4, "四步应当各处理一项");
+    processed.sort();
+    processed.dedup();
+    assert_eq!(processed.len(), 4, "同一个条目不应被处理两次");
+
+    let batch = service
+        .lock()
+        .unwrap()
+        .finish_import_batch(&batch_id)
+        .unwrap();
+    assert_eq!(batch.items.len(), 4);
+    assert_eq!(batch.imported_count, 4);
+    assert_eq!(service.lock().unwrap().list_documents().unwrap().len(), 4);
+}
+
 fn search(
     service: &LibraryService,
     query: &str,
     filters: DocumentSearchFilters,
-) -> Vec<personal_document_manager_lib::library::DocumentSearchResult> {    let DocumentSearchResponse { results } = service
+) -> Vec<personal_document_manager_lib::library::DocumentSearchResult> {
+    let DocumentSearchResponse { results } = service
         .search_documents(DocumentSearchQuery {
             query: query.to_string(),
             filters,
