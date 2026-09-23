@@ -1068,7 +1068,7 @@ mod tests {
     fn format_capability_command_matches_the_shared_contract() {
         let capabilities = list_document_format_capabilities().unwrap();
         let value = serde_json::to_value(capabilities).unwrap();
-        assert_eq!(value.as_array().unwrap().len(), 7);
+        assert_eq!(value.as_array().unwrap().len(), 9);
         assert_eq!(value[0]["id"], "pdf");
         assert_eq!(value[0]["displayType"], "PDF");
         assert_eq!(value[0]["security"]["scripts"], "blocked");
@@ -1080,6 +1080,21 @@ mod tests {
         assert_eq!(value[6]["preview"], "pptxPages");
         assert_eq!(value[6]["thumbnail"], "pptxFirstPage");
         assert_eq!(value[6]["textExtraction"], "pptxText");
+
+        // 表格格式由同一张能力表驱动，命令层只透传，不包含业务规则。
+        assert_eq!(value[7]["id"], "csv");
+        assert_eq!(value[7]["importEnabled"], true);
+        assert_eq!(value[7]["validation"], "csvText");
+        assert_eq!(value[7]["preview"], "tablePaged");
+        assert_eq!(value[7]["textExtraction"], "tableText");
+        assert_eq!(value[7]["searchable"], true);
+        assert_eq!(value[8]["id"], "xlsx");
+        assert_eq!(value[8]["importEnabled"], true);
+        assert_eq!(value[8]["validation"], "xlsxPackage");
+        assert_eq!(value[8]["preview"], "tablePaged");
+        assert_eq!(value[8]["textExtraction"], "tableText");
+        assert_eq!(value[8]["security"]["macros"], "blocked");
+        assert_eq!(value[8]["security"]["remoteResources"], "blocked");
     }
 
     #[test]

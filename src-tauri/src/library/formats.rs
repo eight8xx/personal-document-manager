@@ -16,6 +16,8 @@ pub enum DocumentFormatId {
     Jpg,
     Png,
     Pptx,
+    Csv,
+    Xlsx,
 }
 
 impl DocumentFormatId {
@@ -28,6 +30,8 @@ impl DocumentFormatId {
             Self::Jpg => "jpg",
             Self::Png => "png",
             Self::Pptx => "pptx",
+            Self::Csv => "csv",
+            Self::Xlsx => "xlsx",
         }
     }
 
@@ -40,6 +44,8 @@ impl DocumentFormatId {
             "jpg" | "jpeg" => Some(Self::Jpg),
             "png" => Some(Self::Png),
             "pptx" => Some(Self::Pptx),
+            "csv" => Some(Self::Csv),
+            "xlsx" => Some(Self::Xlsx),
             _ => None,
         }
     }
@@ -54,6 +60,8 @@ pub enum ValidationStrategy {
     JpegSignature,
     PngSignature,
     PptxPackage,
+    CsvText,
+    XlsxPackage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +73,7 @@ pub enum PreviewStrategy {
     SafeMarkdown,
     LocalImage,
     PptxPages,
+    TablePaged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +93,7 @@ pub enum TextExtractionStrategy {
     PlainText,
     None,
     PptxText,
+    TableText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,7 +212,9 @@ mod tests {
                 .iter()
                 .map(|capability| capability.display_type.as_str())
                 .collect::<Vec<_>>(),
-            ["PDF", "DOCX", "TXT", "Markdown", "JPG", "PNG", "PPTX"]
+            [
+                "PDF", "DOCX", "TXT", "Markdown", "JPG", "PNG", "PPTX", "CSV", "XLSX"
+            ]
         );
 
         let mut extensions = HashSet::new();
@@ -234,7 +246,23 @@ mod tests {
         assert_eq!(pptx.preview, PreviewStrategy::PptxPages);
         assert_eq!(pptx.thumbnail, ThumbnailStrategy::PptxFirstPage);
         assert_eq!(pptx.text_extraction, TextExtractionStrategy::PptxText);
-        assert_eq!(importable_display_types().len(), 7);
+
+        let csv = capability_for_file_type("csv").unwrap();
+        assert_eq!(csv.id, DocumentFormatId::Csv);
+        assert_eq!(csv.validation, ValidationStrategy::CsvText);
+        assert_eq!(csv.preview, PreviewStrategy::TablePaged);
+        assert_eq!(csv.text_extraction, TextExtractionStrategy::TableText);
+        assert!(csv.searchable);
+
+        let xlsx = capability_for_path(Path::new("C:/Docs/账目.XLSX")).unwrap();
+        assert_eq!(xlsx.id, DocumentFormatId::Xlsx);
+        assert_eq!(xlsx.validation, ValidationStrategy::XlsxPackage);
+        assert_eq!(xlsx.preview, PreviewStrategy::TablePaged);
+        assert_eq!(xlsx.text_extraction, TextExtractionStrategy::TableText);
+
+        assert_eq!(importable_display_types().len(), 9);
         assert!(unsupported_message().contains("PPTX"));
+        assert!(unsupported_message().contains("CSV"));
+        assert!(unsupported_message().contains("XLSX"));
     }
 }
