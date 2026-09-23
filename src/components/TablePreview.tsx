@@ -72,6 +72,15 @@ export function TablePreview({ client, document, preview }: TablePreviewProps) {
   const hasSheetTabs = range.sheets.length > 1;
   const hasPrevious = startRow > 0;
   const hasNext = range.hasMoreRows;
+  /**
+   * 「下一页」的下一段起点：优先用后端给出的下一个含数据行（稀疏表可一次跳过去），
+   * 缺席（CSV 或没有更多数据）时退回固定页长顺序翻页。值不前进时同样退回页长，
+   * 避免畸形载荷让界面原地打转。
+   */
+  const nextStartRow =
+    range.nextDataRow !== undefined && range.nextDataRow > startRow
+      ? range.nextDataRow
+      : startRow + TABLE_PAGE_ROWS;
 
   async function loadRange(nextSheetIndex: number, nextStartRow: number) {
     const target = {
@@ -173,7 +182,7 @@ export function TablePreview({ client, document, preview }: TablePreviewProps) {
             className="icon-button compact"
             type="button"
             onClick={() =>
-              void loadRange(sheetIndex, startRow + TABLE_PAGE_ROWS)
+              void loadRange(sheetIndex, nextStartRow)
             }
             disabled={!hasNext || loading}
             aria-label="表格下一页"

@@ -132,6 +132,11 @@ export type DocumentPreview =
       columnCount: number;
       /** 是否还有更多行可读取。 */
       hasMoreRows: boolean;
+      /**
+       * 请求范围之后下一个含数据的行索引（0 基）；稀疏工作簿可以据此一次跳到数据行。
+       * 缺席表示没有更多数据，或来源行是连续的（CSV）不需要跳转。
+       */
+      nextDataRow?: number;
       degradedFeatures: string[];
       notice: string | null;
     }

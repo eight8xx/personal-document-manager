@@ -1153,6 +1153,10 @@ export class FakeBackendClient implements BackendClient {
       { length: visibleRows },
       (_, offset) => startRow + offset
     );
+    const hasMoreRows = startRow + visibleRows < totalRows;
+    // CSV 行是连续的，逐页顺序翻页即可；XLSX 给出下一段起点，稀疏表据此一次跳到数据行。
+    const nextDataRow =
+      capability.id !== "csv" && hasMoreRows ? startRow + visibleRows : undefined;
 
     return {
       kind: "table",
@@ -1162,7 +1166,9 @@ export class FakeBackendClient implements BackendClient {
       cells,
       rowNumbers,
       columnCount,
-      hasMoreRows: startRow + visibleRows < totalRows,
+      hasMoreRows,
+      // 与后端一致：没有更多数据（或 CSV）时省略该字段。
+      ...(nextDataRow === undefined ? {} : { nextDataRow }),
       degradedFeatures: [],
       notice: null
     };
