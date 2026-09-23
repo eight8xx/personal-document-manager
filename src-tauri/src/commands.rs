@@ -151,7 +151,7 @@ impl ReceiveDirectoryMonitor {
                     let Some(library) = library else {
                         continue;
                     };
-                    match run_receive_scan(&service, &library) {
+                    match run_receive_scan(&service, &library, false) {
                         Ok(results) if !results.is_empty() => on_scan(library, results),
                         Ok(_) => {}
                         Err(_) => continue,
@@ -219,9 +219,12 @@ pub(crate) fn drive_receive_import(
 }
 
 /// 补扫当前资料库已启用的接收来源；每一步都重新核对资料库身份。
+///
+/// `retry_failed` 为真（用户主动点「扫描」）时立即重试失败项；周期补扫传假，失败项走冷却时间。
 fn run_receive_scan(
     service: &Arc<Mutex<LibraryService>>,
     library: &LibrarySummary,
+    retry_failed: bool,
 ) -> LibraryResult<Vec<ReceiveSourceScanResult>> {
     let sources = {
         let service = service.lock().map_err(|_| LibraryError::StateLock)?;
@@ -241,7 +244,7 @@ fn run_receive_scan(
         let pending = {
             let service = service.lock().map_err(|_| LibraryError::StateLock)?;
             service.ensure_current_library(library)?;
-            service.receive_pending_files(&source.id)?
+            service.receive_pending_files(&source.id, retry_failed)?
         };
         if pending.is_empty() {
             continue;
@@ -1407,7 +1410,8 @@ pub async fn scan_receive_sources(
 ) -> Result<Vec<ReceiveSourceScanResult>, CommandError> {
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
-        run_receive_scan(&service, &library).map_err(CommandError::from)
+        // 用户主动触发：可以立即重试此前失败的项。
+        run_receive_scan(&service, &library, true).map_err(CommandError::from)
     })
     .await
     .map_err(|error| CommandError {
@@ -2873,7 +2877,7 @@ mod tests {
         let pending = {
             let mut service = state.service().unwrap();
             service.ensure_current_library(&library).unwrap();
-            service.receive_pending_files(&source_id).unwrap()
+            service.receive_pending_files(&source_id, true).unwrap()
         };
         assert!(pending.is_empty());
         let first = {

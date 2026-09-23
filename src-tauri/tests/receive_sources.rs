@@ -42,14 +42,21 @@ fn rule(name: &str, file_name_pattern: &str, collection_id: Option<String>, tag_
 }
 
 /// 模拟监视线程/命令层的补扫驱动：逐文件分步导入。
-fn scan_and_import(service: &mut LibraryService) -> Vec<ReceiveSourceScanResult> {
+///
+/// `retry_failed` 与命令层一致：周期补扫传 `false`（失败项走冷却），用户主动扫描传 `true`。
+fn scan_and_import_with(
+    service: &mut LibraryService,
+    retry_failed: bool,
+) -> Vec<ReceiveSourceScanResult> {
     let sources = service.list_receive_sources().unwrap();
     let mut results = Vec::new();
     for source in sources {
         if !source.enabled || source.path.is_none() || source.last_scanned_at.is_none() {
             continue;
         }
-        let pending = service.receive_pending_files(&source.id).unwrap();
+        let pending = service
+            .receive_pending_files(&source.id, retry_failed)
+            .unwrap();
         if pending.is_empty() {
             continue;
         }
@@ -63,6 +70,10 @@ fn scan_and_import(service: &mut LibraryService) -> Vec<ReceiveSourceScanResult>
         results.push(service.finish_receive_import_batch(&batch_id).unwrap());
     }
     results
+}
+
+fn scan_and_import(service: &mut LibraryService) -> Vec<ReceiveSourceScanResult> {
+    scan_and_import_with(service, false)
 }
 
 /// 首次启用来源：确认目录 → 列出清单 → 跳过未选项 → 导入所选项。
