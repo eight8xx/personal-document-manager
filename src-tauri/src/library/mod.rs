@@ -5,6 +5,7 @@ mod models;
 mod ooxml;
 mod pdf_security;
 mod service;
+pub mod table;
 mod thumbnail;
 
 pub use error::{LibraryError, LibraryResult};
