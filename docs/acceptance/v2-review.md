@@ -33,7 +33,7 @@
 - **M1 CSV 导入校验的内存峰值**：`validate_file_content` 的预检已由 `861f7a2` 纳入 `CsvText`（超限在导入阶段即拒绝），但 `validate_table_file` 仍对允许范围内的文件整份 `fs::read`，`decode_csv_text` 再复制一份 `String`，峰值约为文件大小的 2 倍。**部分闭合**。
 - **M2 CSV 索引期解析产物不在预算内**：`861f7a2`/`b8c5268` 已让 XLSX/CSV 索引路径共享单元格预算，但 `parse_csv_rows(&text, None, usize::MAX)` 的整表物化与 `bound_extracted_text` 的截断时机仍需复核。**部分闭合**。
 - **M3 接收来源变化待决项在界面上无路可走**：日志没有 `item_id`，前端无法调用 `resolveImportItem`，`pendingCount` 永不清零，用户无法按 PRD 25/34 选择「新建/替换」。**未修**。
-- **M4 中断恢复对单个文件操作失败是致命的**：`documents/<id>/` 下一个被占用的残留就让 `open_library` 整体失败，而不是「那一份文档恢复失败、其余照常」；同文件已有 `RecoveryFailure` 机制但只有哈希不匹配会走到。**未修**。
+- **M4 中断恢复对单个文件操作失败是致命的**：已修复（`6884507`）。实测确认：用 `share_mode(0)` 锁住 `documents/<id>/.leftover.previous` 后 `open_library` 返回 `Err(Io(os error 32))`，用户打不开自己的资料库。修法为逐文档隔离 + 按错误类型分流（只有 `Database`/`Json` 继续整体失败），并区分「清理失败」（吞掉、文档保持可用、下次打开重试）与「恢复失败」（走 `error_stage="recovery"` 让用户看见）。新增 `reconcile_isolation.rs` 3 个用例；修复者做了非空洞验证（把实现 stash 回修复前后该用例 FAILED）。可见性采用零契约变更的第 1 档：残留删不掉时界面不提示，已记入已知边界。
 
 ## 低（已记录）
 
