@@ -1,13 +1,23 @@
 import {
   FolderOpen,
+  ListFilter,
   LoaderCircle,
   RotateCcw,
   Settings,
+  SlidersHorizontal,
   X
 } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import type { LibrarySummary, RecentLibrary } from "../backend/types";
+import type {
+  BackendClient,
+  CollectionSummary,
+  LibrarySummary,
+  RecentLibrary,
+  TagSummary
+} from "../backend/types";
+import { ClassificationRulesPanel } from "./ClassificationRules";
+import { ReceiveDirectoryPanel } from "./ReceiveDirectory";
 
 interface SettingsDialogProps {
   library: LibrarySummary;
@@ -17,7 +27,13 @@ interface SettingsDialogProps {
   onOpenDirectory: () => void;
   onOpenLibrary: (path: string) => void;
   onForgetLibrary: (path: string) => void;
+  /** 分类规则与接收目录需要访问后端；缺省时不渲染这两个面板。 */
+  client?: BackendClient;
+  collections?: CollectionSummary[];
+  tags?: TagSummary[];
 }
+
+type SettingsSection = "library" | "rules" | "receive";
 
 export function SettingsDialog({
   library,
@@ -26,10 +42,14 @@ export function SettingsDialog({
   onClose,
   onOpenDirectory,
   onOpenLibrary,
-  onForgetLibrary
+  onForgetLibrary,
+  client,
+  collections = [],
+  tags = []
 }: SettingsDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const [section, setSection] = useState<SettingsSection>("library");
 
   useEffect(() => {
     closeButtonRef.current?.focus();
@@ -98,6 +118,61 @@ export function SettingsDialog({
           </button>
         </header>
 
+        <div className="settings-tabs" role="tablist" aria-label="设置分类">
+          <button
+            className="button quiet"
+            type="button"
+            role="tab"
+            aria-selected={section === "library"}
+            onClick={() => setSection("library")}
+          >
+            <Settings size={16} aria-hidden="true" />
+            资料库
+          </button>
+          {client ? (
+            <button
+              className="button quiet"
+              type="button"
+              role="tab"
+              aria-selected={section === "rules"}
+              onClick={() => setSection("rules")}
+            >
+              <SlidersHorizontal size={16} aria-hidden="true" />
+              分类规则
+            </button>
+          ) : null}
+          {client ? (
+            <button
+              className="button quiet"
+              type="button"
+              role="tab"
+              aria-selected={section === "receive"}
+              onClick={() => setSection("receive")}
+            >
+              <ListFilter size={16} aria-hidden="true" />
+              接收目录
+            </button>
+          ) : null}
+        </div>
+
+        {client && section === "rules" ? (
+          <div className="settings-section settings-panel-section" role="tabpanel">
+            <ClassificationRulesPanel
+              client={client}
+              collections={collections}
+              tags={tags}
+            />
+          </div>
+        ) : null}
+
+        {client && section === "receive" ? (
+          <div className="settings-section settings-panel-section" role="tabpanel">
+            <ReceiveDirectoryPanel client={client} />
+          </div>
+        ) : null}
+
+        {section !== "library" ? null : (
+          <>
         <div className="settings-section">
           <div className="section-title-row">
             <Settings size={18} aria-hidden="true" />
@@ -178,6 +253,8 @@ export function SettingsDialog({
             移出最近使用列表不会删除磁盘上的资料库文件。
           </p>
         </div>
+          </>
+        )}
       </section>
     </div>
   );

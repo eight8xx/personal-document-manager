@@ -3261,6 +3261,28 @@ p {
   border-bottom: 0;
 }
 
+.settings-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.settings-tabs button[aria-selected="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 规则与接收目录面板自带分区标题，这里只保证滚动区内不重复加边框。 */
+.settings-panel-section {
+  max-height: 60vh;
+  overflow: auto;
+  border-bottom: 0;
+}
+
 .section-title-row {
   display: flex;
   align-items: center;

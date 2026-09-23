@@ -131,8 +131,90 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
-  it("exposes the empty state and settings library controls", async () => {
+  it("opens the classification rules and receive directory panels from settings", async () => {
     const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap: bootstrapWithLibrary([
+        {
+          path: currentLibrary.path,
+          name: currentLibrary.name,
+          lastOpenedAt: "2026-09-13T08:00:00Z",
+          isAvailable: true
+        }
+      ]),
+      collections: [
+        {
+          id: "inbox",
+          name: "收件箱",
+          parentId: null,
+          isInbox: true,
+          documentCount: 0
+        },
+        {
+          id: "finance",
+          name: "财务",
+          parentId: null,
+          isInbox: false,
+          documentCount: 0
+        }
+      ],
+      tags: [{ id: "tag-1", name: "发票", documentCount: 0 }],
+      classificationRules: {
+        [`${currentLibrary.id}:${currentLibrary.path}`]: [
+          {
+            id: "rule-1",
+            name: "发票归档",
+            enabled: true,
+            position: 1,
+            fileNamePattern: "发票",
+            fileType: null,
+            sourceDirectory: null,
+            collectionId: "finance",
+            tagIds: ["tag-1"]
+          }
+        ]
+      },
+      receiveSources: {
+        [`${currentLibrary.id}:${currentLibrary.path}`]: [
+          {
+            id: "source-1",
+            kind: "qq",
+            displayName: "QQ",
+            path: "C:\\QQ\\Files",
+            enabled: true,
+            status: "ready",
+            statusMessage: null,
+            pendingCount: 0,
+            lastScannedAt: null
+          }
+        ]
+      }
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    await user.click(screen.getByRole("button", { name: "设置" }));
+
+    const dialog = screen.getByRole("dialog", { name: "资料库" });
+
+    // 分类规则面板：显示已保存的规则及其目标集合。
+    await user.click(within(dialog).getByRole("tab", { name: "分类规则" }));
+    expect(client.calls).toContain("listClassificationRules");
+    expect(await within(dialog).findByText("发票归档")).toBeInTheDocument();
+    expect(await within(dialog).findByText(/财务/)).toBeInTheDocument();
+
+    // 接收目录面板：QQ 来源与已确认路径可见。
+    await user.click(within(dialog).getByRole("tab", { name: "接收目录" }));
+    expect(await within(dialog).findByText("QQ")).toBeInTheDocument();
+    expect(within(dialog).getByText("C:\\QQ\\Files")).toBeInTheDocument();
+
+    // 回到资料库页签时不应残留其它面板。
+    await user.click(within(dialog).getByRole("tab", { name: "资料库" }));
+    expect(within(dialog).queryByText("发票归档")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("C:\\QQ\\Files")).not.toBeInTheDocument();
+  });
+
+  it("exposes the empty state and settings library controls", async () => {    const user = userEvent.setup();
     const otherLibrary = {
       path: "D:\\Archive",
       name: "归档",

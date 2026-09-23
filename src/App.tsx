@@ -6,8 +6,10 @@ import { toBackendError } from "./backend/error";
 import { LibraryContext } from "./backend/libraryContext";
 import type {
   BackendClient,
+  CollectionSummary,
   LibrarySummary,
-  RecentLibrary
+  RecentLibrary,
+  TagSummary
 } from "./backend/types";
 import { LibraryWizard } from "./components/LibraryWizard";
 import { LibraryWorkspace } from "./components/LibraryWorkspace";
@@ -49,6 +51,10 @@ export function App({ client = tauriBackendClient }: AppProps) {
   const [showImportRestartNotice, setShowImportRestartNotice] = useState(false);
   const [recentLibraries, setRecentLibraries] = useState<RecentLibrary[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsCollections, setSettingsCollections] = useState<
+    CollectionSummary[]
+  >([]);
+  const [settingsTags, setSettingsTags] = useState<TagSummary[]>([]);
   const [error, setError] = useState("");
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const settingsTriggerRef = useRef<HTMLElement | null>(null);
@@ -82,6 +88,29 @@ export function App({ client = tauriBackendClient }: AppProps) {
     }
     setSettingsOpen(true);
   }, []);
+
+  // 分类规则编辑器需要集合与标签作为选项；打开设置时按当前资料库加载。
+  useEffect(() => {
+    if (!settingsOpen || !library) {
+      return;
+    }
+    let active = true;
+    void Promise.all([client.listCollections(), client.listTags()])
+      .then(([collections, tags]) => {
+        if (active) {
+          setSettingsCollections(collections);
+          setSettingsTags(tags);
+        }
+      })
+      .catch((caught) => {
+        if (active) {
+          setError(toBackendError(caught).message);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [settingsOpen, library, client]);
 
   const closeSettings = useCallback(() => {
     setSettingsOpen(false);
@@ -218,15 +247,21 @@ export function App({ client = tauriBackendClient }: AppProps) {
             />
           </LibraryContext.Provider>
           {settingsOpen ? (
-            <SettingsDialog
-              library={library}
-              recentLibraries={recentLibraries}
-              busyPath={busyPath}
-              onClose={closeSettings}
-              onOpenDirectory={() => void openDirectory()}
-              onOpenLibrary={(path) => void openLibrary(path)}
-              onForgetLibrary={(path) => void forgetLibrary(path)}
-            />
+            // 设置里的分类规则与接收目录面板需要资料库上下文，必须在 Provider 内。
+            <LibraryContext.Provider value={library}>
+              <SettingsDialog
+                library={library}
+                recentLibraries={recentLibraries}
+                busyPath={busyPath}
+                client={client}
+                collections={settingsCollections}
+                tags={settingsTags}
+                onClose={closeSettings}
+                onOpenDirectory={() => void openDirectory()}
+                onOpenLibrary={(path) => void openLibrary(path)}
+                onForgetLibrary={(path) => void forgetLibrary(path)}
+              />
+            </LibraryContext.Provider>
           ) : null}
         </>
       ) : (
