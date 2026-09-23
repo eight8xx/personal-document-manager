@@ -7,8 +7,9 @@ import {
   RotateCcw,
   Trash2
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
+  KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   UIEvent
@@ -34,59 +35,303 @@ export interface StatusPresentation {
   tone: "neutral" | "success" | "warning" | "danger";
 }
 
-const INITIAL_RENDERED_DOCUMENTS = 200;
-const DOCUMENT_RENDER_BATCH = 200;
-const REVEAL_THRESHOLD_PX = 600;
+const LIST_ROW_HEIGHT = 72;
+const LIST_HEADER_HEIGHT = 38;
+const GRID_CARD_HEIGHT = 236;
+const GRID_GAP = 12;
+const GRID_ROW_HEIGHT = GRID_CARD_HEIGHT + GRID_GAP;
+const GRID_MIN_CARD_WIDTH = 190;
+const GRID_HORIZONTAL_PADDING = 32;
+const GRID_VERTICAL_PADDING = 16;
+const WINDOW_OVERSCAN_ROWS = 5;
+const FALLBACK_VIEWPORT_HEIGHT = 720;
+const FALLBACK_GRID_WIDTH = 900;
 
-function useIncrementalDocuments(
-  documents: DocumentSummary[],
-  highlightedDocumentId: string | null
-) {
-  const [renderedCount, setRenderedCount] = useState(() =>
-    Math.min(documents.length, INITIAL_RENDERED_DOCUMENTS)
+type ResultView = "list" | "grid";
+
+function gridColumns(width: number) {
+  const availableWidth = Math.max(0, width - GRID_HORIZONTAL_PADDING);
+  return Math.max(
+    1,
+    Math.floor(
+      (availableWidth + GRID_GAP) / (GRID_MIN_CARD_WIDTH + GRID_GAP)
+    )
   );
-  const resetKey = `${documents.length}:${documents[0]?.id ?? ""}:${
-    documents.at(-1)?.id ?? ""
-  }`;
-
-  useEffect(() => {
-    setRenderedCount(Math.min(documents.length, INITIAL_RENDERED_DOCUMENTS));
-  }, [documents.length, resetKey]);
-
-  useEffect(() => {
-    if (!highlightedDocumentId) {
-      return;
-    }
-    const highlightedIndex = documents.findIndex(
-      (document) => document.id === highlightedDocumentId
-    );
-    if (highlightedIndex >= renderedCount) {
-      setRenderedCount(
-        Math.min(documents.length, highlightedIndex + 1)
-      );
-    }
-  }, [documents, highlightedDocumentId, renderedCount]);
-
-  return {
-    visibleDocuments: documents.slice(0, renderedCount),
-    revealMore() {
-      setRenderedCount((current) =>
-        Math.min(documents.length, current + DOCUMENT_RENDER_BATCH)
-      );
-    }
-  };
 }
 
-function revealMoreOnApproach(
-  event: UIEvent<HTMLElement>,
-  revealMore: () => void
+function useVirtualDocuments(
+  documents: DocumentSummary[],
+  highlightedDocumentId: string | null,
+  view: ResultView
 ) {
-  const element = event.currentTarget;
-  const distanceToBottom =
-    element.scrollHeight - element.scrollTop - element.clientHeight;
-  if (distanceToBottom <= REVEAL_THRESHOLD_PX) {
-    revealMore();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pendingFocusIndex = useRef<number | null>(null);
+  const lastPositionedHighlight = useRef<string | null>(null);
+  const [viewport, setViewport] = useState({
+    width: FALLBACK_GRID_WIDTH,
+    height: FALLBACK_VIEWPORT_HEIGHT,
+    scrollTop: 0
+  });
+  const viewportRef = useRef(viewport);
+  function updateViewport(next: typeof viewport) {
+    viewportRef.current = next;
+    setViewport(next);
   }
+  const documentOrder = useMemo(
+    () => documents.map((document) => document.id).join("\u0000"),
+    [documents]
+  );
+  const columns = view === "grid" ? gridColumns(viewport.width) : 1;
+  const rowHeight = view === "grid" ? GRID_ROW_HEIGHT : LIST_ROW_HEIGHT;
+  const leadingOffset =
+    view === "grid" ? GRID_VERTICAL_PADDING : LIST_HEADER_HEIGHT;
+  const trailingOffset = view === "grid" ? GRID_VERTICAL_PADDING : 0;
+  const rowCount = Math.ceil(documents.length / columns);
+  const totalHeight = Math.max(
+    0,
+    rowCount * rowHeight - (view === "grid" && rowCount > 0 ? GRID_GAP : 0)
+  );
+  const maxScrollTop = Math.max(
+    0,
+    leadingOffset + totalHeight + trailingOffset - viewport.height
+  );
+  const scrollTop = Math.min(viewport.scrollTop, maxScrollTop);
+  const firstRow = Math.max(
+    0,
+    Math.floor(Math.max(0, scrollTop - leadingOffset) / rowHeight) -
+      WINDOW_OVERSCAN_ROWS
+  );
+  const afterLastRow = Math.min(
+    rowCount,
+    Math.ceil((scrollTop + viewport.height - leadingOffset) / rowHeight) +
+      WINDOW_OVERSCAN_ROWS
+  );
+  const firstIndex = firstRow * columns;
+  const afterLastIndex = Math.min(documents.length, afterLastRow * columns);
+
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    const measure = () => {
+      const width = element.clientWidth || FALLBACK_GRID_WIDTH;
+      const height = element.clientHeight || FALLBACK_VIEWPORT_HEIGHT;
+      const current = viewportRef.current;
+      const oldColumns = view === "grid" ? gridColumns(current.width) : 1;
+      const newColumns = view === "grid" ? gridColumns(width) : 1;
+      const firstVisibleIndex =
+        Math.floor(
+          Math.max(0, current.scrollTop - leadingOffset) / rowHeight
+        ) * oldColumns;
+      const nextScrollTop =
+        oldColumns === newColumns
+          ? element.scrollTop
+          : current.scrollTop === 0
+            ? 0
+            : leadingOffset +
+              Math.floor(firstVisibleIndex / newColumns) * rowHeight;
+      if (oldColumns !== newColumns) {
+        element.scrollTop = nextScrollTop;
+      }
+      if (
+        current.width !== width ||
+        current.height !== height ||
+        current.scrollTop !== nextScrollTop
+      ) {
+        updateViewport({ width, height, scrollTop: nextScrollTop });
+      }
+    };
+    measure();
+    const observer =
+      typeof ResizeObserver === "function" ? new ResizeObserver(measure) : null;
+    observer?.observe(element);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [leadingOffset, rowHeight, view]);
+
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (element) {
+      element.scrollTop = 0;
+    }
+    const current = viewportRef.current;
+    if (current.scrollTop !== 0) {
+      updateViewport({ ...current, scrollTop: 0 });
+    }
+  }, [documentOrder]);
+
+  useLayoutEffect(() => {
+    if (!highlightedDocumentId) {
+      lastPositionedHighlight.current = null;
+      return;
+    }
+    if (lastPositionedHighlight.current === highlightedDocumentId) {
+      return;
+    }
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    const index = documents.findIndex(
+      (document) => document.id === highlightedDocumentId
+    );
+    if (index < 0) {
+      return;
+    }
+    lastPositionedHighlight.current = highlightedDocumentId;
+    const targetTop =
+      leadingOffset + Math.floor(index / columns) * rowHeight;
+    const currentTop = element.scrollTop;
+    if (
+      targetTop >= currentTop &&
+      targetTop + rowHeight <= currentTop + viewport.height
+    ) {
+      return;
+    }
+    const nextTop = Math.max(0, targetTop - Math.floor(viewport.height / 2));
+    element.scrollTop = nextTop;
+    updateViewport({ ...viewportRef.current, scrollTop: nextTop });
+  }, [columns, documentOrder, highlightedDocumentId, leadingOffset, rowHeight, viewport.height]);
+
+  useLayoutEffect(() => {
+    const index = pendingFocusIndex.current;
+    if (index === null) {
+      return;
+    }
+    const button = scrollRef.current?.querySelector<HTMLButtonElement>(
+      `[data-result-index="${index}"] .${view === "grid" ? "document-grid-select" : "document-select"}`
+    );
+    if (button) {
+      button.focus({ preventScroll: true });
+      pendingFocusIndex.current = null;
+    }
+  }, [afterLastIndex, firstIndex, view]);
+
+  function onScroll(event: UIEvent<HTMLDivElement>) {
+    const element = event.currentTarget;
+    const active = document.activeElement;
+    const activeRow =
+      active instanceof HTMLElement
+        ? active.closest<HTMLElement>("[data-result-index]")
+        : null;
+    if (activeRow && element.contains(activeRow)) {
+      const activeIndex = Number(activeRow.dataset.resultIndex);
+      const nextFirstRow = Math.max(
+        0,
+        Math.floor(
+          Math.max(0, element.scrollTop - leadingOffset) / rowHeight
+        ) - WINDOW_OVERSCAN_ROWS
+      );
+      const nextLastRow = Math.min(
+        rowCount,
+        Math.ceil(
+          (element.scrollTop + viewport.height - leadingOffset) / rowHeight
+        ) +
+          WINDOW_OVERSCAN_ROWS
+      );
+      if (
+        activeIndex < nextFirstRow * columns ||
+        activeIndex >= nextLastRow * columns
+      ) {
+        element.focus({ preventScroll: true });
+      }
+    }
+    if (viewportRef.current.scrollTop !== element.scrollTop) {
+      updateViewport({ ...viewportRef.current, scrollTop: element.scrollTop });
+    }
+  }
+
+  function onKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const target = event.target;
+    if (
+      target !== event.currentTarget &&
+      !(target instanceof HTMLElement &&
+        target.matches(".document-select, .document-grid-select"))
+    ) {
+      return;
+    }
+    const item =
+      target instanceof HTMLElement
+        ? target.closest<HTMLElement>("[data-result-index]")
+        : null;
+    const firstVisibleIndex =
+      Math.floor(Math.max(0, scrollTop - leadingOffset) / rowHeight) *
+      columns;
+    const currentIndex = item
+      ? Number(item.dataset.resultIndex)
+      : Math.min(documents.length - 1, firstVisibleIndex);
+    const pageRows = Math.max(1, Math.floor(viewport.height / rowHeight));
+    let nextIndex: number;
+    switch (event.key) {
+      case "ArrowDown":
+        nextIndex = currentIndex + columns;
+        break;
+      case "ArrowUp":
+        nextIndex = currentIndex - columns;
+        break;
+      case "ArrowRight":
+        if (view !== "grid") return;
+        nextIndex = currentIndex + 1;
+        break;
+      case "ArrowLeft":
+        if (view !== "grid") return;
+        nextIndex = currentIndex - 1;
+        break;
+      case "PageDown":
+        nextIndex = currentIndex + pageRows * columns;
+        break;
+      case "PageUp":
+        nextIndex = currentIndex - pageRows * columns;
+        break;
+      case "Home":
+        nextIndex = 0;
+        break;
+      case "End":
+        nextIndex = documents.length - 1;
+        break;
+      default:
+        return;
+    }
+    if (documents.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    const index = Math.max(0, Math.min(documents.length - 1, nextIndex));
+    pendingFocusIndex.current = index;
+    const targetRow = Math.floor(index / columns);
+    const targetTop = leadingOffset + targetRow * rowHeight;
+    let nextTop = scrollTop;
+    if (targetTop < scrollTop || targetTop + rowHeight > scrollTop + viewport.height) {
+      nextTop = Math.max(0, targetTop - Math.floor(viewport.height / 2));
+    }
+    const element = scrollRef.current;
+    if (element) {
+      element.scrollTop = nextTop;
+      const button = element.querySelector<HTMLButtonElement>(
+        `[data-result-index="${index}"] .${view === "grid" ? "document-grid-select" : "document-select"}`
+      );
+      if (button) {
+        button.focus({ preventScroll: true });
+        pendingFocusIndex.current = null;
+      }
+    }
+    updateViewport({ ...viewportRef.current, scrollTop: nextTop });
+  }
+
+  return {
+    scrollRef,
+    onScroll,
+    onKeyDown,
+    columns,
+    firstIndex,
+    afterLastIndex,
+    topOffset: firstRow * rowHeight,
+    totalHeight
+  };
 }
 
 interface DocumentResultsProps {
@@ -258,6 +503,7 @@ function DocumentTags({
 
 function DocumentRow({
   document,
+  resultIndex,
   collections,
   selected,
   dragging,
@@ -273,6 +519,7 @@ function DocumentRow({
   onRetryIndex
 }: {
   document: DocumentSummary;
+  resultIndex: number;
   collections: CollectionSummary[];
   selected: boolean;
   dragging: boolean;
@@ -298,10 +545,12 @@ function DocumentRow({
   return (
     <article
       id={`document-row-${document.id}`}
+      data-result-index={resultIndex}
       className={`document-row collection-aware${selected ? " selected" : ""}${
         highlighted ? " highlighted" : ""
       }${dragging ? " dragging" : ""}`}
       role="row"
+      aria-rowindex={resultIndex + 2}
       aria-current={highlighted ? "true" : undefined}
     >
       <div className="document-title-cell" role="cell">
@@ -429,23 +678,28 @@ export function DocumentList({
   onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps) {
-  const { visibleDocuments, revealMore } = useIncrementalDocuments(
+  const virtual = useVirtualDocuments(
     documents,
-    highlightedDocumentId
+    highlightedDocumentId,
+    "list"
   );
-  const searchResultsById = new Map(
-    searchResults.map((result) => [result.document.id, result])
+  const searchResultsById = useMemo(
+    () => new Map(searchResults.map((result) => [result.document.id, result])),
+    [searchResults]
   );
 
   return (
     <main className="document-area" aria-label="文档列表">
       <div
         className="document-list-scroll"
+        ref={virtual.scrollRef}
         role="table"
         aria-label="文档结果"
         aria-rowcount={documents.length + 1}
         aria-colcount={7}
-        onScroll={(event) => revealMoreOnApproach(event, revealMore)}
+        tabIndex={0}
+        onScroll={virtual.onScroll}
+        onKeyDown={virtual.onKeyDown}
       >
         <div
           className="document-list-header collection-aware"
@@ -462,29 +716,48 @@ export function DocumentList({
           </span>
         </div>
         <div className="document-list" role="rowgroup">
-          {visibleDocuments.map((document) => (
-            <DocumentRow
-              key={document.id}
-              document={document}
-              collections={collections}
-              selected={selectedDocumentIds.has(document.id)}
-              dragging={draggingDocumentIds.has(document.id)}
-              selectionDisabled={selectionDisabled}
-              highlighted={document.id === highlightedDocumentId}
-              searchResult={searchResultsById.get(document.id) ?? null}
-              retryingIndex={retryingIndexIds.has(document.id)}
-              onSelect={(event) => onSelectDocument(document.id, event)}
-              onStartDocumentDrag={(event) =>
-                onStartDocumentDrag(document, event)
-              }
-              onMove={(collectionId) =>
-                onMoveDocument(document, collectionId)
-              }
-              onEdit={() => onEditDocument(document)}
-              onMoveToTrash={() => onMoveDocumentToTrash(document)}
-              onRetryIndex={() => onRetryIndex(document)}
-            />
-          ))}
+          <div
+            role="presentation"
+            aria-hidden="true"
+            style={{ height: virtual.topOffset }}
+          />
+          {documents
+            .slice(virtual.firstIndex, virtual.afterLastIndex)
+            .map((document, windowIndex) => (
+              <DocumentRow
+                key={document.id}
+                document={document}
+                resultIndex={virtual.firstIndex + windowIndex}
+                collections={collections}
+                selected={selectedDocumentIds.has(document.id)}
+                dragging={draggingDocumentIds.has(document.id)}
+                selectionDisabled={selectionDisabled}
+                highlighted={document.id === highlightedDocumentId}
+                searchResult={searchResultsById.get(document.id) ?? null}
+                retryingIndex={retryingIndexIds.has(document.id)}
+                onSelect={(event) => onSelectDocument(document.id, event)}
+                onStartDocumentDrag={(event) =>
+                  onStartDocumentDrag(document, event)
+                }
+                onMove={(collectionId) =>
+                  onMoveDocument(document, collectionId)
+                }
+                onEdit={() => onEditDocument(document)}
+                onMoveToTrash={() => onMoveDocumentToTrash(document)}
+                onRetryIndex={() => onRetryIndex(document)}
+              />
+            ))}
+          <div
+            role="presentation"
+            aria-hidden="true"
+            style={{
+              height:
+                virtual.totalHeight -
+                virtual.topOffset -
+                (virtual.afterLastIndex - virtual.firstIndex) *
+                  LIST_ROW_HEIGHT
+            }}
+          />
         </div>
       </div>
     </main>
@@ -507,116 +780,142 @@ export function DocumentGrid({
   onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentResultsProps & { client: BackendClient }) {
-  const { visibleDocuments, revealMore } = useIncrementalDocuments(
+  const virtual = useVirtualDocuments(
     documents,
-    highlightedDocumentId
+    highlightedDocumentId,
+    "grid"
   );
-  const searchResultsById = new Map(
-    searchResults.map((result) => [result.document.id, result])
+  const searchResultsById = useMemo(
+    () => new Map(searchResults.map((result) => [result.document.id, result])),
+    [searchResults]
   );
-  const collectionsById = new Map(
-    collections.map((collection) => [collection.id, collection])
+  const collectionsById = useMemo(
+    () => new Map(collections.map((collection) => [collection.id, collection])),
+    [collections]
   );
 
   return (
     <main className="document-area" aria-label="文档网格">
       <div
         className="document-grid"
+        ref={virtual.scrollRef}
         role="list"
         aria-label="文档结果"
-        onScroll={(event) => revealMoreOnApproach(event, revealMore)}
+        tabIndex={0}
+        onScroll={virtual.onScroll}
+        onKeyDown={virtual.onKeyDown}
+        style={{ display: "block" }}
       >
-        {visibleDocuments.map((document) => {
-          const status = documentStatusPresentation(document);
-          const collection = collectionsById.get(document.collectionId);
-          const selected = selectedDocumentIds.has(document.id);
-          const highlighted = document.id === highlightedDocumentId;
-          const searchResult =
-            searchResultsById.get(document.id) ?? null;
-          const resultCopy =
-            searchResult?.snippet && searchResult.matchKind === "content"
-              ? searchResult.snippet
-              : document.fileName;
+        <div style={{ height: virtual.totalHeight, position: "relative" }}>
+          <div
+            style={{
+              position: "absolute",
+              top: virtual.topOffset,
+              left: 0,
+              right: 0,
+              display: "grid",
+              gridTemplateColumns: `repeat(${virtual.columns}, minmax(0, 1fr))`,
+              gap: GRID_GAP
+            }}
+          >
+            {documents
+              .slice(virtual.firstIndex, virtual.afterLastIndex)
+              .map((document, windowIndex) => {
+                const status = documentStatusPresentation(document);
+                const collection = collectionsById.get(document.collectionId);
+                const selected = selectedDocumentIds.has(document.id);
+                const highlighted = document.id === highlightedDocumentId;
+                const searchResult =
+                  searchResultsById.get(document.id) ?? null;
+                const resultCopy =
+                  searchResult?.snippet && searchResult.matchKind === "content"
+                    ? searchResult.snippet
+                    : document.fileName;
 
-          return (
-            <article
-              id={`document-card-${document.id}`}
-              className={`document-grid-item${selected ? " selected" : ""}${
-                highlighted ? " highlighted" : ""
-              }${
-                draggingDocumentIds.has(document.id) ? " dragging" : ""
-              }`}
-              role="listitem"
-              aria-current={highlighted ? "true" : undefined}
-              key={document.id}
-            >
-              <button
-                className="document-grid-select"
-                type="button"
-                onClick={(event) => onSelectDocument(document.id, event)}
-                onPointerDown={(event) =>
-                  onStartDocumentDrag(document, event)
-                }
-                disabled={selectionDisabled}
-                aria-pressed={selected}
-                aria-label={`选择文档 ${document.title}`}
-              >
-                <span className="document-grid-visual" aria-hidden="true">
-                  <DocumentThumbnailVisual
-                    client={client}
-                    document={document}
-                  />
-                  <span>{document.fileType}</span>
-                </span>
-                <strong title={document.title}>{document.title}</strong>
-                <span className="document-grid-file" title={resultCopy}>
-                  {resultCopy}
-                </span>
-                <span className="document-grid-metadata">
-                  <span title={document.documentDate ?? "未设置"}>
-                    {document.documentDate ?? "未设置"}
-                  </span>
-                  <span title={collection?.name ?? "未知集合"}>
-                    {collection?.name ?? "未知集合"}
-                  </span>
-                </span>
-                <DocumentTags document={document} compact />
-                <span className={`status-badge ${status.tone}`}>
-                  {status.label}
-                </span>
-              </button>
-              {document.indexStatus === "failed" ? (
-                <button
-                  className="icon-button compact grid-retry-index"
-                  type="button"
-                  onClick={() => onRetryIndex(document)}
-                  disabled={retryingIndexIds.has(document.id)}
-                  aria-label={`重试索引 ${document.title}`}
-                  title="重试索引"
-                >
-                  {retryingIndexIds.has(document.id) ? (
-                    <LoaderCircle
-                      className="spin"
-                      size={14}
-                      aria-hidden="true"
-                    />
-                  ) : (
-                    <RotateCcw size={14} aria-hidden="true" />
-                  )}
-                </button>
-              ) : null}
-              <button
-                className="icon-button compact grid-move-to-trash"
-                type="button"
-                onClick={() => onMoveDocumentToTrash(document)}
-                aria-label={`将 ${document.title} 移入回收站`}
-                title="移入回收站"
-              >
-                <Trash2 size={14} aria-hidden="true" />
-              </button>
-            </article>
-          );
-        })}
+                return (
+                  <article
+                    id={`document-card-${document.id}`}
+                    data-result-index={virtual.firstIndex + windowIndex}
+                    className={`document-grid-item${selected ? " selected" : ""}${
+                      highlighted ? " highlighted" : ""
+                    }${
+                      draggingDocumentIds.has(document.id) ? " dragging" : ""
+                    }`}
+                    role="listitem"
+                    aria-setsize={documents.length}
+                    aria-posinset={virtual.firstIndex + windowIndex + 1}
+                    aria-current={highlighted ? "true" : undefined}
+                    key={document.id}
+                  >
+                    <button
+                      className="document-grid-select"
+                      type="button"
+                      onClick={(event) => onSelectDocument(document.id, event)}
+                      onPointerDown={(event) =>
+                        onStartDocumentDrag(document, event)
+                      }
+                      disabled={selectionDisabled}
+                      aria-pressed={selected}
+                      aria-label={`选择文档 ${document.title}`}
+                    >
+                      <span className="document-grid-visual" aria-hidden="true">
+                        <DocumentThumbnailVisual
+                          client={client}
+                          document={document}
+                        />
+                        <span>{document.fileType}</span>
+                      </span>
+                      <strong title={document.title}>{document.title}</strong>
+                      <span className="document-grid-file" title={resultCopy}>
+                        {resultCopy}
+                      </span>
+                      <span className="document-grid-metadata">
+                        <span title={document.documentDate ?? "未设置"}>
+                          {document.documentDate ?? "未设置"}
+                        </span>
+                        <span title={collection?.name ?? "未知集合"}>
+                          {collection?.name ?? "未知集合"}
+                        </span>
+                      </span>
+                      <DocumentTags document={document} compact />
+                      <span className={`status-badge ${status.tone}`}>
+                        {status.label}
+                      </span>
+                    </button>
+                    {document.indexStatus === "failed" ? (
+                      <button
+                        className="icon-button compact grid-retry-index"
+                        type="button"
+                        onClick={() => onRetryIndex(document)}
+                        disabled={retryingIndexIds.has(document.id)}
+                        aria-label={`重试索引 ${document.title}`}
+                        title="重试索引"
+                      >
+                        {retryingIndexIds.has(document.id) ? (
+                          <LoaderCircle
+                            className="spin"
+                            size={14}
+                            aria-hidden="true"
+                          />
+                        ) : (
+                          <RotateCcw size={14} aria-hidden="true" />
+                        )}
+                      </button>
+                    ) : null}
+                    <button
+                      className="icon-button compact grid-move-to-trash"
+                      type="button"
+                      onClick={() => onMoveDocumentToTrash(document)}
+                      aria-label={`将 ${document.title} 移入回收站`}
+                      title="移入回收站"
+                    >
+                      <Trash2 size={14} aria-hidden="true" />
+                    </button>
+                  </article>
+                );
+              })}
+          </div>
+        </div>
       </div>
     </main>
   );
