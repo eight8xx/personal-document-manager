@@ -111,6 +111,7 @@ export const tauriBackendClient: BackendClient = {
       paths,
       targetCollectionId,
       source,
+      // 未传时键为 undefined，序列化时被丢弃，后端按「应用规则」处理。
       applyClassification
     }),
   resolveImportItem: (library, itemId, decision) =>

@@ -76,7 +76,8 @@ export interface FakeBackendOptions {
   startImport?: (
     paths: string[],
     targetCollectionId?: string | null,
-    source?: ImportSource
+    source?: ImportSource,
+    applyClassification?: boolean
   ) => Promise<ImportBatch>;
   resolveImportItem?: (
     itemId: string,
@@ -218,7 +219,8 @@ export class FakeBackendClient implements BackendClient {
     | ((
         paths: string[],
         targetCollectionId?: string | null,
-        source?: ImportSource
+        source?: ImportSource,
+        applyClassification?: boolean
       ) => Promise<ImportBatch>)
     | null;
   private readonly resolveImportItemImpl:
@@ -292,8 +294,13 @@ export class FakeBackendClient implements BackendClient {
   private receiveImportLog: ReceiveImportLogEntry[] = [];
   private nextReceiveSourceId = 1;
   private receiveImportCompletedHandlers = new Set<ReceiveImportCompletedHandler>();
-  /** 每次 startImport 的分类开关：null 表示调用方未传（按应用规则处理）。 */
-  readonly importClassificationDecisions: (boolean | null)[] = [];
+  /** 每次 startImport 的完整参数；applyClassification 为 null 表示调用方未传（按应用规则处理）。 */
+  readonly startImportCalls: {
+    paths: string[];
+    targetCollectionId: string | null;
+    source: ImportSource;
+    applyClassification: boolean | null;
+  }[] = [];
   /** 测试可注入的候选目录；默认只给微信一个候选，QQ 留空以覆盖「无候选」路径。 */
   private readonly receiveSourceCandidates: Partial<
     Record<ReceiveSourceKind, ReceiveSourceCandidate[]>
@@ -474,22 +481,26 @@ export class FakeBackendClient implements BackendClient {
     applyClassification?: boolean
   ): Promise<ImportBatch> {
     this.assertCurrentLibrary(_library);
-    // 记录分类开关，供测试断言「不应用规则」分支确实传到了后端。
-    this.importClassificationDecisions.push(
-      applyClassification === undefined ? null : applyClassification
-    );
+    // 记录完整调用参数，供测试断言用户的选择确实传给了后端。
+    this.startImportCalls.push({
+      paths: [...paths],
+      targetCollectionId,
+      source,
+      applyClassification: applyClassification ?? null
+    });
+    // 既有断言依赖 calls 字符串的既有形状，这里只保留原有内容，
+    // 分类开关通过 startImportCalls 断言。
     this.calls.push(
       `startImport:${paths.join("|")}${
         targetCollectionId ? `:${targetCollectionId}` : ""
-      }${source === "collectionDrop" ? `:${source}` : ""}${
-        applyClassification === undefined ? "" : `:classify=${applyClassification}`
-      }`
+      }${source === "collectionDrop" ? `:${source}` : ""}`
     );
     if (this.startImportImpl) {
       const resolved = await this.startImportImpl(
         paths,
         targetCollectionId,
-        source
+        source,
+        applyClassification
       );
       const batch = {
         ...resolved,
