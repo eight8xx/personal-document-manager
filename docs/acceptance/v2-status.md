@@ -29,16 +29,18 @@
 
 | 套件 | 结果 | 命令 |
 | --- | --- | --- |
-| Rust 全部 | **190 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
-| ├ 单元（含 limits/store/formats/commands 契约） | 44 passed | 同上 |
+| Rust 全部 | **198 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
+| ├ 单元（含 limits/store/formats/commands 契约与监视退出） | 46 passed | 同上 |
 | ├ `library_service.rs` 集成 | 75 passed | 同上 |
 | ├ `receive_locked_files.rs`（11 文件占用） | 2 passed | 同上 |
 | ├ `receive_sources.rs`（11/12/13 接收目录） | 19 passed | 同上 |
+| ├ `reconcile_isolation.rs`（M4 恢复隔离） | 3 passed | 同上 |
+| ├ `recovery_orphans.rs`（L2 孤儿副本） | 2 passed | 同上 |
 | ├ `replacement_recovery.rs`（03） | 10 passed | 同上 |
 | ├ `sparse_column_amplification.rs`（H1 独立复现） | 2 passed | 同上 |
 | ├ `table_documents.rs`（08/09 端到端） | 13 passed | 同上 |
-| └ `table_formats.rs`（08/09 解析层 + H1） | 25 passed | 同上 |
-| 前端全部 | **163 passed（21 文件）** | `npm test` |
+| └ `table_formats.rs`（08/09 解析层 + H1/L3） | 26 passed | 同上 |
+| 前端全部 | **169 passed（21 文件）** | `npm test` |
 | 类型检查 | 通过 | `npm run typecheck` |
 | 前端生产构建 | 通过 | `npm run build` |
 
@@ -103,7 +105,8 @@
 - **原生窗口自动化**：见第四节，07 未覆盖的原生交互不接受「用假后端替代」或「改个名字算覆盖」。
 - **表格解析的远列引用**：XLSX 单元格列引用超过 Excel 上限 XFD（16384 列）会被拒绝；索引路径按「只取值不补位」处理并用单元格预算约束保留量。修复前 3 行 / 1.6 KB 的远列样本会让索引提取耗时 3.59 秒，现在 0.01 秒。
 - **残留清理失败的用户可见性**：若 `documents/<id>/` 下有一个删不掉的残留（被占用、只读属性等），应用会跳过它继续打开资料库，文档保持可用，每次打开重试；但界面**不会提示**存在未清理残留（无资料库级警告通道）。
-- **代码审查待办**：`docs/acceptance/v2-review.md` 列出的中优先级四项中，M1/M2 已部分闭合，M3（来源变化待决项无界面入口）与 M4 的实现状态见该文件。
+- **孤儿副本的隔离区**：崩溃后「副本已落盘、数据库未写入」留下的孤儿目录，打开资料库时会被整体移到 `<资料库>/.recovered-orphans/<id>/`（**只搬不删**，附 `orphan-copy-report.txt` 说明如何还原）；只搬目录内最新 mtime 超过 10 分钟的，避免打断另一实例正在进行的导入。诊断同样只在磁盘说明文件上，界面无提示。
+- **代码审查待办**：`docs/acceptance/v2-review.md` 列出的问题中，H1/H2/M4 已修复并验证，L1/L2/L3 中 L1/L2 已修复、L3 后端已交付（前端在 task-20），M3 已扩展契约（后端 task-18、前端已交付）。
 
 ## 六、未完成项
 
