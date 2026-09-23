@@ -29,14 +29,15 @@
 
 | 套件 | 结果 | 命令 |
 | --- | --- | --- |
-| Rust 全部 | **185 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
+| Rust 全部 | **190 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
 | ├ 单元（含 limits/store/formats/commands 契约） | 44 passed | 同上 |
 | ├ `library_service.rs` 集成 | 75 passed | 同上 |
 | ├ `receive_locked_files.rs`（11 文件占用） | 2 passed | 同上 |
-| ├ `receive_sources.rs`（11/12/13 接收目录） | 18 passed | 同上 |
+| ├ `receive_sources.rs`（11/12/13 接收目录） | 19 passed | 同上 |
 | ├ `replacement_recovery.rs`（03） | 10 passed | 同上 |
+| ├ `sparse_column_amplification.rs`（H1 独立复现） | 2 passed | 同上 |
 | ├ `table_documents.rs`（08/09 端到端） | 13 passed | 同上 |
-| └ `table_formats.rs`（08/09 解析层） | 23 passed | 同上 |
+| └ `table_formats.rs`（08/09 解析层 + H1） | 25 passed | 同上 |
 | 前端全部 | **163 passed（21 文件）** | `npm test` |
 | 类型检查 | 通过 | `npm run typecheck` |
 | 前端生产构建 | 通过 | `npm run build` |
@@ -100,6 +101,9 @@
 - **两字符查询**：按设计只匹配标题/描述/元数据，不匹配正文（FTS5 trigram 的既有取舍）。
 - **测试配置**：`vite.config.ts` 已排除 `.scratch`，避免把其它工作区副本的测试当成本仓库测试；并行构建负载下用例超时放宽到 15s、`findBy*` 等待放宽到 3s（断言未放宽）。
 - **原生窗口自动化**：见第四节，07 未覆盖的原生交互不接受「用假后端替代」或「改个名字算覆盖」。
+- **表格解析的远列引用**：XLSX 单元格列引用超过 Excel 上限 XFD（16384 列）会被拒绝；索引路径按「只取值不补位」处理并用单元格预算约束保留量。修复前 3 行 / 1.6 KB 的远列样本会让索引提取耗时 3.59 秒，现在 0.01 秒。
+- **残留清理失败的用户可见性**：若 `documents/<id>/` 下有一个删不掉的残留（被占用、只读属性等），应用会跳过它继续打开资料库，文档保持可用，每次打开重试；但界面**不会提示**存在未清理残留（无资料库级警告通道）。
+- **代码审查待办**：`docs/acceptance/v2-review.md` 列出的中优先级四项中，M1/M2 已部分闭合，M3（来源变化待决项无界面入口）与 M4 的实现状态见该文件。
 
 ## 六、未完成项
 
