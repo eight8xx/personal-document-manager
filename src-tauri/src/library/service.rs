@@ -4209,8 +4209,15 @@ impl LibraryService {
     /// 列表内尚未被用户跳过、且仍需导入的文件。
     ///
     /// 已经导入过（含相同内容跳过）的源文件不会再被重复导入，避免周期补扫刷日志；
-    /// 失败项在冷却时间后重试，来源内容变化的待决项不再自动重复导入。
-    pub fn receive_pending_files(&self, source_id: &str) -> LibraryResult<Vec<String>> {
+    /// 来源内容变化的待决项不再自动重复导入。
+    ///
+    /// `retry_failed` 区分调用方：周期补扫传 `false`，失败项要等冷却时间过后才重试（避免每次补扫刷日志）；
+    /// 用户主动点「扫描」传 `true`，立即重试失败项，让「恢复后重试」不必干等冷却。
+    pub fn receive_pending_files(
+        &self,
+        source_id: &str,
+        retry_failed: bool,
+    ) -> LibraryResult<Vec<String>> {
         let connection = self.library_connection()?;
         let source = load_receive_source(connection, source_id)?;
         if !source.enabled {
@@ -4240,9 +4247,9 @@ impl LibraryService {
                     ImportItemStatus::Imported | ImportItemStatus::Duplicate => {
                         source_file_changed(connection, &file_path, &file)?
                     }
-                    // 失败项冷却一段时间后自动重试，避免每次补扫都刷日志。
+                    // 失败项：周期补扫等冷却，用户主动重试立即放行。
                     ImportItemStatus::Failed => {
-                        created_at.as_str() <= receive_retry_cutoff().as_str()
+                        retry_failed || created_at.as_str() <= receive_retry_cutoff().as_str()
                     }
                     // 待决项等用户决定，已跳过/忽略的不再自动导入。
                     _ => false,
