@@ -9,18 +9,22 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::library::{
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState,
-    CollectionDeleteResult, CollectionSummary, DocumentFormatCapability, DocumentIndexChangedEvent,
-    DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentSearchQuery,
-    DocumentSearchResponse, DocumentSummary, DocumentThumbnail, EmptyTrashResult,
-    ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult, ImportProgress,
-    ImportSource, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
-    LibrarySummary, RecentLibrary, TablePreviewRequest, TableSheet, TagSummary,
-    TrashDocumentSummary,
+    ClassificationPreviewRequest, ClassificationPreviewResponse, ClassificationRule,
+    ClassificationRuleOperation, CollectionDeleteResult, CollectionSummary, DocumentFormatCapability,
+    DocumentIndexChangedEvent, DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview,
+    DocumentSearchQuery, DocumentSearchResponse, DocumentSummary, DocumentThumbnail,
+    EmptyTrashResult, ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult,
+    ImportProgress, ImportSource, IndexRunResult, IndexStatus, LibraryError, LibraryResult,
+    LibraryService, LibrarySummary, ReceiveDirectoryListing, ReceiveDirectoryOperation,
+    ReceiveImportLogEntry, ReceiveSource, ReceiveSourceCandidates, ReceiveSourceInput,
+    ReceiveSourceKind, ReceiveSourceScanResult, RecentLibrary, TablePreviewRequest, TableSheet,
+    TagSummary, TrashDocumentSummary,
 };
 
 pub struct AppState {
     service: Arc<Mutex<LibraryService>>,
     monitor: Mutex<Option<ExternalChangeMonitor>>,
+    receive_monitor: Mutex<Option<ReceiveDirectoryMonitor>>,
     batch_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -29,6 +33,7 @@ impl AppState {
         Self {
             service: Arc::new(Mutex::new(service)),
             monitor: Mutex::new(None),
+            receive_monitor: Mutex::new(None),
             batch_cancellations: Mutex::new(HashMap::new()),
         }
     }
@@ -56,6 +61,18 @@ impl AppState {
         monitor: ExternalChangeMonitor,
     ) -> LibraryResult<()> {
         let mut current = self.monitor.lock().map_err(|_| LibraryError::StateLock)?;
+        *current = Some(monitor);
+        Ok(())
+    }
+
+    pub(crate) fn set_receive_directory_monitor(
+        &self,
+        monitor: ReceiveDirectoryMonitor,
+    ) -> LibraryResult<()> {
+        let mut current = self
+            .receive_monitor
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?;
         *current = Some(monitor);
         Ok(())
     }
@@ -91,9 +108,155 @@ impl AppState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveImportCompletedEvent {
+    pub library: LibrarySummary,
+    pub results: Vec<ReceiveSourceScanResult>,
+}
+
+/// 接收目录的实时导入监视。
+///
+/// 与外部变更监视一致：只在本进程内周期性补扫当前资料库已启用的来源，
+/// 关闭应用（Drop）后线程立刻退出，不留下常驻进程；扫描过程**每个文件单独加锁**，
+/// 已有文档的浏览、搜索与预览不会被整轮扫描挡住。
+pub struct ReceiveDirectoryMonitor {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReceiveDirectoryMonitor {
+    pub fn start<F>(
+        service: Arc<Mutex<LibraryService>>,
+        poll_interval: std::time::Duration,
+        on_scan: F,
+    ) -> std::io::Result<Self>
+    where
+        F: Fn(LibrarySummary, Vec<ReceiveSourceScanResult>) + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("pdm-receive-directory-monitor".to_string())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(poll_interval);
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let library = match service.lock() {
+                        Ok(service) => service.current_library().cloned(),
+                        Err(_) => break,
+                    };
+                    let Some(library) = library else {
+                        continue;
+                    };
+                    match run_receive_scan(&service, &library) {
+                        Ok(results) if !results.is_empty() => on_scan(library, results),
+                        Ok(_) => {}
+                        Err(_) => continue,
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ReceiveDirectoryMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 按文件分步导入一批接收文件：每一步单独加锁，出错时丢弃批次状态。
+pub(crate) fn drive_receive_import(
+    service: &Arc<Mutex<LibraryService>>,
+    library: &LibrarySummary,
+    source_id: &str,
+    paths: Vec<String>,
+) -> LibraryResult<ReceiveSourceScanResult> {
+    let first = {
+        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(library)?;
+        service.begin_receive_import_batch(source_id, paths)?
+    };
+    let batch_id = first.batch_id.clone();
+
+    let outcome = (|| -> LibraryResult<()> {
+        loop {
+            let before = {
+                let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+                service.ensure_current_library(library)?;
+                service.peek_import_progress(&batch_id)?
+            };
+            if before.is_none() {
+                break;
+            }
+            let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+            service.ensure_current_library(library)?;
+            service.import_batch_step(&batch_id)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = outcome {
+        if let Ok(mut service) = service.lock() {
+            let _ = service.abort_import_batch(&batch_id);
+        }
+        return Err(error);
+    }
+
+    let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+    service.ensure_current_library(library)?;
+    service.finish_receive_import_batch(&batch_id)
+}
+
+/// 补扫当前资料库已启用的接收来源；每一步都重新核对资料库身份。
+fn run_receive_scan(
+    service: &Arc<Mutex<LibraryService>>,
+    library: &LibrarySummary,
+) -> LibraryResult<Vec<ReceiveSourceScanResult>> {
+    let sources = {
+        let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(library)?;
+        service.list_receive_sources()?
+    };
+
+    let mut results = Vec::new();
+    for source in sources {
+        if !source.enabled || source.path.is_none() {
+            continue;
+        }
+        // 首次启用或刚重新定位的来源等待用户在清单里选择；补扫不会自动导入既有文件。
+        if source.last_scanned_at.is_none() {
+            continue;
+        }
+        let pending = {
+            let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+            service.ensure_current_library(library)?;
+            service.receive_pending_files(&source.id)?
+        };
+        if pending.is_empty() {
+            continue;
+        }
+        results.push(drive_receive_import(service, library, &source.id, pending)?);
+    }
+    Ok(results)
+}
+
 impl Drop for AppState {
     fn drop(&mut self) {
         if let Ok(monitor) = self.monitor.get_mut() {
+            monitor.take();
+        }
+        if let Ok(monitor) = self.receive_monitor.get_mut() {
             monitor.take();
         }
     }
@@ -208,6 +371,7 @@ pub async fn start_import(
     paths: Vec<String>,
     target_collection_id: Option<String>,
     source: Option<ImportSource>,
+    apply_classification: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportBatch, CommandError> {
@@ -217,6 +381,7 @@ pub async fn start_import(
         paths,
         target_collection_id,
         source.unwrap_or(ImportSource::FilePicker),
+        apply_classification.unwrap_or(true),
         move |progress| {
             let _ = app.emit("import-progress", progress);
         },
@@ -228,12 +393,14 @@ pub async fn start_import(
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_import_task<F>(
     state: &AppState,
     library: LibrarySummary,
     paths: Vec<String>,
     target_collection_id: Option<String>,
     source: ImportSource,
+    apply_classification: bool,
     mut on_progress: F,
 ) -> tauri::async_runtime::JoinHandle<Result<ImportBatch, CommandError>>
 where
@@ -247,7 +414,12 @@ where
             let first = {
                 let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
                 service.ensure_current_library(&library)?;
-                service.begin_import_batch(paths, target_collection_id, source)?
+                service.begin_import_batch_with_classification(
+                    paths,
+                    target_collection_id,
+                    source,
+                    apply_classification,
+                )?
             };
             let batch_id = first.batch_id.clone();
             on_progress(first);
@@ -1038,6 +1210,229 @@ pub fn list_document_format_capabilities() -> Result<Vec<DocumentFormatCapabilit
     Ok(crate::library::document_format_capabilities().to_vec())
 }
 
+// ---- 分类规则（工作单 10） ----
+
+#[tauri::command]
+pub fn list_classification_rules(
+    library: LibrarySummary,
+    state: State<'_, AppState>,
+) -> Result<Vec<ClassificationRule>, CommandError> {
+    list_classification_rules_contract(&state, &library)
+}
+
+fn list_classification_rules_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+) -> Result<Vec<ClassificationRule>, CommandError> {
+    state.with_library(library, |service| service.list_classification_rules())
+}
+
+#[tauri::command]
+pub fn apply_classification_rule_operation(
+    library: LibrarySummary,
+    operation: ClassificationRuleOperation,
+    state: State<'_, AppState>,
+) -> Result<Vec<ClassificationRule>, CommandError> {
+    apply_classification_rule_operation_contract(&state, &library, operation)
+}
+
+fn apply_classification_rule_operation_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    operation: ClassificationRuleOperation,
+) -> Result<Vec<ClassificationRule>, CommandError> {
+    state.with_library(library, |service| {
+        service.apply_classification_rule_operation(operation)
+    })
+}
+
+#[tauri::command]
+pub fn preview_classification(
+    library: LibrarySummary,
+    request: ClassificationPreviewRequest,
+    state: State<'_, AppState>,
+) -> Result<ClassificationPreviewResponse, CommandError> {
+    preview_classification_contract(&state, &library, request)
+}
+
+fn preview_classification_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    request: ClassificationPreviewRequest,
+) -> Result<ClassificationPreviewResponse, CommandError> {
+    state.with_library(library, |service| service.preview_classification(request))
+}
+
+// ---- 接收目录（工作单 11/12/13） ----
+
+#[tauri::command]
+pub fn list_receive_sources(
+    library: LibrarySummary,
+    state: State<'_, AppState>,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    list_receive_sources_contract(&state, &library)
+}
+
+fn list_receive_sources_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    state.with_library(library, |service| service.list_receive_sources())
+}
+
+#[tauri::command]
+pub fn list_receive_source_candidates(
+    library: LibrarySummary,
+    kind: ReceiveSourceKind,
+    state: State<'_, AppState>,
+) -> Result<ReceiveSourceCandidates, CommandError> {
+    list_receive_source_candidates_contract(&state, &library, kind)
+}
+
+fn list_receive_source_candidates_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    kind: ReceiveSourceKind,
+) -> Result<ReceiveSourceCandidates, CommandError> {
+    state.with_library(library, |service| {
+        service.list_receive_source_candidates(kind)
+    })
+}
+
+#[tauri::command]
+pub fn upsert_receive_source(
+    library: LibrarySummary,
+    source_id: Option<String>,
+    input: ReceiveSourceInput,
+    state: State<'_, AppState>,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    upsert_receive_source_contract(&state, &library, source_id, input)
+}
+
+fn upsert_receive_source_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    source_id: Option<String>,
+    input: ReceiveSourceInput,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    state.with_library(library, |service| {
+        service.upsert_receive_source(source_id.as_deref(), input)
+    })
+}
+
+#[tauri::command]
+pub fn remove_receive_source(
+    library: LibrarySummary,
+    source_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    remove_receive_source_contract(&state, &library, source_id)
+}
+
+fn remove_receive_source_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    source_id: String,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    state.with_library(library, |service| service.remove_receive_source(&source_id))
+}
+
+#[tauri::command]
+pub fn list_receive_directory_files(
+    library: LibrarySummary,
+    source_id: String,
+    state: State<'_, AppState>,
+) -> Result<ReceiveDirectoryListing, CommandError> {
+    list_receive_directory_files_contract(&state, &library, source_id)
+}
+
+fn list_receive_directory_files_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    source_id: String,
+) -> Result<ReceiveDirectoryListing, CommandError> {
+    state.with_library(library, |service| {
+        service.list_receive_directory_files(&source_id)
+    })
+}
+
+#[tauri::command]
+pub fn skip_receive_directory_files(
+    library: LibrarySummary,
+    operation: ReceiveDirectoryOperation,
+    state: State<'_, AppState>,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    skip_receive_directory_files_contract(&state, &library, operation)
+}
+
+fn skip_receive_directory_files_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    operation: ReceiveDirectoryOperation,
+) -> Result<Vec<ReceiveSource>, CommandError> {
+    state.with_library(library, |service| {
+        service.skip_receive_directory_files(operation)
+    })
+}
+
+/// 导入用户在首次清单里勾选的文件；每个文件单独加锁，读取命令不会被整轮挡住。
+#[tauri::command]
+pub async fn apply_receive_directory_selection(
+    library: LibrarySummary,
+    operation: ReceiveDirectoryOperation,
+    state: State<'_, AppState>,
+) -> Result<ReceiveSourceScanResult, CommandError> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        drive_receive_import(
+            &service,
+            &library,
+            &operation.source_id,
+            operation.paths,
+        )
+        .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "receiveImportTask".to_string(),
+        message: format!("接收目录导入无法完成：{error}"),
+    })?
+}
+
+/// 补扫当前资料库已启用的接收来源；切换资料库后不会继续写入旧资料库。
+#[tauri::command]
+pub async fn scan_receive_sources(
+    library: LibrarySummary,
+    state: State<'_, AppState>,
+) -> Result<Vec<ReceiveSourceScanResult>, CommandError> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_receive_scan(&service, &library).map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "receiveScanTask".to_string(),
+        message: format!("接收目录扫描无法完成：{error}"),
+    })?
+}
+
+#[tauri::command]
+pub fn list_receive_import_log(
+    library: LibrarySummary,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ReceiveImportLogEntry>, CommandError> {
+    list_receive_import_log_contract(&state, &library, limit.unwrap_or(100))
+}
+
+fn list_receive_import_log_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    limit: usize,
+) -> Result<Vec<ReceiveImportLogEntry>, CommandError> {
+    state.with_library(library, |service| service.list_receive_import_log(limit))
+}
+
 #[tauri::command]
 pub fn list_recent_libraries(
     state: State<'_, AppState>,
@@ -1087,24 +1482,32 @@ fn emit_library_changed(app: &AppHandle, action: &str, library: LibrarySummary) 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_tag_to_document_contract, bootstrap_contract, create_collection_contract,
-        create_library_contract, create_tag_contract, delete_collection_contract,
-        delete_tag_contract, empty_trash_contract, get_document_preview_contract,
+        add_tag_to_document_contract, apply_classification_rule_operation_contract,
+        bootstrap_contract, create_collection_contract, create_library_contract,
+        create_tag_contract, delete_collection_contract, delete_tag_contract,
+        drive_receive_import, empty_trash_contract, get_document_preview_contract,
         index_next_pending_for_library, inspect_library_location_contract,
-        list_collections_contract, list_document_format_capabilities, list_documents_contract,
-        list_tags_contract, list_trash_documents_contract, move_collection_contract,
+        list_classification_rules_contract, list_collections_contract,
+        list_document_format_capabilities, list_documents_contract,
+        list_receive_directory_files_contract, list_receive_import_log_contract,
+        list_receive_source_candidates_contract, list_receive_sources_contract, list_tags_contract,
+        list_trash_documents_contract, move_collection_contract,
         move_document_to_collection_contract, move_document_to_trash_contract,
         open_library_contract, pending_index_count_contract, permanently_delete_document_contract,
+        preview_classification_contract, remove_receive_source_contract,
         remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
         resolve_import_item_contract, restore_document_contract, retry_import_item_contract,
-        spawn_batch_organize_task, spawn_import_task, start_import_contract,
-        update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
+        skip_receive_directory_files_contract, spawn_batch_organize_task, spawn_import_task,
+        start_import_contract, update_document_metadata_contract, upsert_receive_source_contract,
+        AppState, CommandError, LibraryChangedEvent, ReceiveDirectoryMonitor,
     };
     use crate::library::{
-        BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
-        DocumentPreview, DocumentSearchFilters, DocumentSearchQuery, DocumentThumbnail,
-        ImportDecision, ImportItemStatus, ImportSource, IndexStatus, LibraryService,
-        LibrarySummary, LocationStatus,
+        BatchDocumentOperation, BatchDocumentOperationRequest, ClassificationPreviewRequest,
+        ClassificationRuleInput, ClassificationRuleOperation, ClassificationRuleUpdate,
+        DocumentMetadataUpdate, DocumentPreview, DocumentSearchFilters, DocumentSearchQuery,
+        DocumentThumbnail, ImportDecision, ImportItemStatus, ImportSource, IndexStatus,
+        LibraryService, LibrarySummary, LocationStatus, ReceiveDirectoryOperation,
+        ReceiveSourceInput, ReceiveSourceKind,
     };
     use std::path::Path;
     use std::sync::{Arc, Condvar, Mutex};
@@ -1459,6 +1862,7 @@ mod tests {
             vec![source_path.to_string_lossy().into_owned()],
             None,
             ImportSource::FilePicker,
+            true,
             {
                 let progress = Arc::clone(&progress);
                 move |event| progress.lock().unwrap().push(event)
@@ -1520,6 +1924,7 @@ mod tests {
             paths,
             None,
             ImportSource::FilePicker,
+            true,
             {
                 let gate = Arc::clone(&gate);
                 move |progress| {
@@ -1640,6 +2045,7 @@ mod tests {
             paths,
             None,
             ImportSource::FilePicker,
+            true,
             {
                 let gate = Arc::clone(&gate);
                 move |progress| {
@@ -1731,6 +2137,7 @@ mod tests {
             vec![source.to_string_lossy().into_owned()],
             None,
             ImportSource::FilePicker,
+            true,
             |_| {},
         );
         guard.open_library(&second_path).unwrap();
@@ -2163,5 +2570,351 @@ mod tests {
         assert_eq!(value["deletedCount"], 0);
         assert_eq!(value["failedCount"], 0);
         assert!(value["items"].as_array().unwrap().is_empty());
+    }
+
+    /// 分类规则与接收目录的命令层契约：命令可调用、字段名与冻结契约一致。
+    #[test]
+    fn classification_and_receive_commands_use_the_frozen_contract() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let library_path = root.path().join("Library");
+        let library =
+            create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let collection = create_collection_contract(
+            &state,
+            &library,
+            "归档".to_string(),
+            None,
+        )
+        .unwrap();
+        let tag = create_tag_contract(&state, &library, "重要".to_string()).unwrap();
+
+        // 五种规则操作都能走通，并按位置返回排序后的列表。
+        let created = apply_classification_rule_operation_contract(
+            &state,
+            &library,
+            ClassificationRuleOperation::Create {
+                rule: ClassificationRuleInput {
+                    name: "报告".to_string(),
+                    enabled: true,
+                    file_name_pattern: "报告".to_string(),
+                    file_type: Some("TXT".to_string()),
+                    source_directory: None,
+                    collection_id: Some(collection.id.clone()),
+                    tag_ids: vec![tag.id.clone()],
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(created.len(), 1);
+        let rule_id = created[0].id.clone();
+        let value = serde_json::to_value(&created[0]).unwrap();
+        for key in [
+            "id",
+            "name",
+            "enabled",
+            "position",
+            "fileNamePattern",
+            "fileType",
+            "sourceDirectory",
+            "collectionId",
+            "tagIds",
+        ] {
+            assert!(value.get(key).is_some(), "分类规则缺少字段 {key}");
+        }
+        assert!(value.get("file_name_pattern").is_none());
+
+        let operation_json = serde_json::to_value(ClassificationRuleOperation::SetEnabled {
+            rule_id: rule_id.clone(),
+            enabled: false,
+        })
+        .unwrap();
+        assert_eq!(operation_json["kind"], "setEnabled");
+        assert_eq!(operation_json["ruleId"], rule_id);
+        assert_eq!(operation_json["enabled"], false);
+
+        apply_classification_rule_operation_contract(
+            &state,
+            &library,
+            ClassificationRuleOperation::Reorder {
+                ordered_rule_ids: vec![rule_id.clone()],
+            },
+        )
+        .unwrap();
+        apply_classification_rule_operation_contract(
+            &state,
+            &library,
+            ClassificationRuleOperation::SetEnabled {
+                rule_id: rule_id.clone(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        apply_classification_rule_operation_contract(
+            &state,
+            &library,
+            ClassificationRuleOperation::Update {
+                rule: ClassificationRuleUpdate {
+                    id: rule_id.clone(),
+                    input: ClassificationRuleInput {
+                        name: "报告（改）".to_string(),
+                        enabled: true,
+                        file_name_pattern: "报告".to_string(),
+                        file_type: None,
+                        source_directory: None,
+                        collection_id: Some(collection.id.clone()),
+                        tag_ids: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let source_path = root.path().join("季度报告.txt");
+        std::fs::write(&source_path, "报告正文").unwrap();
+        let preview = preview_classification_contract(
+            &state,
+            &library,
+            ClassificationPreviewRequest {
+                paths: vec![source_path.to_string_lossy().into_owned()],
+                target_collection_id: None,
+            },
+        )
+        .unwrap();
+        let value = serde_json::to_value(&preview).unwrap();
+        assert_eq!(value["items"][0]["collectionId"], collection.id);
+        assert_eq!(value["items"][0]["matchedRuleIds"][0], rule_id);
+        assert_eq!(value["items"][0]["fileType"], "TXT");
+        assert!(value["items"][0].get("sourcePath").is_some());
+        assert!(value["items"][0].get("fileName").is_some());
+
+        apply_classification_rule_operation_contract(
+            &state,
+            &library,
+            ClassificationRuleOperation::Delete {
+                rule_id: rule_id.clone(),
+            },
+        )
+        .unwrap();
+        assert!(list_classification_rules_contract(&state, &library).unwrap().is_empty());
+
+        // 接收来源：确认目录 → 首次清单 → 跳过未选 → 导入所选。
+        let receive_dir = root.path().join("wechat");
+        std::fs::create_dir_all(&receive_dir).unwrap();
+        let kept = receive_dir.join("保留.txt");
+        let skipped = receive_dir.join("未选.txt");
+        std::fs::write(&kept, "保留正文").unwrap();
+        std::fs::write(&skipped, "未选正文").unwrap();
+
+        let sources = upsert_receive_source_contract(
+            &state,
+            &library,
+            None,
+            ReceiveSourceInput {
+                kind: ReceiveSourceKind::Wechat,
+                display_name: "微信".to_string(),
+                path: receive_dir.to_string_lossy().into_owned(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 1);
+        let source_id = sources[0].id.clone();
+        let value = serde_json::to_value(&sources[0]).unwrap();
+        for key in [
+            "id",
+            "kind",
+            "displayName",
+            "path",
+            "enabled",
+            "status",
+            "pendingCount",
+            "lastScannedAt",
+        ] {
+            assert!(value.get(key).is_some(), "接收来源缺少字段 {key}");
+        }
+        assert_eq!(value["kind"], "wechat");
+        assert_eq!(value["status"], "ready");
+        assert!(value["lastScannedAt"].is_null());
+
+        let candidates = list_receive_source_candidates_contract(
+            &state,
+            &library,
+            ReceiveSourceKind::Other,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&candidates).unwrap();
+        assert_eq!(value["kind"], "other");
+        assert!(value["candidates"].as_array().unwrap().is_empty());
+
+        let listing =
+            list_receive_directory_files_contract(&state, &library, source_id.clone()).unwrap();
+        let value = serde_json::to_value(&listing).unwrap();
+        assert_eq!(value["sourceId"], source_id);
+        assert_eq!(value["items"].as_array().unwrap().len(), 2);
+        for key in ["path", "fileName", "fileType", "fileSize", "previouslySkipped"] {
+            assert!(
+                value["items"][0].get(key).is_some(),
+                "清单项缺少字段 {key}"
+            );
+        }
+
+        skip_receive_directory_files_contract(
+            &state,
+            &library,
+            ReceiveDirectoryOperation {
+                source_id: source_id.clone(),
+                paths: vec![skipped.to_string_lossy().into_owned()],
+            },
+        )
+        .unwrap();
+        let listing =
+            list_receive_directory_files_contract(&state, &library, source_id.clone()).unwrap();
+        let value = serde_json::to_value(&listing).unwrap();
+        let skipped_item = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["path"].as_str().unwrap().ends_with("未选.txt"))
+            .unwrap();
+        assert_eq!(skipped_item["previouslySkipped"], true);
+
+        let result = drive_receive_import(
+            &state.service_handle(),
+            &library,
+            &source_id,
+            vec![kept.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        let value = serde_json::to_value(&result).unwrap();
+        for key in [
+            "sourceId",
+            "scannedCount",
+            "importedCount",
+            "skippedCount",
+            "pendingCount",
+            "failedCount",
+        ] {
+            assert!(value.get(key).is_some(), "扫描结果缺少字段 {key}");
+        }
+        assert_eq!(value["importedCount"], 1);
+
+        let log = list_receive_import_log_contract(&state, &library, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        let value = serde_json::to_value(&log[0]).unwrap();
+        for key in [
+            "sourceId",
+            "sourcePath",
+            "fileName",
+            "status",
+            "documentId",
+            "collectionId",
+            "tagIds",
+            "matchedRuleIds",
+            "errorMessage",
+            "createdAt",
+        ] {
+            assert!(value.get(key).is_some(), "导入日志缺少字段 {key}");
+        }
+        assert_eq!(value["status"], "imported");
+
+        remove_receive_source_contract(&state, &library, source_id).unwrap();
+        assert!(list_receive_sources_contract(&state, &library).unwrap().is_empty());
+    }
+
+    /// 接收目录监视线程在 Drop 后立刻退出，不留下常驻进程。
+    #[test]
+    fn receive_directory_monitor_stops_when_dropped() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let library_path = root.path().join("Library");
+        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+
+        let monitor = ReceiveDirectoryMonitor::start(
+            state.service_handle(),
+            Duration::from_millis(20),
+            |_, _| {},
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let started = Instant::now();
+        drop(monitor);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "监视线程应在 Drop 后立刻退出：{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 应用运行期间，已确认接收目录里的新文件会被监视自动导入。
+    #[test]
+    fn receive_directory_monitor_imports_new_files_while_running() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let library_path = root.path().join("Library");
+        let library =
+            create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let receive_dir = root.path().join("wechat");
+        std::fs::create_dir_all(&receive_dir).unwrap();
+
+        // 先确认目录并完成首次清单（空目录：没有任何未选项）。
+        let sources = upsert_receive_source_contract(
+            &state,
+            &library,
+            None,
+            ReceiveSourceInput {
+                kind: ReceiveSourceKind::Wechat,
+                display_name: "微信".to_string(),
+                path: receive_dir.to_string_lossy().into_owned(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let source_id = sources[0].id.clone();
+        let pending = {
+            let mut service = state.service().unwrap();
+            service.ensure_current_library(&library).unwrap();
+            service.receive_pending_files(&source_id).unwrap()
+        };
+        assert!(pending.is_empty());
+        let first = {
+            let mut service = state.service().unwrap();
+            service.ensure_current_library(&library).unwrap();
+            service
+                .begin_receive_import_batch(&source_id, Vec::new())
+                .unwrap()
+        };
+        {
+            let mut service = state.service().unwrap();
+            service
+                .finish_receive_import_batch(&first.batch_id)
+                .unwrap();
+        }
+
+        let monitor = ReceiveDirectoryMonitor::start(
+            state.service_handle(),
+            Duration::from_millis(30),
+            |_, _| {},
+        )
+        .unwrap();
+
+        // 应用打开期间新保存的文件应在下一次补扫被自动导入。
+        std::fs::write(receive_dir.join("新消息.txt"), "新消息正文").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut imported = false;
+        while Instant::now() < deadline {
+            let documents = list_documents_contract(&state).unwrap();
+            if documents.iter().any(|document| document.file_name == "新消息.txt") {
+                imported = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(monitor);
+        assert!(imported, "运行期间的新文件应被监视自动导入");
+        assert_eq!(
+            std::fs::read(receive_dir.join("新消息.txt")).unwrap(),
+            "新消息正文".as_bytes(),
+            "来源文件不应被修改"
+        );
     }
 }
