@@ -22,12 +22,12 @@ use uuid::Uuid;
 use super::error::{LibraryError, LibraryResult};
 use super::formats::{
     canonical_file_type, capability_for_file_type, capability_for_path,
-    require_capability_for_file_type, unsupported_message, PreviewStrategy, TextExtractionStrategy,
-    ThumbnailStrategy, ValidationStrategy,
+    require_capability_for_file_type, unsupported_message, DocumentFormatId, PreviewStrategy,
+    TextExtractionStrategy, ThumbnailStrategy, ValidationStrategy,
 };
 use super::limits::{
     bound_extracted_text, read_stream_limited, ArchiveLimits, ExpansionBudget,
-    MAX_EXTRACTED_TEXT_CHARS,
+    MAX_EXTRACTED_TEXT_CHARS, MAX_TABLE_PREVIEW_ROWS,
 };
 use super::models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
@@ -38,10 +38,10 @@ use super::models::{
     DocumentThumbnail, EmptyTrashItemResult, EmptyTrashItemStatus, EmptyTrashResult, ImportBatch,
     ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, ImportSource,
     IndexRunResult, IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary,
-    LocationStatus, RecentLibrary, RecentLibraryRecord, SearchMatchKind, TagSummary,
-    TrashDocumentSummary,
+    LocationStatus, RecentLibrary, RecentLibraryRecord, SearchMatchKind, TablePreviewRequest,
+    TableSheet, TagSummary, TrashDocumentSummary,
 };
-use super::{ooxml, thumbnail};
+use super::{ooxml, table, thumbnail};
 
 const FORMAT_VERSION: u32 = 1;
 const INTERNAL_DIR: &str = ".pdm";
@@ -59,6 +59,8 @@ const REPLACEMENT_BACKUP_SUFFIX: &str = ".previous";
 const IMPORT_TEMPORARY_SUFFIX: &str = ".importing";
 /// 纯文本读取的字节上限：UTF-8 每字符最多 4 字节，另加 4 字节用于识别截断。
 const MAX_TEXT_READ_BYTES: u64 = MAX_EXTRACTED_TEXT_CHARS as u64 * 4 + 4;
+/// 表格预览未指定列数时的默认列数；上限由 `limits` 模块统一约束。
+const DEFAULT_TABLE_PREVIEW_COLUMNS: usize = 16;
 
 pub struct LibraryService {
     state_dir: PathBuf,
@@ -3081,6 +3083,42 @@ impl LibraryService {
         }
     }
 
+    /// 列出表格文档的工作表；非表格格式返回空列表。
+    pub fn list_document_sheets(&self, document_id: &str) -> LibraryResult<Vec<TableSheet>> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let path = self.document_copy_path(&stored)?;
+        ensure_document_copy_exists(&path)?;
+        let capability = require_capability_for_file_type(&stored.file_type)?;
+        if capability.preview != PreviewStrategy::TablePaged {
+            return Ok(Vec::new());
+        }
+        let bytes = read_table_bytes_within_limits(&path)?;
+        Ok(table_sheets_for(&bytes, capability.id)?.into())
+    }
+
+    /// 读取表格文档的有限行列范围；失败以 `DocumentPreview::Failure` 返回，界面可解释。
+    pub fn get_table_preview(
+        &self,
+        document_id: &str,
+        request: TablePreviewRequest,
+    ) -> LibraryResult<DocumentPreview> {
+        let stored = self.load_stored_document_file(document_id)?;
+        let path = self.document_copy_path(&stored)?;
+        let capability = require_capability_for_file_type(&stored.file_type)?;
+        if capability.preview != PreviewStrategy::TablePaged {
+            return Ok(DocumentPreview::Unsupported {
+                message: format!("{} 不是表格文档。", capability.display_type),
+            });
+        }
+        match read_table_preview(&path, capability.id, &request) {
+            Ok(preview) => Ok(preview),
+            Err(error) => Ok(DocumentPreview::Failure {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            }),
+        }
+    }
+
     pub fn get_document_thumbnail(&self, document_id: &str) -> LibraryResult<DocumentThumbnail> {
         let stored = self.load_stored_document_file(document_id)?;
         let path = self.document_copy_path(&stored)?;
@@ -3262,11 +3300,10 @@ impl LibraryService {
                     degraded_features,
                 })
             }
-            // 表格分页预览由 08/09 实现；在此之前明确返回失败预览，不伪造内容。
-            PreviewStrategy::TablePaged => Ok(DocumentPreview::Failure {
-                code: "preview".to_string(),
-                message: "表格预览尚未实现。".to_string(),
-            }),
+            // 表格文档：首屏返回第一段范围，翻页与切表由 get_table_preview 处理。
+            PreviewStrategy::TablePaged => {
+                read_table_preview(&path, capability.id, &TablePreviewRequest::default())
+            }
         }
     }
 
@@ -4084,6 +4121,94 @@ fn read_archive_within_limits(path: &Path, limits: ArchiveLimits) -> LibraryResu
     let bytes = fs::read(path)?;
     budget.check_input_size(bytes.len() as u64)?;
     Ok(bytes)
+}
+
+/// 读取表格文档字节，使用表格分页预览的预算（比索引更小）。
+fn read_table_bytes_within_limits(path: &Path) -> LibraryResult<Vec<u8>> {
+    read_archive_within_limits(path, ArchiveLimits::for_table_preview())
+}
+
+/// 表格文档的工作表清单；CSV 返回一张合成工作表。
+fn table_sheets_for(bytes: &[u8], format_id: DocumentFormatId) -> LibraryResult<Vec<TableSheet>> {
+    let range = match format_id {
+        DocumentFormatId::Csv => table::read_csv_table(bytes, 0, 1, 1, ArchiveLimits::for_table_preview())?,
+        DocumentFormatId::Xlsx => {
+            table::read_xlsx_table(bytes, 0, 0, 1, 1, ArchiveLimits::for_table_preview())?
+        }
+        other => {
+            return Err(LibraryError::Preview(format!(
+                "{} 不是表格文档。",
+                other.as_str()
+            )))
+        }
+    };
+    Ok(range.sheets.into_iter().map(TableSheet::from).collect())
+}
+
+/// 读取表格的一页范围，并转换成预览载荷。
+fn read_table_preview(
+    path: &Path,
+    format_id: DocumentFormatId,
+    request: &TablePreviewRequest,
+) -> LibraryResult<DocumentPreview> {
+    let bytes = read_table_bytes_within_limits(path)?;
+    let limits = ArchiveLimits::for_table_preview();
+    // 0 表示「使用默认值」，避免界面必须知道服务端上限。
+    let row_count = match request.row_count {
+        0 => MAX_TABLE_PREVIEW_ROWS,
+        requested => requested,
+    };
+    let column_count = match request.column_count {
+        0 => DEFAULT_TABLE_PREVIEW_COLUMNS,
+        requested => requested,
+    };
+
+    let range = match format_id {
+        DocumentFormatId::Csv => table::read_csv_table(
+            &bytes,
+            request.start_row,
+            row_count,
+            column_count,
+            limits,
+        )?,
+        DocumentFormatId::Xlsx => table::read_xlsx_table(
+            &bytes,
+            request.sheet_index,
+            request.start_row,
+            row_count,
+            column_count,
+            limits,
+        )?,
+        other => {
+            return Err(LibraryError::Preview(format!(
+                "{} 不是表格文档。",
+                other.as_str()
+            )))
+        }
+    };
+
+    Ok(DocumentPreview::Table {
+        sheets: range.sheets.into_iter().map(TableSheet::from).collect(),
+        sheet_index: range.sheet_index,
+        start_row: range.start_row,
+        cells: range.cells,
+        row_numbers: range.row_numbers,
+        column_count: range.column_count,
+        has_more_rows: range.has_more_rows,
+        degraded_features: range.degraded_features,
+        notice: range.notice,
+    })
+}
+
+impl From<table::TableSheetInfo> for TableSheet {
+    fn from(info: table::TableSheetInfo) -> Self {
+        Self {
+            index: info.index,
+            name: info.name,
+            row_count: info.row_count,
+            column_count: info.column_count,
+        }
+    }
 }
 
 /// 预览返回的纯文本按上限截断；截断时在末尾给出可理解的降级说明。
@@ -4970,10 +5095,18 @@ fn validate_file_content(
         ValidationStrategy::DocxPackage => expect_prefix(path, b"PK", "文件内容不是有效的 DOCX。"),
         ValidationStrategy::PlainText => Ok(()),
         ValidationStrategy::PptxPackage => validate_pptx_package(path),
-        // 表格格式的包校验由 08/09 实现；在此之前明确拒绝，避免把未校验内容当成有效文档。
-        ValidationStrategy::CsvText => Err("CSV 解析尚未实现。".to_string()),
-        ValidationStrategy::XlsxPackage => Err("XLSX 解析尚未实现。".to_string()),
+        // 表格文档做真实结构校验：CSV 检查可安全解码，XLSX 检查真实工作簿结构，
+        // 不只依赖扩展名或 ZIP 文件头。
+        ValidationStrategy::CsvText | ValidationStrategy::XlsxPackage => {
+            validate_table_file(path, capability.id.as_str())
+        }
     }
+}
+
+/// 按格式校验表格文档；返回面向用户的失败原因。
+fn validate_table_file(path: &Path, format_id: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| format!("无法读取文件内容：{error}"))?;
+    table::validate_table_document(&bytes, format_id)
 }
 
 fn validate_pptx_package(path: &Path) -> Result<(), String> {
@@ -5949,10 +6082,11 @@ fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
         TextExtractionStrategy::PlainText => read_utf8_text(path),
         TextExtractionStrategy::None => Ok(String::new()),
         TextExtractionStrategy::PptxText => extract_pptx_text(path),
-        // 表格正文提取由 08/09 实现；在此之前不索引内容，但文档本身保持可用。
-        TextExtractionStrategy::TableText => Err(LibraryError::Preview(
-            "表格正文提取尚未实现。".to_string(),
-        )),
+        // 表格文档按单元格可见文字建立索引；公式缓存值缺失的单元格不参与索引。
+        TextExtractionStrategy::TableText => {
+            let bytes = read_table_bytes_within_limits(path)?;
+            table::extract_table_text(&bytes, file_type)
+        }
     }?;
     // 索引正文有明确上限：只把前 MAX_EXTRACTED_TEXT_CHARS 个字符写进 FTS，
     // 避免单份大文档把索引撑到无界（上限同时用于预览截断提示）。

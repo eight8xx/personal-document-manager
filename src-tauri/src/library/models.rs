@@ -194,6 +194,17 @@ pub enum DocumentPreview {
         notice: String,
         degraded_features: Vec<String>,
     },
+    Table {
+        sheets: Vec<TableSheet>,
+        sheet_index: usize,
+        start_row: usize,
+        cells: Vec<Vec<String>>,
+        row_numbers: Vec<usize>,
+        column_count: usize,
+        has_more_rows: bool,
+        degraded_features: Vec<String>,
+        notice: Option<String>,
+    },
     Failure {
         code: String,
         message: String,
@@ -201,6 +212,31 @@ pub enum DocumentPreview {
     Unsupported {
         message: String,
     },
+}
+
+/// 表格文档（CSV/XLSX）的工作表元数据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableSheet {
+    pub index: usize,
+    pub name: String,
+    /// 未读取过该工作表时为 `None`，避免为切换工作表扫描整本工作簿。
+    pub row_count: Option<usize>,
+    pub column_count: Option<usize>,
+}
+
+/// 表格分页预览请求；缺省值由服务层补齐。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TablePreviewRequest {
+    #[serde(default)]
+    pub sheet_index: usize,
+    #[serde(default)]
+    pub start_row: usize,
+    #[serde(default)]
+    pub row_count: usize,
+    #[serde(default)]
+    pub column_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

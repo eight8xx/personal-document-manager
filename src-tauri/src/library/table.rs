@@ -61,6 +61,11 @@ pub struct TableRange {
     pub start_row: usize,
     /// 请求范围内的单元格；行内按列索引定位（内部空洞为空字符串），行尾不补齐。
     pub cells: Vec<Vec<String>>,
+    /// 与 `cells` 一一对应的行号（从 0 开始）。
+    ///
+    /// CSV 是连续行号；XLSX 稀疏表用真实的 Excel 行索引，因此可能出现跳号，
+    /// 界面据此显示与表格软件一致的行号。
+    pub row_numbers: Vec<usize>,
     pub column_count: usize,
     pub has_more_rows: bool,
     pub degraded_features: Vec<String>,
@@ -101,6 +106,7 @@ pub fn read_csv_table(
         start_row,
         has_more_rows: start_row.saturating_add(rows_requested) < total_rows,
         cells: parsed.rows,
+        row_numbers: parsed.row_numbers,
         column_count: columns,
         degraded_features: degraded,
         notice: had_bom.then(|| "已忽略文件开头的 UTF-8 BOM。".to_string()),
@@ -174,6 +180,7 @@ pub fn read_xlsx_table(
         start_row,
         has_more_rows: start_row.saturating_add(rows_requested) < parsed.row_count,
         cells: parsed.rows,
+        row_numbers: parsed.row_numbers,
         column_count: columns,
         degraded_features: degraded,
         notice: None,
@@ -342,6 +349,8 @@ fn decode_csv_text(bytes: &[u8]) -> LibraryResult<(String, bool)> {
 struct CsvParseOutcome {
     /// 只有请求范围内的行；`window` 为 `None` 时是全部行。
     rows: Vec<Vec<String>>,
+    /// 与 `rows` 一一对应的行号。
+    row_numbers: Vec<usize>,
     total_rows: usize,
     max_columns: usize,
     truncated_cells: usize,
@@ -410,6 +419,7 @@ fn parse_csv_rows(
 
 struct CsvBuilder {
     rows: Vec<Vec<String>>,
+    row_numbers: Vec<usize>,
     total_rows: usize,
     max_columns: usize,
     truncated_cells: usize,
@@ -435,6 +445,7 @@ impl CsvBuilder {
         };
         Self {
             rows: Vec::new(),
+            row_numbers: Vec::new(),
             total_rows: 0,
             max_columns: 0,
             truncated_cells: 0,
@@ -515,6 +526,7 @@ impl CsvBuilder {
             || (index >= self.window_start && index - self.window_start < self.window_rows))
             && !self.row.is_empty()
         {
+            self.row_numbers.push(index);
             self.rows.push(std::mem::take(&mut self.row));
         } else {
             self.row.clear();
@@ -543,6 +555,7 @@ impl CsvBuilder {
     fn finish(self) -> CsvParseOutcome {
         CsvParseOutcome {
             rows: self.rows,
+            row_numbers: self.row_numbers,
             total_rows: self.total_rows,
             max_columns: self.max_columns,
             truncated_cells: self.truncated_cells,
@@ -1213,6 +1226,8 @@ struct OpenCell {
 
 struct SheetParse {
     rows: Vec<Vec<String>>,
+    /// 与 `rows` 一一对应的行索引；稀疏表会跳号。
+    row_numbers: Vec<usize>,
     /// 工作表的最大行索引 + 1（用 `r` 属性定位，稀疏行不会被顺序硬填）。
     row_count: usize,
     column_count: usize,
@@ -1232,6 +1247,7 @@ struct SheetParser<'a> {
     max_row_index: Option<usize>,
     max_column_index: Option<usize>,
     rows: Vec<Vec<String>>,
+    row_numbers: Vec<usize>,
     uncached_formulas: usize,
     truncated_cells: usize,
 }
@@ -1363,6 +1379,8 @@ impl SheetParser<'_> {
             .is_some_and(|row_index| self.in_window(row_index))
             && !self.row_cells.is_empty()
         {
+            self.row_numbers
+                .push(self.current_row.unwrap_or_default());
             self.rows.push(std::mem::take(&mut self.row_cells));
         }
         self.row_cells.clear();
@@ -1373,6 +1391,7 @@ impl SheetParser<'_> {
     fn finish(self) -> SheetParse {
         SheetParse {
             rows: self.rows,
+            row_numbers: self.row_numbers,
             row_count: self.max_row_index.map_or(0, |index| index + 1),
             column_count: self.max_column_index.map_or(0, |index| index + 1),
             uncached_formulas: self.uncached_formulas,
@@ -1401,6 +1420,7 @@ fn parse_sheet_xml(
         max_row_index: None,
         max_column_index: None,
         rows: Vec::new(),
+        row_numbers: Vec::new(),
         uncached_formulas: 0,
         truncated_cells: 0,
     };

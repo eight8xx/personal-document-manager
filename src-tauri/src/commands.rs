@@ -14,7 +14,8 @@ use crate::library::{
     DocumentSearchResponse, DocumentSummary, DocumentThumbnail, EmptyTrashResult,
     ExternalChangeMonitor, ImportBatch, ImportDecision, ImportItemResult, ImportProgress,
     ImportSource, IndexRunResult, IndexStatus, LibraryError, LibraryResult, LibraryService,
-    LibrarySummary, RecentLibrary, TagSummary, TrashDocumentSummary,
+    LibrarySummary, RecentLibrary, TablePreviewRequest, TableSheet, TagSummary,
+    TrashDocumentSummary,
 };
 
 pub struct AppState {
@@ -834,6 +835,59 @@ fn get_document_preview_contract(
 ) -> Result<DocumentPreview, CommandError> {
     state.with_library(library, |service| {
         service.get_document_preview(&document_id, page)
+    })
+}
+
+#[tauri::command]
+pub fn list_document_sheets(
+    library: LibrarySummary,
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<TableSheet>, CommandError> {
+    list_document_sheets_contract(&state, &library, document_id)
+}
+
+fn list_document_sheets_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    document_id: String,
+) -> Result<Vec<TableSheet>, CommandError> {
+    state.with_library(library, |service| {
+        service.list_document_sheets(&document_id)
+    })
+}
+
+#[tauri::command]
+pub fn get_table_preview(
+    library: LibrarySummary,
+    document_id: String,
+    sheet_index: usize,
+    start_row: usize,
+    row_count: usize,
+    column_count: usize,
+    state: State<'_, AppState>,
+) -> Result<DocumentPreview, CommandError> {
+    get_table_preview_contract(
+        &state,
+        &library,
+        document_id,
+        TablePreviewRequest {
+            sheet_index,
+            start_row,
+            row_count,
+            column_count,
+        },
+    )
+}
+
+fn get_table_preview_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    document_id: String,
+    request: TablePreviewRequest,
+) -> Result<DocumentPreview, CommandError> {
+    state.with_library(library, |service| {
+        service.get_table_preview(&document_id, request)
     })
 }
 
