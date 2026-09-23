@@ -44,6 +44,8 @@ import type {
   ReceiveDirectoryListing,
   ReceiveDirectoryListingItem,
   ReceiveDirectoryOperation,
+  ReceiveImportCompletedEvent,
+  ReceiveImportCompletedHandler,
   ReceiveImportLogEntry,
   ReceiveSource,
   ReceiveSourceCandidate,
@@ -289,6 +291,9 @@ export class FakeBackendClient implements BackendClient {
   private receiveScanResults: ReceiveSourceScanResult[] = [];
   private receiveImportLog: ReceiveImportLogEntry[] = [];
   private nextReceiveSourceId = 1;
+  private receiveImportCompletedHandlers = new Set<ReceiveImportCompletedHandler>();
+  /** 每次 startImport 的分类开关：null 表示调用方未传（按应用规则处理）。 */
+  readonly importClassificationDecisions: (boolean | null)[] = [];
   /** 测试可注入的候选目录；默认只给微信一个候选，QQ 留空以覆盖「无候选」路径。 */
   private readonly receiveSourceCandidates: Partial<
     Record<ReceiveSourceKind, ReceiveSourceCandidate[]>
@@ -465,13 +470,20 @@ export class FakeBackendClient implements BackendClient {
     _library: LibrarySummary,
     paths: string[],
     targetCollectionId: string | null = null,
-    source: ImportSource = "filePicker"
+    source: ImportSource = "filePicker",
+    applyClassification?: boolean
   ): Promise<ImportBatch> {
     this.assertCurrentLibrary(_library);
+    // 记录分类开关，供测试断言「不应用规则」分支确实传到了后端。
+    this.importClassificationDecisions.push(
+      applyClassification === undefined ? null : applyClassification
+    );
     this.calls.push(
       `startImport:${paths.join("|")}${
         targetCollectionId ? `:${targetCollectionId}` : ""
-      }${source === "collectionDrop" ? `:${source}` : ""}`
+      }${source === "collectionDrop" ? `:${source}` : ""}${
+        applyClassification === undefined ? "" : `:classify=${applyClassification}`
+      }`
     );
     if (this.startImportImpl) {
       const resolved = await this.startImportImpl(
@@ -2016,6 +2028,22 @@ export class FakeBackendClient implements BackendClient {
     this.assertCurrentLibrary(library);
     this.calls.push(`listReceiveImportLog:${limit}`);
     return structuredClone(this.receiveImportLog.slice(0, limit));
+  }
+
+  async subscribeToReceiveImportCompleted(
+    handler: ReceiveImportCompletedHandler
+  ): Promise<() => void> {
+    this.receiveImportCompletedHandlers.add(handler);
+    return () => {
+      this.receiveImportCompletedHandlers.delete(handler);
+    };
+  }
+
+  /** 测试用：模拟后端发出一次接收导入完成事件。 */
+  emitReceiveImportCompleted(event: ReceiveImportCompletedEvent) {
+    for (const handler of this.receiveImportCompletedHandlers) {
+      handler(structuredClone(event));
+    }
   }
 
   private snapshot(): BootstrapState {

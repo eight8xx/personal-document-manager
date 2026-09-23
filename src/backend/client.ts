@@ -34,6 +34,7 @@ import type {
   LibrarySummary,
   ReceiveDirectoryListing,
   ReceiveDirectoryOperation,
+  ReceiveImportCompletedEvent,
   ReceiveImportLogEntry,
   ReceiveSource,
   ReceiveSourceCandidates,
@@ -102,13 +103,15 @@ export const tauriBackendClient: BackendClient = {
     library,
     paths,
     targetCollectionId = null,
-    source = "filePicker"
+    source = "filePicker",
+    applyClassification
   ) =>
     invoke<ImportBatch>("start_import", {
       library,
       paths,
       targetCollectionId,
-      source
+      source,
+      applyClassification
     }),
   resolveImportItem: (library, itemId, decision) =>
     invoke<ImportItemResult>("resolve_import_item", { library, itemId, decision }),
@@ -275,6 +278,10 @@ export const tauriBackendClient: BackendClient = {
     }),
   scanReceiveSources: (library) =>
     invoke<ReceiveSourceScanResult[]>("scan_receive_sources", { library }),
+  subscribeToReceiveImportCompleted: async (handler) =>
+    listen<ReceiveImportCompletedEvent>("receive-import-completed", (event) => {
+      handler(event.payload);
+    }),
   listReceiveImportLog: (library, limit = 100) =>
     invoke<ReceiveImportLogEntry[]>("list_receive_import_log", {
       library,

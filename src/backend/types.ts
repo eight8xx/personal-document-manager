@@ -409,6 +409,16 @@ export interface ReceiveSourceScanResult {
   failedCount: number;
 }
 
+/** 接收目录实时导入一轮结束后由后端发出；只针对产生它的资料库。 */
+export interface ReceiveImportCompletedEvent {
+  library: LibrarySummary;
+  results: ReceiveSourceScanResult[];
+}
+
+export type ReceiveImportCompletedHandler = (
+  event: ReceiveImportCompletedEvent
+) => void;
+
 export interface ReceiveImportLogEntry {
   sourceId: string;
   sourcePath: string;
@@ -568,7 +578,12 @@ export interface BackendClient {
     library: LibrarySummary,
     paths: string[],
     targetCollectionId?: string | null,
-    source?: ImportSource
+    source?: ImportSource,
+    /**
+     * 是否应用当前资料库的分类规则；缺省为应用。
+     * 显式传 false 时保持「按原有方式导入」的行为。
+     */
+    applyClassification?: boolean
   ): Promise<ImportBatch>;
   resolveImportItem(
     library: LibrarySummary,
@@ -703,6 +718,9 @@ export interface BackendClient {
     operation: ReceiveDirectoryOperation
   ): Promise<ReceiveSource[]>;
   scanReceiveSources(library: LibrarySummary): Promise<ReceiveSourceScanResult[]>;
+  subscribeToReceiveImportCompleted(
+    handler: ReceiveImportCompletedHandler
+  ): Promise<() => void>;
   listReceiveImportLog(
     library: LibrarySummary,
     limit?: number
