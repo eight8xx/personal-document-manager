@@ -128,6 +128,7 @@ describe("批量导入流程", () => {
 
     act(() => {
       client.emitImportProgress({
+        library,
         batchId: "batch-merge",
         total: 3,
         completed: 0,
@@ -144,6 +145,7 @@ describe("批量导入流程", () => {
 
     act(() => {
       client.emitImportProgress({
+        library,
         batchId: "batch-merge",
         total: 3,
         completed: 1,
@@ -238,6 +240,260 @@ describe("批量导入流程", () => {
     }
     expect(row).toHaveAttribute("aria-current", "true");
     expect(screen.queryByRole("dialog", { name: "发现重复文档" })).toBeNull();
+  });
+
+  it("clears an old library's pending decision when switching away and back", async () => {
+    const user = userEvent.setup();
+    const secondPath = "D:\\Archive";
+    const duplicateItem = result("duplicate-before-switch", "重复.md", "duplicate", {
+      duplicateDocumentId: existingDocument.id
+    });
+    const client = new FakeBackendClient({
+      bootstrap: {
+        currentLibrary: library,
+        recentLibraries: [
+          {
+            path: library.path,
+            name: library.name,
+            lastOpenedAt: "2026-09-13T08:00:00Z",
+            isAvailable: true
+          },
+          {
+            path: secondPath,
+            name: "归档",
+            lastOpenedAt: "2026-09-12T08:00:00Z",
+            isAvailable: true
+          }
+        ]
+      },
+      documents: [existingDocument],
+      selectedDocuments: [duplicateItem.sourcePath],
+      startImport: async () => batch("batch-before-switch", [duplicateItem])
+    });
+    const openLibrary = client.openLibrary.bind(client);
+    client.openLibrary = async (path) => {
+      const opened = await openLibrary(path);
+      return path === library.path ? library : opened;
+    };
+    let requestedLibrary: LibrarySummary | null = null;
+    const startImport = client.startImport.bind(client);
+    client.startImport = async (owner, paths, targetCollectionId, source) => {
+      requestedLibrary = owner;
+      return startImport(owner, paths, targetCollectionId, source);
+    };
+
+    render(<App client={client} />);
+    await screen.findByText("项目说明");
+    await user.click(screen.getAllByRole("button", { name: "导入文档" })[0]);
+    expect(
+      await screen.findByRole("dialog", { name: "发现重复文档" })
+    ).toBeInTheDocument();
+    expect(requestedLibrary).toEqual(library);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    let settings = screen.getByRole("dialog", { name: "资料库" });
+    await user.click(within(settings).getByRole("button", { name: "切换" }));
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "发现重复文档" })
+      ).not.toBeInTheDocument();
+    });
+    expect(screen.queryByLabelText("导入结果汇总")).not.toBeInTheDocument();
+
+    settings = screen.getByRole("dialog", { name: "资料库" });
+    await user.click(within(settings).getByRole("button", { name: "切换" }));
+    expect(
+      await screen.findByText("此前未完成的导入请重新发起。")
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "发现重复文档" })
+    ).not.toBeInTheDocument();
+    expect(
+      client.calls.some((call) => call.startsWith("resolveImportItem:"))
+    ).toBe(false);
+  });
+
+  it("sends the originating library with a pending decision even when its response arrives after switching", async () => {
+    const user = userEvent.setup();
+    const duplicateItem = result("decision-before-switch", "重复.md", "duplicate", {
+      duplicateDocumentId: existingDocument.id
+    });
+    const secondPath = "D:\\Archive";
+    const client = new FakeBackendClient({
+      strictLibraryIdentity: true,
+      bootstrap: {
+        currentLibrary: library,
+        recentLibraries: [
+          {
+            path: library.path,
+            name: library.name,
+            lastOpenedAt: "2026-09-13T08:00:00Z",
+            isAvailable: true
+          },
+          {
+            path: secondPath,
+            name: "归档",
+            lastOpenedAt: "2026-09-12T08:00:00Z",
+            isAvailable: true
+          }
+        ]
+      },
+      documents: [existingDocument],
+      selectedDocuments: [duplicateItem.sourcePath],
+      startImport: async () => batch("batch-decision-switch", [duplicateItem])
+    });
+    const originalResolve = client.resolveImportItem.bind(client);
+    let requestedLibrary: LibrarySummary | null = null;
+    let rejectedByCurrentLibrary = false;
+    let finishDecision: (() => void) | undefined;
+    client.resolveImportItem = async (owner, itemId, decision) => {
+      requestedLibrary = owner;
+      await new Promise<void>((resolve) => {
+        finishDecision = resolve;
+      });
+      try {
+        return await originalResolve(owner, itemId, decision);
+      } catch (caught) {
+        rejectedByCurrentLibrary = true;
+        throw caught;
+      }
+    };
+
+    render(<App client={client} />);
+    await screen.findByText("项目说明");
+    await user.click(screen.getByRole("button", { name: "导入文档" }));
+    const decision = await screen.findByRole("dialog", {
+      name: "发现重复文档"
+    });
+    await user.click(
+      within(decision).getByRole("button", { name: "仍然单独导入" })
+    );
+    expect(requestedLibrary).toEqual(library);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const settings = screen.getByRole("dialog", { name: "资料库" });
+    await user.click(within(settings).getByRole("button", { name: "切换" }));
+    await waitFor(() => expect(client.calls).toContain(`open:${secondPath}`));
+
+    await act(async () => {
+      finishDecision?.();
+    });
+    expect(requestedLibrary).toEqual(library);
+    expect(rejectedByCurrentLibrary).toBe(true);
+  });
+
+  it("ignores another library's progress while a new import has no batch ID yet", async () => {
+    const user = userEvent.setup();
+    const secondPath = "D:\\Archive";
+    const oldItem = result("old-item", "A旧文件.md", "duplicate");
+    const newItem = result("new-item", "B新文件.md", "imported");
+    const client = new FakeBackendClient({
+      bootstrap: {
+        currentLibrary: library,
+        recentLibraries: [
+          {
+            path: library.path,
+            name: library.name,
+            lastOpenedAt: "2026-09-13T08:00:00Z",
+            isAvailable: true
+          },
+          {
+            path: secondPath,
+            name: "归档",
+            lastOpenedAt: "2026-09-12T08:00:00Z",
+            isAvailable: true
+          }
+        ]
+      },
+      selectedDocuments: [newItem.sourcePath]
+    });
+    let newLibrary: LibrarySummary | null = null;
+    let finishImport: ((value: ImportBatch) => void) | undefined;
+    client.startImport = async (owner) => {
+      newLibrary = owner;
+      return new Promise((resolve) => {
+        finishImport = resolve;
+      });
+    };
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const settings = screen.getByRole("dialog", { name: "资料库" });
+    await user.click(within(settings).getByRole("button", { name: "切换" }));
+    await waitFor(() => expect(client.calls).toContain(`open:${secondPath}`));
+    await user.click(screen.getAllByRole("button", { name: "导入文档" })[0]);
+    await waitFor(() => expect(newLibrary?.path).toBe(secondPath));
+
+    act(() => {
+      client.emitImportProgress({
+        library,
+        batchId: "old-batch",
+        total: 1,
+        completed: 1,
+        currentFileName: oldItem.fileName,
+        currentSourcePath: oldItem.sourcePath,
+        item: oldItem,
+        finished: true
+      });
+    });
+    expect(screen.queryByText("A旧文件.md")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "发现重复文档" })
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      client.emitImportProgress({
+        library: { ...newLibrary!, path: "d:/archive/" },
+        batchId: "new-batch",
+        total: 1,
+        completed: 1,
+        currentFileName: newItem.fileName,
+        currentSourcePath: newItem.sourcePath,
+        item: newItem,
+        finished: true
+      });
+    });
+    expect(await screen.findByText("B新文件.md")).toBeInTheDocument();
+    await act(async () => {
+      finishImport?.(batch("new-batch", [newItem]));
+    });
+  });
+
+  it("keeps a pending decision visible with a readable error when resolution fails", async () => {
+    const user = userEvent.setup();
+    const duplicateItem = result("failed-decision", "重复.md", "duplicate", {
+      duplicateDocumentId: existingDocument.id
+    });
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: [existingDocument],
+      selectedDocuments: [duplicateItem.sourcePath],
+      startImport: async () => batch("batch-failed-decision", [duplicateItem])
+    });
+    client.resolveImportItem = async () => {
+      throw {
+        code: "invalidImportDecision",
+        message: "该导入项属于其他资料库，请重新发起导入。"
+      };
+    };
+
+    render(<App client={client} />);
+    await screen.findByText("项目说明");
+    await user.click(screen.getByRole("button", { name: "导入文档" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "发现重复文档"
+    });
+    await user.click(
+      within(dialog).getByRole("button", { name: "仍然单独导入" })
+    );
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "该导入项属于其他资料库，请重新发起导入。"
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "仍然单独导入" })
+    ).toBeEnabled();
   });
 
   it("requires confirmation before replacing a changed source document", async () => {

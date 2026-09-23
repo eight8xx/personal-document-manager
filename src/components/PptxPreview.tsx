@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import {
   useCallback,
+  useContext,
   useEffect,
   useRef,
   useState
@@ -20,11 +21,13 @@ import type { CSSProperties } from "react";
 
 import { documentFormatIdForType } from "../backend/documentFormats";
 import { toBackendError } from "../backend/error";
+import { LibraryContext } from "../backend/libraryContext";
 import { safeExternalUrl } from "../backend/url";
 import type {
   BackendClient,
   DocumentPreview,
-  DocumentSummary
+  DocumentSummary,
+  LibrarySummary
 } from "../backend/types";
 import {
   cachePptxRender,
@@ -275,6 +278,7 @@ export function PptxPreview({
   document: DocumentSummary;
   preview: PptxDocumentPreview;
 }) {
+  const library = useContext(LibraryContext);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewerRef = useRef<PptxViewer | null>(null);
   const safetyTimerRef = useRef<number | null>(null);
@@ -515,7 +519,10 @@ export function PptxPreview({
     setOpening(true);
     setLinkError("");
     try {
-      await client.openDocument(document.id);
+      if (!library) {
+        throw new Error("当前资料库不可用，无法打开文档。");
+      }
+      await client.openDocument(library, document.id);
     } catch (caught) {
       setLinkError(toBackendError(caught).message);
     } finally {
@@ -733,14 +740,15 @@ const thumbnailCache = new Map<string, Promise<DocumentPreview>>();
 
 async function loadPptxPreview(
   client: BackendClient,
+  library: LibrarySummary,
   documentId: string,
   contentHash: string,
   lastImportedAt: string
 ) {
-  const key = `${documentId}:${contentHash || lastImportedAt}`;
+  const key = `${library.id}:${library.path}:${documentId}:${contentHash || lastImportedAt}`;
   let pending = thumbnailCache.get(key);
   if (!pending) {
-    pending = client.getDocumentPreview(documentId);
+    pending = client.getDocumentPreview(library, documentId);
     thumbnailCache.set(key, pending);
     void pending.catch(() => thumbnailCache.delete(key));
   }
@@ -754,6 +762,7 @@ export function PptxThumbnail({
   client: BackendClient;
   document: DocumentSummary;
 }) {
+  const library = useContext(LibraryContext);
   const containerRef = useRef<HTMLSpanElement | null>(null);
   const generationRef = useRef(0);
   const startedGenerationRef = useRef(0);
@@ -784,7 +793,10 @@ export function PptxThumbnail({
       let timer: number | null = null;
       let removeAbortListener: () => void = () => undefined;
       try {
-        const cached = await client.getDocumentThumbnail(documentId);
+        if (!library) {
+          throw new Error("当前资料库不可用，无法生成缩略图。");
+        }
+        const cached = await client.getDocumentThumbnail(library, documentId);
         if (!isCurrent()) {
           return;
         }
@@ -799,6 +811,7 @@ export function PptxThumbnail({
 
         const preview = await loadPptxPreview(
           client,
+          library,
           documentId,
           contentHash,
           lastImportedAt
@@ -889,7 +902,11 @@ export function PptxThumbnail({
         if (!thumb || !/^data:image\/(?:png|jpeg|jpg);base64,/i.test(thumb)) {
           throw new Error("PPTX 渲染器没有生成有效图片。");
         }
+        if (!library) {
+          throw new Error("当前资料库不可用，无法保存缩略图。");
+        }
         const saved = await client.saveDocumentThumbnail(
+          library,
           documentId,
           contentHash,
           thumb
@@ -914,7 +931,7 @@ export function PptxThumbnail({
         host.remove();
       }
     },
-    [client]
+    [client, library]
   );
 
   useEffect(() => {

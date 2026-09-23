@@ -12,10 +12,11 @@ import {
   Tags,
   Trash2
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { toBackendError } from "../backend/error";
+import { LibraryContext } from "../backend/libraryContext";
 import { safeExternalUrl } from "../backend/url";
 import type {
   BackendClient,
@@ -225,6 +226,7 @@ export function DocumentDetails({
   onMoveDocumentToTrash,
   onRetryIndex
 }: DocumentDetailsProps) {
+  const library = useContext(LibraryContext);
   const TypeIcon = document ? documentTypeIcon(document) : FileText;
   const status = document ? documentStatusPresentation(document) : null;
   const documentId = document?.id ?? null;
@@ -255,7 +257,7 @@ export function DocumentDetails({
     }
     setPreviewError("");
 
-    if (!documentId) {
+    if (!documentId || !library) {
       setPreviewLoading(false);
       return () => {
         active = false;
@@ -264,7 +266,7 @@ export function DocumentDetails({
 
     setPreviewLoading(true);
     void client
-      .getDocumentPreview(documentId, requestedPage)
+      .getDocumentPreview(library, documentId, requestedPage)
       .then((result) => {
         if (active) {
           setPreview(result);
@@ -286,6 +288,7 @@ export function DocumentDetails({
     };
   }, [
     client,
+    library,
     documentId,
     previewKey,
     pdfPage,
@@ -293,14 +296,14 @@ export function DocumentDetails({
   ]);
 
   async function openDocument() {
-    if (!documentId) {
+    if (!documentId || !library) {
       return;
     }
 
     setOpening(true);
     setOpenError("");
     try {
-      await client.openDocument(documentId);
+      await client.openDocument(library, documentId);
     } catch (caught) {
       setOpenError(toBackendError(caught).message);
     } finally {

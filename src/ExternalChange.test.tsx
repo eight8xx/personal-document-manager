@@ -62,6 +62,68 @@ function document(
 }
 
 describe("外部变化重索引状态", () => {
+  it("ignores an old library's index event after switching to another library", async () => {
+    const user = userEvent.setup();
+    const secondPath = "D:\\Archive";
+    const currentDocument = document("shared-document-id", "当前资料");
+    const client = new FakeBackendClient({
+      bootstrap: {
+        currentLibrary: library,
+        recentLibraries: [
+          {
+            path: library.path,
+            name: library.name,
+            lastOpenedAt: "2026-09-13T08:00:00Z",
+            isAvailable: true
+          },
+          {
+            path: secondPath,
+            name: "归档",
+            lastOpenedAt: "2026-09-12T08:00:00Z",
+            isAvailable: true
+          }
+        ]
+      },
+      collections,
+      documents: [currentDocument]
+    });
+    const openLibrary = client.openLibrary.bind(client);
+    let openedLibrary: LibrarySummary | null = null;
+    client.openLibrary = async (path) => {
+      openedLibrary = await openLibrary(path);
+      return openedLibrary;
+    };
+
+    render(<App client={client} />);
+    await screen.findByText("当前资料");
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const settings = screen.getByRole("dialog", { name: "资料库" });
+    await user.click(within(settings).getByRole("button", { name: "切换" }));
+    await waitFor(() => expect(client.calls).toContain(`open:${secondPath}`));
+    const results = await screen.findByRole("main", { name: "文档列表" });
+    expect(within(results).getByText("可搜索")).toBeInTheDocument();
+
+    act(() => {
+      client.emitDocumentIndexChanged({
+        library,
+        phase: "processing",
+        documentIds: [currentDocument.id],
+        result: null
+      });
+    });
+    expect(within(results).getByText("可搜索")).toBeInTheDocument();
+
+    act(() => {
+      client.emitDocumentIndexChanged({
+        library: openedLibrary!,
+        phase: "processing",
+        documentIds: [currentDocument.id],
+        result: null
+      });
+    });
+    expect(await within(results).findByText("处理中")).toBeInTheDocument();
+  });
+
   it("shows processing, searchable, failed retry and waiting states", async () => {
     const client = new FakeBackendClient({
       bootstrap,
@@ -131,6 +193,7 @@ describe("外部变化重索引状态", () => {
     client.setDocument(refreshed);
     await act(async () => {
       client.emitDocumentIndexChanged({
+        library,
         phase: "completed",
         documentIds: [],
         result: { processed: 1, searchable: 1, failed: 0 }
@@ -163,6 +226,7 @@ describe("外部变化重索引状态", () => {
 
     act(() => {
       client.emitDocumentIndexChanged({
+        library,
         phase: "processing",
         documentIds: [original.id],
         result: null
@@ -173,6 +237,7 @@ describe("外部变化重索引状态", () => {
     client.setDocument(refreshed);
     await act(async () => {
       client.emitDocumentIndexChanged({
+        library,
         phase: "completed",
         documentIds: [],
         result: { processed: 1, searchable: 1, failed: 0 }

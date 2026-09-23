@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import { FakeBackendClient } from "./backend/fakeClient";
+import { LibraryContext } from "./backend/libraryContext";
 import type {
   BootstrapState,
   DocumentPreview,
@@ -42,6 +43,14 @@ const bootstrap: BootstrapState = {
   currentLibrary: library,
   recentLibraries: []
 };
+
+function thumbnailInLibrary(client: FakeBackendClient, document: DocumentSummary) {
+  return (
+    <LibraryContext.Provider value={library}>
+      <PptxThumbnail client={client} document={document} />
+    </LibraryContext.Provider>
+  );
+}
 
 const documentSummary: DocumentSummary = {
   id: "pptx-1",
@@ -172,11 +181,13 @@ describe("PPTX 导入与版式预览", () => {
     });
     const user = userEvent.setup();
     render(
-      <PptxPreview
-        client={client}
-        document={documentSummary}
-        preview={pptxPreview}
-      />
+      <LibraryContext.Provider value={library}>
+        <PptxPreview
+          client={client}
+          document={documentSummary}
+          preview={pptxPreview}
+        />
+      </LibraryContext.Provider>
     );
 
     expect(await screen.findByText("幻灯片一")).toBeInTheDocument();
@@ -343,11 +354,13 @@ describe("PPTX 导入与版式预览", () => {
     });
     const user = userEvent.setup();
     render(
-      <PptxPreview
-        client={client}
-        document={documentSummary}
-        preview={pptxPreview}
-      />
+      <LibraryContext.Provider value={library}>
+        <PptxPreview
+          client={client}
+          document={documentSummary}
+          preview={pptxPreview}
+        />
+      </LibraryContext.Provider>
     );
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -411,6 +424,12 @@ describe("PPTX 导入与版式预览", () => {
       getDocumentPreview: async () => pptxPreview,
       saveDocumentThumbnail
     });
+    let requestedLibrary: LibrarySummary | null = null;
+    const saveThumbnail = client.saveDocumentThumbnail.bind(client);
+    client.saveDocumentThumbnail = async (owner, id, hash, dataUrl) => {
+      requestedLibrary = owner;
+      return saveThumbnail(owner, id, hash, dataUrl);
+    };
     pptxMocks.open.mockImplementationOnce(
       async (_buffer: ArrayBuffer, host: HTMLElement, options: MockRendererOptions) => {
         const slide = document.createElement("section");
@@ -438,9 +457,7 @@ describe("PPTX 导入与版式预览", () => {
       }
     );
 
-    const { container } = render(
-      <PptxThumbnail client={client} document={documentSummary} />
-    );
+    const { container } = render(thumbnailInLibrary(client, documentSummary));
 
     const image = await waitFor(() => {
       const candidate = container.querySelector<HTMLImageElement>(
@@ -458,6 +475,7 @@ describe("PPTX 导入与版式预览", () => {
         thumbnailDataUrl
       );
     });
+    expect(requestedLibrary).toEqual(library);
     expect(embeddedThumbnail).toHaveBeenCalled();
     expect(saveDocumentThumbnail).not.toHaveBeenCalledWith(
       documentSummary.id,
@@ -560,12 +578,10 @@ describe("PPTX 导入与版式预览", () => {
       getDocumentPreview: async () => pptxPreview,
       saveDocumentThumbnail
     });
-    const { container, rerender } = render(
-      <PptxThumbnail client={client} document={oldDocument} />
-    );
+    const { container, rerender } = render(thumbnailInLibrary(client, oldDocument));
     await waitFor(() => expect(getDocumentThumbnail).toHaveBeenCalledTimes(1));
 
-    rerender(<PptxThumbnail client={client} document={newDocument} />);
+    rerender(thumbnailInLibrary(client, newDocument));
     await waitFor(() => {
       expect(saveDocumentThumbnail).toHaveBeenCalledTimes(1);
       expect(saveDocumentThumbnail).toHaveBeenCalledWith(
@@ -607,9 +623,7 @@ describe("PPTX 导入与版式预览", () => {
       }),
       getDocumentPreview: async () => pptxPreview
     });
-    const { container } = render(
-      <PptxThumbnail client={client} document={documentSummary} />
-    );
+    const { container } = render(thumbnailInLibrary(client, documentSummary));
 
     await waitFor(() => {
       expect(
@@ -632,9 +646,7 @@ describe("PPTX 导入与版式预览", () => {
       })
     });
 
-    const { container } = render(
-      <PptxThumbnail client={client} document={documentSummary} />
-    );
+    const { container } = render(thumbnailInLibrary(client, documentSummary));
 
     await waitFor(() => {
       expect(

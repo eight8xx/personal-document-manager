@@ -22,11 +22,13 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   MouseEvent as ReactMouseEvent,
-  PointerEvent as ReactPointerEvent
+  PointerEvent as ReactPointerEvent,
+  RefObject
 } from "react";
 
 import { BackendError, toBackendError } from "../backend/error";
 import { importableDocumentTypes } from "../backend/documentFormats";
+import { sameLibraryIdentity } from "../backend/libraryIdentity";
 import type {
   BackendClient,
   BatchDocumentOperation,
@@ -86,6 +88,12 @@ import {
 interface LibraryWorkspaceProps {
   client: BackendClient;
   library: LibrarySummary;
+  showImportRestartNotice: boolean;
+  settingsButtonRef: RefObject<HTMLButtonElement | null>;
+  onUnfinishedImportChange: (
+    owner: LibrarySummary,
+    unfinished: boolean
+  ) => void;
   onOpenSettings: () => void;
 }
 
@@ -226,9 +234,13 @@ function replaceImportItem(
   );
 }
 
-function progressFromBatch(batch: ImportBatch): ImportProgress {
+function progressFromBatch(
+  batch: ImportBatch,
+  library: LibrarySummary
+): ImportProgress {
   const lastItem = batch.items.at(-1) ?? null;
   return {
+    library,
     batchId: batch.batchId,
     total: batch.items.length,
     completed: batch.items.length,
@@ -281,6 +293,9 @@ function documentMatchesFilters(
 export function LibraryWorkspace({
   client,
   library,
+  showImportRestartNotice,
+  settingsButtonRef,
+  onUnfinishedImportChange,
   onOpenSettings
 }: LibraryWorkspaceProps) {
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
@@ -325,6 +340,9 @@ export function LibraryWorkspace({
   const [importing, setImporting] = useState(false);
   const importingRef = useRef(false);
   const [importRun, setImportRun] = useState<ImportRun | null>(null);
+  const [importRestartNotice, setImportRestartNotice] = useState(
+    showImportRestartNotice
+  );
   const [internalDocumentDrag, setInternalDocumentDrag] =
     useState<InternalDocumentDrag | null>(null);
   const pendingDocumentDragRef = useRef<PendingDocumentDrag | null>(null);
@@ -376,6 +394,18 @@ export function LibraryWorkspace({
   const batchRunningRef = useRef(false);
   const [cancellingBatch, setCancellingBatch] = useState(false);
   const [error, setError] = useState("");
+  const hasUnfinishedImport =
+    importing ||
+    importRun?.items.some(
+      (item) =>
+        item.status === "duplicate" ||
+        item.status === "sourceChanged" ||
+        (item.status === "failed" && item.retryable)
+    ) === true;
+
+  useEffect(() => {
+    onUnfinishedImportChange(library, hasUnfinishedImport);
+  }, [hasUnfinishedImport, library, onUnfinishedImportChange]);
 
   const refreshDocuments = useCallback(async (replace = false) => {
     const items = await client.listDocuments();
@@ -437,7 +467,7 @@ export function LibraryWorkspace({
       );
       setIndexProgress({ processed: 0, total: pendingCount });
       setIndexing(true);
-      const result = await client.indexPendingDocuments();
+      const result = await client.indexPendingDocuments(library);
       if (result.processed > 0) {
         await refreshDocuments();
         setSearchRevision((value) => value + 1);
@@ -449,7 +479,7 @@ export function LibraryWorkspace({
       setIndexing(false);
       setIndexProgress(null);
     }
-  }, [client, refreshDocuments]);
+  }, [client, library, refreshDocuments]);
 
   useEffect(() => {
     let active = true;
@@ -518,7 +548,7 @@ export function LibraryWorkspace({
 
     void client
       .subscribeToDocumentIndexChanges((event: DocumentIndexChangedEvent) => {
-        if (!active) {
+        if (!active || !sameLibraryIdentity(event.library, library)) {
           return;
         }
         if (event.phase === "processing") {
@@ -593,7 +623,7 @@ export function LibraryWorkspace({
       active = false;
       unlisten?.();
     };
-  }, [client, refreshDocuments]);
+  }, [client, library, refreshDocuments]);
 
   useEffect(() => {
     const query = searchQuery.trim();
@@ -671,6 +701,7 @@ export function LibraryWorkspace({
 
       importingRef.current = true;
       setImporting(true);
+      setImportRestartNotice(false);
       setError("");
       setHighlightedDocumentId(null);
       setActiveDecisionItemId(null);
@@ -683,6 +714,7 @@ export function LibraryWorkspace({
 
       try {
         const batch = await client.startImport(
+          library,
           uniquePaths,
           targetCollectionId,
           source
@@ -699,7 +731,7 @@ export function LibraryWorkspace({
             progress:
               current?.progress?.batchId === batch.batchId
                 ? current.progress
-                : progressFromBatch(batch),
+                : progressFromBatch(batch, library),
             items: mergeById(currentItems, batch.items, importItemId)
           };
         });
@@ -711,7 +743,7 @@ export function LibraryWorkspace({
         setImporting(false);
       }
     },
-    [client, refreshLibraryData]
+    [client, library, refreshLibraryData]
   );
 
   useEffect(() => {
@@ -765,6 +797,9 @@ export function LibraryWorkspace({
 
     void client
       .subscribeToImportProgress((progress) => {
+        if (!active || !sameLibraryIdentity(progress.library, library)) {
+          return;
+        }
         setImportRun((current) => {
           if (!current) {
             return current;
@@ -799,7 +834,7 @@ export function LibraryWorkspace({
       active = false;
       unlisten?.();
     };
-  }, [client]);
+  }, [client, library]);
 
   useEffect(() => {
     const pendingItem = importRun?.items.find(
@@ -844,6 +879,7 @@ export function LibraryWorkspace({
 
     setError("");
     const updated = await client.resolveImportItem(
+      library,
       activeDecisionItemId,
       decision
     );
@@ -881,7 +917,7 @@ export function LibraryWorkspace({
     setRetryingItemIds((current) => new Set(current).add(item.itemId));
     setError("");
     try {
-      const updated = await client.retryImportItem(item.itemId);
+      const updated = await client.retryImportItem(library, item.itemId);
       setImportRun((current) =>
         current
           ? {
@@ -906,7 +942,7 @@ export function LibraryWorkspace({
     setRetryingIndexIds((current) => new Set(current).add(document.id));
     setError("");
     try {
-      const updated = await client.retryDocumentIndex(document.id);
+      const updated = await client.retryDocumentIndex(library, document.id);
       setDocuments((current) =>
         current.map((candidate) =>
           candidate.id === updated.id ? updated : candidate
@@ -933,6 +969,7 @@ export function LibraryWorkspace({
     try {
       if (collectionAction.type === "create") {
         const created = await client.createCollection(
+          library,
           value ?? "",
           collectionAction.parent?.id ?? null
         );
@@ -940,12 +977,13 @@ export function LibraryWorkspace({
         setSelectedCollectionId(created.id);
       } else if (collectionAction.type === "rename") {
         await client.renameCollection(
+          library,
           collectionAction.collection.id,
           value ?? ""
         );
         await refreshCollections();
       } else {
-        await client.moveCollection(collectionAction.collection.id, value);
+        await client.moveCollection(library, collectionAction.collection.id, value);
         await refreshCollections();
       }
       setCollectionAction(null);
@@ -963,6 +1001,7 @@ export function LibraryWorkspace({
     setError("");
     try {
       const result: CollectionDeleteResult = await client.deleteCollection(
+        library,
         deleteTarget.id
       );
       await refreshLibraryData();
@@ -983,14 +1022,14 @@ export function LibraryWorkspace({
 
     setError("");
     if (tagAction.type === "create") {
-      const created = await client.createTag(name);
+      const created = await client.createTag(library, name);
       setTags((current) =>
         [...current.filter((tag) => tag.id !== created.id), created].sort(
           (left, right) => left.name.localeCompare(right.name, "zh-CN")
         )
       );
     } else {
-      const renamed = await client.renameTag(tagAction.tag.id, name);
+      const renamed = await client.renameTag(library, tagAction.tag.id, name);
       setTags((current) =>
         current
           .map((tag) => (tag.id === renamed.id ? renamed : tag))
@@ -1015,7 +1054,7 @@ export function LibraryWorkspace({
 
     setError("");
     const target = deleteTagTarget;
-    await client.deleteTag(target.id);
+    await client.deleteTag(library, target.id);
     setTags((current) => current.filter((tag) => tag.id !== target.id));
     setDocuments((current) =>
       current.map((document) => ({
@@ -1037,6 +1076,7 @@ export function LibraryWorkspace({
 
     setError("");
     const updated = await client.updateDocumentMetadata(
+      library,
       metadataTarget.id,
       update
     );
@@ -1062,6 +1102,7 @@ export function LibraryWorkspace({
     setError("");
     try {
       const moved = await client.moveDocumentToCollection(
+        library,
         document.id,
         collectionId
       );
@@ -1088,7 +1129,7 @@ export function LibraryWorkspace({
 
     setError("");
     try {
-      await client.moveDocumentToTrash(moveToTrashTarget.id);
+      await client.moveDocumentToTrash(library, moveToTrashTarget.id);
       if (selectedDocumentId === moveToTrashTarget.id) {
         setSelectedDocumentId(null);
       }
@@ -1110,7 +1151,7 @@ export function LibraryWorkspace({
     setRestoringTrashIds((current) => new Set(current).add(document.id));
     setError("");
     try {
-      await client.restoreDocument(document.id);
+      await client.restoreDocument(library, document.id);
       await refreshLibraryData();
     } catch (caught) {
       setError(toBackendError(caught).message);
@@ -1133,7 +1174,7 @@ export function LibraryWorkspace({
     );
     setError("");
     try {
-      await client.permanentlyDeleteDocument(permanentDeleteTarget.id);
+      await client.permanentlyDeleteDocument(library, permanentDeleteTarget.id);
       setPermanentDeleteTarget(null);
       await refreshLibraryData();
     } catch (caught) {
@@ -1151,7 +1192,7 @@ export function LibraryWorkspace({
   async function emptyTrash() {
     setError("");
     try {
-      const result = await client.emptyTrash();
+      const result = await client.emptyTrash(library);
       await refreshLibraryData();
       if (result.failedCount > 0) {
         const failures = result.items
@@ -1194,7 +1235,7 @@ export function LibraryWorkspace({
     setError("");
 
     try {
-      const result = await client.batchOrganizeDocuments({
+      const result = await client.batchOrganizeDocuments(library, {
         jobId,
         documentIds: uniqueDocumentIds,
         operation
@@ -1779,7 +1820,12 @@ export function LibraryWorkspace({
 
         <div className="sidebar-spacer" />
 
-        <button className="nav-item" type="button" onClick={onOpenSettings}>
+        <button
+          ref={settingsButtonRef}
+          className="nav-item"
+          type="button"
+          onClick={onOpenSettings}
+        >
           <Settings size={18} aria-hidden="true" />
           <span>设置</span>
         </button>
@@ -1964,6 +2010,12 @@ export function LibraryWorkspace({
               <X size={16} aria-hidden="true" />
             </button>
           </div>
+        ) : null}
+
+        {importRestartNotice ? (
+          <p className="muted-copy" role="status">
+            此前未完成的导入请重新发起。
+          </p>
         ) : null}
 
         {importRun ? (

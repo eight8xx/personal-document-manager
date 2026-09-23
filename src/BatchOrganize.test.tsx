@@ -224,6 +224,12 @@ describe("批量整理操作", () => {
   it("opens the batch menu and moves selected documents to a collection", async () => {
     const user = userEvent.setup();
     const client = createClient();
+    let requestedLibrary: LibrarySummary | null = null;
+    const organize = client.batchOrganizeDocuments.bind(client);
+    client.batchOrganizeDocuments = async (owner, request) => {
+      requestedLibrary = owner;
+      return organize(owner, request);
+    };
     render(<App client={client} />);
     await screen.findByText("第一份文档");
 
@@ -255,6 +261,7 @@ describe("批量整理操作", () => {
       name: "批量操作结果"
     });
     expect(result).toHaveTextContent("成功 2 份");
+    expect(requestedLibrary).toEqual(library);
     expect(client.calls.some((call) => call.startsWith("batchOrganizeDocuments:")))
       .toBe(true);
     await waitFor(() => {
@@ -302,12 +309,13 @@ describe("批量整理操作", () => {
     const originalBatch = client.batchOrganizeDocuments.bind(client);
     let attempts = 0;
     client.batchOrganizeDocuments = async (
+      owner: LibrarySummary,
       request: BatchDocumentOperationRequest
     ): Promise<BatchDocumentOperationResult> => {
       attempts += 1;
       if (attempts === 1) {
         const [firstId, secondId] = request.documentIds;
-        await client.moveDocumentToCollection(firstId, "projects");
+        await client.moveDocumentToCollection(owner, firstId, "projects");
         return {
           jobId: request.jobId,
           operation: request.operation,
@@ -330,7 +338,7 @@ describe("批量整理操作", () => {
           cancelledCount: 0
         };
       }
-      return originalBatch(request);
+      return originalBatch(owner, request);
     };
 
     render(<App client={client} />);

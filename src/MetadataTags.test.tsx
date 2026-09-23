@@ -170,7 +170,7 @@ describe("标签与文档元数据", () => {
       | { documentId: string; update: DocumentMetadataUpdate }
       | undefined;
     let resolveSave: ((document: DocumentSummary) => void) | undefined;
-    client.updateDocumentMetadata = async (documentId, update) => {
+    client.updateDocumentMetadata = async (_library, documentId, update) => {
       submitted = { documentId, update };
       return new Promise<DocumentSummary>((resolve) => {
         resolveSave = resolve;
@@ -254,7 +254,7 @@ describe("标签与文档元数据", () => {
     const client = createClient();
     const originalUpdate = client.updateDocumentMetadata.bind(client);
     let attempts = 0;
-    client.updateDocumentMetadata = async (documentId, update) => {
+    client.updateDocumentMetadata = async (owner, documentId, update) => {
       attempts += 1;
       if (attempts === 1) {
         throw new BackendError({
@@ -262,7 +262,7 @@ describe("标签与文档元数据", () => {
           message: "无法保存文档元数据。"
         });
       }
-      return originalUpdate(documentId, update);
+      return originalUpdate(owner, documentId, update);
     };
 
     render(<App client={client} />);

@@ -65,6 +65,7 @@ struct OpenLibrary {
 }
 
 struct ImportItemContext {
+    owner_library: LibrarySummary,
     item: ImportItemResult,
     pending: Option<PendingImport>,
     target_collection_id: Option<String>,
@@ -149,6 +150,7 @@ impl ExternalChangeMonitor {
             .spawn(move || {
                 let mut previous_fingerprints = HashMap::new();
                 let mut quiet_deadline = None;
+                let mut scanned_library: Option<LibrarySummary> = None;
 
                 while !thread_stop.load(Ordering::Relaxed) {
                     thread::park_timeout(poll_interval);
@@ -161,14 +163,27 @@ impl ExternalChangeMonitor {
                             Ok(service) => service,
                             Err(_) => break,
                         };
+                        let Some(library) = service.current_library().cloned() else {
+                            previous_fingerprints.clear();
+                            quiet_deadline = None;
+                            scanned_library = None;
+                            continue;
+                        };
                         let scan = match service.scan_external_changes(false) {
                             Ok(scan) => scan,
                             Err(_) => continue,
                         };
                         let fingerprints = service.external_file_fingerprints();
-                        (scan, fingerprints)
+                        (scan, fingerprints, library)
                     };
-                    let (scan, fingerprints) = scan;
+                    let (scan, fingerprints, library) = scan;
+                    if scanned_library.as_ref().is_some_and(|previous| {
+                        previous.id != library.id || !paths_equal(&previous.path, &library.path)
+                    }) {
+                        previous_fingerprints.clear();
+                        quiet_deadline = None;
+                    }
+                    scanned_library = Some(library.clone());
 
                     let fingerprints_changed =
                         !previous_fingerprints.is_empty() && fingerprints != previous_fingerprints;
@@ -178,6 +193,7 @@ impl ExternalChangeMonitor {
                         quiet_deadline = Some(Instant::now() + quiet_period);
                         if !scan.changed_document_ids.is_empty() {
                             on_event(DocumentIndexChangedEvent {
+                                library: library.clone(),
                                 phase: DocumentIndexPhase::Processing,
                                 document_ids: scan.changed_document_ids,
                                 result: None,
@@ -201,6 +217,10 @@ impl ExternalChangeMonitor {
                             Ok(service) => service,
                             Err(_) => break,
                         };
+                        if service.ensure_current_library(&library).is_err() {
+                            quiet_deadline = None;
+                            continue;
+                        }
                         service.process_pending_external_changes()
                     };
                     let Ok(result) = result else {
@@ -209,6 +229,7 @@ impl ExternalChangeMonitor {
                     };
                     quiet_deadline = None;
                     on_event(DocumentIndexChangedEvent {
+                        library,
                         phase: DocumentIndexPhase::Completed,
                         document_ids: Vec::new(),
                         result: Some(result),
@@ -413,13 +434,26 @@ impl LibraryService {
         };
 
         if let Err(error) = initialize_library(&path, &metadata) {
-            cleanup_failed_creation(&path, root_created);
-            return Err(error);
+            return Err(creation_error_after_cleanup(&path, root_created, error));
         }
 
         let summary = summary_from_metadata(&path, &metadata);
-        self.set_current(summary.clone())?;
-        self.record_recent(&summary)?;
+        let connection = match open_database(&path) {
+            Ok(connection) => connection,
+            Err(error) => return Err(creation_error_after_cleanup(&path, root_created, error)),
+        };
+        if let Err(error) = initialize_schema(&connection) {
+            drop(connection);
+            return Err(creation_error_after_cleanup(&path, root_created, error));
+        }
+        if let Err(error) = self.record_recent(&summary) {
+            drop(connection);
+            return Err(creation_error_after_cleanup(&path, root_created, error));
+        }
+        self.current = Some(OpenLibrary {
+            summary: summary.clone(),
+            connection,
+        });
         Ok(summary)
     }
 
@@ -446,12 +480,13 @@ impl LibraryService {
         cleanup_delete_tombstones(&path, &connection)?;
 
         let summary = summary_from_metadata(&path, &metadata);
-        self.current = Some(OpenLibrary {
+        let mut candidate = OpenLibrary {
             summary: summary.clone(),
             connection,
-        });
+        };
+        Self::scan_external_changes_for(&mut candidate, true)?;
         self.record_recent(&summary)?;
-        self.scan_external_changes(true)?;
+        self.current = Some(candidate);
         Ok(summary)
     }
 
@@ -667,9 +702,10 @@ impl LibraryService {
     where
         F: FnMut(ImportProgress),
     {
-        if self.current.is_none() {
-            return Err(LibraryError::NoCurrentLibrary);
-        }
+        let library = self
+            .current_library()
+            .cloned()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
         if let Some(collection_id) = target_collection_id.as_deref() {
             let library = self
                 .current
@@ -683,6 +719,7 @@ impl LibraryService {
         let total = entries.len();
         let first = entries.first();
         on_progress(ImportProgress {
+            library: library.clone(),
             batch_id: batch_id.clone(),
             total,
             completed: 0,
@@ -697,6 +734,7 @@ impl LibraryService {
             let current_file_name = entry.file_name();
             let current_source_path = entry.source_path();
             on_progress(ImportProgress {
+                library: library.clone(),
                 batch_id: batch_id.clone(),
                 total,
                 completed: index,
@@ -751,6 +789,7 @@ impl LibraryService {
             };
 
             on_progress(ImportProgress {
+                library: library.clone(),
                 batch_id: batch_id.clone(),
                 total,
                 completed: index + 1,
@@ -763,6 +802,7 @@ impl LibraryService {
         }
 
         on_progress(ImportProgress {
+            library,
             batch_id: batch_id.clone(),
             total,
             completed: total,
@@ -795,6 +835,7 @@ impl LibraryService {
         item_id: &str,
         decision: ImportDecision,
     ) -> LibraryResult<ImportItemResult> {
+        self.ensure_import_item_belongs_to_current_library(item_id)?;
         let context = self
             .import_items
             .remove(item_id)
@@ -849,10 +890,7 @@ impl LibraryService {
     }
 
     pub fn retry_import_item(&mut self, item_id: &str) -> LibraryResult<ImportItemResult> {
-        if self.current.is_none() {
-            return Err(LibraryError::NoCurrentLibrary);
-        }
-
+        self.ensure_import_item_belongs_to_current_library(item_id)?;
         let context = self
             .import_items
             .remove(item_id)
@@ -871,6 +909,25 @@ impl LibraryService {
             Some(item_id.to_string()),
             target_collection_id,
         )
+    }
+
+    fn ensure_import_item_belongs_to_current_library(&self, item_id: &str) -> LibraryResult<()> {
+        let current = self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        let context = self
+            .import_items
+            .get(item_id)
+            .ok_or_else(|| import_item_not_found(item_id))?;
+        if current.summary.id != context.owner_library.id
+            || !paths_equal(&current.summary.path, &context.owner_library.path)
+        {
+            return Err(LibraryError::InvalidImportDecision(
+                "该导入项属于其他资料库。请切回原资料库继续处理，或重新发起导入。".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn process_import_file_with_target(
@@ -1684,6 +1741,10 @@ impl LibraryService {
         existing_document_id: String,
         target_collection_id: Option<String>,
     ) -> ImportItemResult {
+        let owner_library = self
+            .current_library()
+            .expect("创建待决导入项前必须打开资料库")
+            .clone();
         let item = ImportItemResult {
             item_id: item_id.clone(),
             source_path: prepared.source_path.clone(),
@@ -1702,6 +1763,7 @@ impl LibraryService {
         self.import_items.insert(
             item_id,
             ImportItemContext {
+                owner_library,
                 item: item.clone(),
                 target_collection_id: target_collection_id.clone(),
                 pending: Some(PendingImport {
@@ -1731,6 +1793,10 @@ impl LibraryService {
         error_message: String,
         retryable: bool,
     ) -> ImportItemResult {
+        let owner_library = self
+            .current_library()
+            .expect("创建失败导入项前必须打开资料库")
+            .clone();
         let file_name = file_name.unwrap_or_else(|| display_file_name(&source_path));
         let item = ImportItemResult {
             item_id: item_id.clone(),
@@ -1750,6 +1816,7 @@ impl LibraryService {
         self.import_items.insert(
             item_id,
             ImportItemContext {
+                owner_library,
                 item: item.clone(),
                 pending: None,
                 target_collection_id: None,
@@ -2692,9 +2759,16 @@ impl LibraryService {
         &mut self,
         verify_content_hashes: bool,
     ) -> LibraryResult<ExternalChangeScan> {
-        let Some(library) = self.current.as_ref() else {
+        let Some(library) = self.current.as_mut() else {
             return Ok(ExternalChangeScan::default());
         };
+        Self::scan_external_changes_for(library, verify_content_hashes)
+    }
+
+    fn scan_external_changes_for(
+        library: &mut OpenLibrary,
+        verify_content_hashes: bool,
+    ) -> LibraryResult<ExternalChangeScan> {
         let library_root = PathBuf::from(&library.summary.path);
         let documents = load_external_document_indexes(&library.connection)?;
         let mut changed_document_ids = Vec::new();
@@ -2743,10 +2817,6 @@ impl LibraryService {
             }
         }
 
-        let library = self
-            .current
-            .as_mut()
-            .ok_or(LibraryError::NoCurrentLibrary)?;
         let transaction = library.connection.transaction()?;
         let timestamp = now();
         for document_id in &changed_document_ids {
@@ -3335,9 +3405,10 @@ impl LibraryService {
         let target = normalize_path(path.as_ref())?;
         let target = target.to_string_lossy();
 
-        self.recent
-            .retain(|entry| !paths_equal(&entry.path, target.as_ref()));
-        self.persist_recent()?;
+        let mut recent = self.recent.clone();
+        recent.retain(|entry| !paths_equal(&entry.path, target.as_ref()));
+        self.persist_recent(&recent)?;
+        self.recent = recent;
         Ok(self.list_recent_libraries())
     }
 
@@ -3345,13 +3416,15 @@ impl LibraryService {
         self.current.as_ref().map(|library| &library.summary)
     }
 
-    fn set_current(&mut self, summary: LibrarySummary) -> LibraryResult<()> {
-        let connection = open_database(Path::new(&summary.path))?;
-        initialize_schema(&connection)?;
-        self.current = Some(OpenLibrary {
-            summary,
-            connection,
-        });
+    pub fn ensure_current_library(&self, expected: &LibrarySummary) -> LibraryResult<()> {
+        let current = self
+            .current_library()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+        if current.id != expected.id || !paths_equal(&current.path, &expected.path) {
+            return Err(LibraryError::InvalidLibrary(
+                "资料库已切换，请在当前资料库重新发起操作。".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -3359,9 +3432,9 @@ impl LibraryService {
         let target = normalize_path(Path::new(&library.path))?;
         let target_display = target.to_string_lossy().into_owned();
 
-        self.recent
-            .retain(|entry| !paths_equal(&entry.path, &target_display));
-        self.recent.insert(
+        let mut recent = self.recent.clone();
+        recent.retain(|entry| !paths_equal(&entry.path, &target_display));
+        recent.insert(
             0,
             RecentLibraryRecord {
                 path: target_display,
@@ -3369,14 +3442,26 @@ impl LibraryService {
                 last_opened_at: now(),
             },
         );
-        self.recent.truncate(MAX_RECENT_LIBRARIES);
-        self.persist_recent()
+        recent.truncate(MAX_RECENT_LIBRARIES);
+        self.persist_recent(&recent)?;
+        self.recent = recent;
+        Ok(())
     }
 
-    fn persist_recent(&self) -> LibraryResult<()> {
+    fn persist_recent(&self, recent: &[RecentLibraryRecord]) -> LibraryResult<()> {
         let path = self.state_dir.join(RECENT_FILE);
-        let data = serde_json::to_vec_pretty(&self.recent)?;
-        fs::write(path, data)?;
+        let temporary = self
+            .state_dir
+            .join(format!(".{RECENT_FILE}.{}.tmp", Uuid::new_v4()));
+        let data = serde_json::to_vec_pretty(recent)?;
+        if let Err(error) = fs::write(&temporary, data) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -6048,12 +6133,54 @@ fn cloud_sync_warning(path: &Path) -> Option<CloudSyncWarning> {
     None
 }
 
-fn cleanup_failed_creation(path: &Path, root_created: bool) {
-    let _ = fs::remove_dir_all(path.join(INTERNAL_DIR));
-    let _ = fs::remove_dir_all(path.join(DOCUMENTS_DIR));
-    let _ = fs::remove_dir_all(path.join(TRASH_DIR));
-    let _ = fs::remove_dir_all(path.join(THUMBNAILS_DIR));
+fn creation_error_after_cleanup(
+    path: &Path,
+    root_created: bool,
+    cause: LibraryError,
+) -> LibraryError {
+    match cleanup_failed_creation(path, root_created) {
+        Ok(()) => cause,
+        Err(cleanup_error) => LibraryError::InvalidLibrary(format!(
+            "创建资料库失败：{cause}。清理目录 {} 时又发生错误：{cleanup_error}。该位置可能留有部分创建内容，请检查后再重试。",
+            path.display()
+        )),
+    }
+}
+
+fn cleanup_failed_creation(path: &Path, root_created: bool) -> io::Result<()> {
+    let internal = path.join(INTERNAL_DIR);
+    for file_name in [
+        format!("{DATABASE_FILE}-wal"),
+        format!("{DATABASE_FILE}-shm"),
+        format!("{DATABASE_FILE}-journal"),
+        DATABASE_FILE.to_string(),
+        METADATA_FILE.to_string(),
+    ] {
+        remove_created_file(&internal.join(file_name))?;
+    }
+    for directory in [INTERNAL_DIR, DOCUMENTS_DIR, TRASH_DIR, THUMBNAILS_DIR] {
+        remove_created_directory(&path.join(directory))?;
+    }
     if root_created {
-        let _ = fs::remove_dir(path);
+        remove_created_directory(path)?;
+    } else if fs::read_dir(path)?.next().transpose()?.is_some() {
+        return Err(io::Error::other("创建前为空的目录仍包含其他文件"));
+    }
+    Ok(())
+}
+
+fn remove_created_file(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_created_directory(path: &Path) -> io::Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }

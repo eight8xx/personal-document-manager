@@ -339,6 +339,7 @@ pub enum DocumentIndexPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentIndexChangedEvent {
+    pub library: LibrarySummary,
     pub phase: DocumentIndexPhase,
     pub document_ids: Vec<String>,
     pub result: Option<IndexRunResult>,
@@ -406,6 +407,7 @@ pub struct ImportBatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgress {
+    pub library: LibrarySummary,
     pub batch_id: String,
     pub total: usize,
     pub completed: usize,

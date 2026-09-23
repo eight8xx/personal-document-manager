@@ -83,14 +83,24 @@ export const tauriBackendClient: BackendClient = {
     });
     return typeof selected === "string" ? selected : null;
   },
-  importDocument: (path) =>
-    invoke<DocumentSummary>("import_document", { path }),
-  startImport: (paths, targetCollectionId = null, source = "filePicker") =>
-    invoke<ImportBatch>("start_import", { paths, targetCollectionId, source }),
-  resolveImportItem: (itemId, decision) =>
-    invoke<ImportItemResult>("resolve_import_item", { itemId, decision }),
-  retryImportItem: (itemId) =>
-    invoke<ImportItemResult>("retry_import_item", { itemId }),
+  importDocument: (library, path) =>
+    invoke<DocumentSummary>("import_document", { library, path }),
+  startImport: (
+    library,
+    paths,
+    targetCollectionId = null,
+    source = "filePicker"
+  ) =>
+    invoke<ImportBatch>("start_import", {
+      library,
+      paths,
+      targetCollectionId,
+      source
+    }),
+  resolveImportItem: (library, itemId, decision) =>
+    invoke<ImportItemResult>("resolve_import_item", { library, itemId, decision }),
+  retryImportItem: (library, itemId) =>
+    invoke<ImportItemResult>("retry_import_item", { library, itemId }),
   subscribeToImportProgress: async (handler) =>
     listen<ImportProgress>("import-progress", (event) => {
       handler(event.payload);
@@ -114,18 +124,19 @@ export const tauriBackendClient: BackendClient = {
       });
     });
   },
-  getDocumentPreview: (documentId, page) =>
-    invoke<DocumentPreview>("get_document_preview", { documentId, page }),
-  getDocumentThumbnail: (documentId) =>
-    invoke<DocumentThumbnail>("get_document_thumbnail", { documentId }),
-  saveDocumentThumbnail: (documentId, contentHash, thumbnailDataUrl) =>
+  getDocumentPreview: (library, documentId, page) =>
+    invoke<DocumentPreview>("get_document_preview", { library, documentId, page }),
+  getDocumentThumbnail: (library, documentId) =>
+    invoke<DocumentThumbnail>("get_document_thumbnail", { library, documentId }),
+  saveDocumentThumbnail: (library, documentId, contentHash, thumbnailDataUrl) =>
     invoke<DocumentThumbnail>("save_document_thumbnail", {
+      library,
       documentId,
       contentHash,
       thumbnailDataUrl
     }),
-  openDocument: (documentId) =>
-    invoke<void>("open_document", { documentId }),
+  openDocument: (library, documentId) =>
+    invoke<void>("open_document", { library, documentId }),
   openExternalUrl: (url) => invoke<void>("open_external_url", { url }),
   listDocumentFormatCapabilities: () =>
     invoke<DocumentFormatCapability[]>("list_document_format_capabilities"),
@@ -136,53 +147,62 @@ export const tauriBackendClient: BackendClient = {
   openLibraryDirectory: (path) =>
     invoke<void>("open_library_directory", { path }),
   listCollections: () => invoke<CollectionSummary[]>("list_collections"),
-  createCollection: (name, parentId) =>
-    invoke<CollectionSummary>("create_collection", { name, parentId }),
-  renameCollection: (collectionId, name) =>
+  createCollection: (library, name, parentId) =>
+    invoke<CollectionSummary>("create_collection", { library, name, parentId }),
+  renameCollection: (library, collectionId, name) =>
     invoke<CollectionSummary>("rename_collection", {
+      library,
       collectionId,
       name
     }),
-  moveCollection: (collectionId, parentId) =>
+  moveCollection: (library, collectionId, parentId) =>
     invoke<CollectionSummary>("move_collection", {
+      library,
       collectionId,
       parentId
     }),
-  deleteCollection: (collectionId) =>
-    invoke<CollectionDeleteResult>("delete_collection", { collectionId }),
-  moveDocumentToCollection: (documentId, collectionId) =>
+  deleteCollection: (library, collectionId) =>
+    invoke<CollectionDeleteResult>("delete_collection", { library, collectionId }),
+  moveDocumentToCollection: (library, documentId, collectionId) =>
     invoke<DocumentSummary>("move_document_to_collection", {
+      library,
       documentId,
       collectionId
     }),
-  moveDocumentToTrash: (documentId) =>
-    invoke<void>("move_document_to_trash", { documentId }),
+  moveDocumentToTrash: (library, documentId) =>
+    invoke<void>("move_document_to_trash", { library, documentId }),
   listTrashDocuments: () =>
     invoke<TrashDocumentSummary[]>("list_trash_documents"),
-  restoreDocument: (documentId) =>
-    invoke<DocumentSummary>("restore_document", { documentId }),
-  permanentlyDeleteDocument: (documentId) =>
-    invoke<void>("permanently_delete_document", { documentId }),
-  emptyTrash: () => invoke<EmptyTrashResult>("empty_trash"),
+  restoreDocument: (library, documentId) =>
+    invoke<DocumentSummary>("restore_document", { library, documentId }),
+  permanentlyDeleteDocument: (library, documentId) =>
+    invoke<void>("permanently_delete_document", { library, documentId }),
+  emptyTrash: (library) => invoke<EmptyTrashResult>("empty_trash", { library }),
   listTags: () => invoke<TagSummary[]>("list_tags"),
-  createTag: (name) => invoke<TagSummary>("create_tag", { name }),
-  renameTag: (tagId, name) =>
-    invoke<TagSummary>("rename_tag", { tagId, name }),
-  deleteTag: (tagId) => invoke<void>("delete_tag", { tagId }),
-  addTagToDocument: (documentId, tagId) =>
-    invoke<DocumentSummary>("add_tag_to_document", { documentId, tagId }),
-  removeTagFromDocument: (documentId, tagId) =>
+  createTag: (library, name) => invoke<TagSummary>("create_tag", { library, name }),
+  renameTag: (library, tagId, name) =>
+    invoke<TagSummary>("rename_tag", { library, tagId, name }),
+  deleteTag: (library, tagId) => invoke<void>("delete_tag", { library, tagId }),
+  addTagToDocument: (library, documentId, tagId) =>
+    invoke<DocumentSummary>("add_tag_to_document", { library, documentId, tagId }),
+  removeTagFromDocument: (library, documentId, tagId) =>
     invoke<DocumentSummary>("remove_tag_from_document", {
+      library,
       documentId,
       tagId
     }),
-  updateDocumentMetadata: (documentId, update: DocumentMetadataUpdate) =>
+  updateDocumentMetadata: (library, documentId, update: DocumentMetadataUpdate) =>
     invoke<DocumentSummary>("update_document_metadata", {
+      library,
       documentId,
       update
     }),
-  batchOrganizeDocuments: (request: BatchDocumentOperationRequest) =>
+  batchOrganizeDocuments: (
+    library: LibrarySummary,
+    request: BatchDocumentOperationRequest
+  ) =>
     invoke<BatchDocumentOperationResult>("batch_organize_documents", {
+      library,
       request
     }),
   cancelBatchDocumentOperation: (jobId) =>
@@ -190,10 +210,10 @@ export const tauriBackendClient: BackendClient = {
   searchDocuments: (request: DocumentSearchQuery) =>
     invoke<DocumentSearchResponse>("search_documents", { request }),
   pendingIndexCount: () => invoke<number>("pending_index_count"),
-  indexPendingDocuments: () =>
-    invoke<IndexRunResult>("index_pending_documents"),
-  retryDocumentIndex: (documentId) =>
-    invoke<DocumentSummary>("retry_document_index", { documentId }),
+  indexPendingDocuments: (library) =>
+    invoke<IndexRunResult>("index_pending_documents", { library }),
+  retryDocumentIndex: (library, documentId) =>
+    invoke<DocumentSummary>("retry_document_index", { library, documentId }),
   subscribeToDocumentIndexChanges: async (handler) =>
     listen<DocumentIndexChangedEvent>("document-index-changed", (event) => {
       handler(event.payload);

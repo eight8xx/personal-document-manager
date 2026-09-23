@@ -111,7 +111,7 @@ describe("文档预览与外部打开", () => {
         }
       }
     });
-    client.getDocumentPreview = (documentId, page) => {
+    client.getDocumentPreview = (owner, documentId, page) => {
       if (documentId === "pdf" && firstPreviewPending) {
         firstPreviewPending = false;
         return new Promise((resolve) => {
@@ -120,6 +120,7 @@ describe("文档预览与外部打开", () => {
       }
       return FakeBackendClient.prototype.getDocumentPreview.call(
         client,
+        owner,
         documentId,
         page
       );
@@ -445,6 +446,7 @@ describe("文档预览与外部打开", () => {
     client.setDocument(refreshed);
     await act(async () => {
       client.emitDocumentIndexChanged({
+        library,
         phase: "completed",
         documentIds: [],
         result: { processed: 1, searchable: 1, failed: 0 }

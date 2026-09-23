@@ -36,6 +36,16 @@ impl AppState {
         self.service.lock().map_err(|_| LibraryError::StateLock)
     }
 
+    fn with_library<T>(
+        &self,
+        expected: &LibrarySummary,
+        operation: impl FnOnce(&mut LibraryService) -> LibraryResult<T>,
+    ) -> Result<T, CommandError> {
+        let mut service = self.service()?;
+        service.ensure_current_library(expected)?;
+        operation(&mut service).map_err(CommandError::from)
+    }
+
     pub(crate) fn service_handle(&self) -> Arc<Mutex<LibraryService>> {
         Arc::clone(&self.service)
     }
@@ -176,24 +186,24 @@ fn open_library_contract(state: &AppState, path: String) -> Result<LibrarySummar
 
 #[tauri::command]
 pub fn import_document(
+    library: LibrarySummary,
     path: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
-    import_document_contract(&state, path)
+    import_document_contract(&state, &library, path)
 }
 
 fn import_document_contract(
     state: &AppState,
+    library: &LibrarySummary,
     path: String,
 ) -> Result<DocumentSummary, CommandError> {
-    state
-        .service()?
-        .import_document(path)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| service.import_document(path))
 }
 
 #[tauri::command]
 pub async fn start_import(
+    library: LibrarySummary,
     paths: Vec<String>,
     target_collection_id: Option<String>,
     source: Option<ImportSource>,
@@ -202,6 +212,7 @@ pub async fn start_import(
 ) -> Result<ImportBatch, CommandError> {
     spawn_import_task(
         &state,
+        library,
         paths,
         target_collection_id,
         source.unwrap_or(ImportSource::FilePicker),
@@ -218,6 +229,7 @@ pub async fn start_import(
 
 fn spawn_import_task<F>(
     state: &AppState,
+    library: LibrarySummary,
     paths: Vec<String>,
     target_collection_id: Option<String>,
     source: ImportSource,
@@ -229,6 +241,7 @@ where
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
         let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(&library)?;
         service
             .start_import_to_collection_with_progress(
                 paths,
@@ -275,40 +288,40 @@ where
 
 #[tauri::command]
 pub fn resolve_import_item(
+    library: LibrarySummary,
     item_id: String,
     decision: ImportDecision,
     state: State<'_, AppState>,
 ) -> Result<ImportItemResult, CommandError> {
-    resolve_import_item_contract(&state, item_id, decision)
+    resolve_import_item_contract(&state, &library, item_id, decision)
 }
 
 fn resolve_import_item_contract(
     state: &AppState,
+    library: &LibrarySummary,
     item_id: String,
     decision: ImportDecision,
 ) -> Result<ImportItemResult, CommandError> {
-    state
-        .service()?
-        .resolve_import_item(&item_id, decision)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.resolve_import_item(&item_id, decision)
+    })
 }
 
 #[tauri::command]
 pub fn retry_import_item(
+    library: LibrarySummary,
     item_id: String,
     state: State<'_, AppState>,
 ) -> Result<ImportItemResult, CommandError> {
-    retry_import_item_contract(&state, item_id)
+    retry_import_item_contract(&state, &library, item_id)
 }
 
 fn retry_import_item_contract(
     state: &AppState,
+    library: &LibrarySummary,
     item_id: String,
 ) -> Result<ImportItemResult, CommandError> {
-    state
-        .service()?
-        .retry_import_item(&item_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| service.retry_import_item(&item_id))
 }
 
 #[tauri::command]
@@ -327,118 +340,122 @@ fn list_collections_contract(state: &AppState) -> Result<Vec<CollectionSummary>,
 
 #[tauri::command]
 pub fn create_collection(
+    library: LibrarySummary,
     name: String,
     parent_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CollectionSummary, CommandError> {
-    create_collection_contract(&state, name, parent_id)
+    create_collection_contract(&state, &library, name, parent_id)
 }
 
 fn create_collection_contract(
     state: &AppState,
+    library: &LibrarySummary,
     name: String,
     parent_id: Option<String>,
 ) -> Result<CollectionSummary, CommandError> {
-    state
-        .service()?
-        .create_collection(name, parent_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.create_collection(name, parent_id)
+    })
 }
 
 #[tauri::command]
 pub fn rename_collection(
+    library: LibrarySummary,
     collection_id: String,
     name: String,
     state: State<'_, AppState>,
 ) -> Result<CollectionSummary, CommandError> {
-    rename_collection_contract(&state, collection_id, name)
+    rename_collection_contract(&state, &library, collection_id, name)
 }
 
 fn rename_collection_contract(
     state: &AppState,
+    library: &LibrarySummary,
     collection_id: String,
     name: String,
 ) -> Result<CollectionSummary, CommandError> {
-    state
-        .service()?
-        .rename_collection(&collection_id, name)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.rename_collection(&collection_id, name)
+    })
 }
 
 #[tauri::command]
 pub fn move_collection(
+    library: LibrarySummary,
     collection_id: String,
     parent_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CollectionSummary, CommandError> {
-    move_collection_contract(&state, collection_id, parent_id)
+    move_collection_contract(&state, &library, collection_id, parent_id)
 }
 
 fn move_collection_contract(
     state: &AppState,
+    library: &LibrarySummary,
     collection_id: String,
     parent_id: Option<String>,
 ) -> Result<CollectionSummary, CommandError> {
-    state
-        .service()?
-        .move_collection(&collection_id, parent_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.move_collection(&collection_id, parent_id)
+    })
 }
 
 #[tauri::command]
 pub fn delete_collection(
+    library: LibrarySummary,
     collection_id: String,
     state: State<'_, AppState>,
 ) -> Result<CollectionDeleteResult, CommandError> {
-    delete_collection_contract(&state, collection_id)
+    delete_collection_contract(&state, &library, collection_id)
 }
 
 fn delete_collection_contract(
     state: &AppState,
+    library: &LibrarySummary,
     collection_id: String,
 ) -> Result<CollectionDeleteResult, CommandError> {
-    state
-        .service()?
-        .delete_collection(&collection_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| service.delete_collection(&collection_id))
 }
 
 #[tauri::command]
 pub fn move_document_to_collection(
+    library: LibrarySummary,
     document_id: String,
     collection_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
-    move_document_to_collection_contract(&state, document_id, collection_id)
+    move_document_to_collection_contract(&state, &library, document_id, collection_id)
 }
 
 fn move_document_to_collection_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
     collection_id: String,
 ) -> Result<DocumentSummary, CommandError> {
-    state
-        .service()?
-        .move_document_to_collection(&document_id, &collection_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.move_document_to_collection(&document_id, &collection_id)
+    })
 }
 
 #[tauri::command]
 pub fn move_document_to_trash(
+    library: LibrarySummary,
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    move_document_to_trash_contract(&state, document_id)
+    move_document_to_trash_contract(&state, &library, document_id)
 }
 
 fn move_document_to_trash_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
 ) -> Result<(), CommandError> {
-    state
-        .service()?
-        .move_document_to_trash(&document_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.move_document_to_trash(&document_id)
+    })
 }
 
 #[tauri::command]
@@ -459,47 +476,53 @@ fn list_trash_documents_contract(
 
 #[tauri::command]
 pub fn restore_document(
+    library: LibrarySummary,
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
-    restore_document_contract(&state, document_id)
+    restore_document_contract(&state, &library, document_id)
 }
 
 fn restore_document_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
 ) -> Result<DocumentSummary, CommandError> {
-    state
-        .service()?
-        .restore_document(&document_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| service.restore_document(&document_id))
 }
 
 #[tauri::command]
 pub fn permanently_delete_document(
+    library: LibrarySummary,
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    permanently_delete_document_contract(&state, document_id)
+    permanently_delete_document_contract(&state, &library, document_id)
 }
 
 fn permanently_delete_document_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
 ) -> Result<(), CommandError> {
-    state
-        .service()?
-        .permanently_delete_document(&document_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.permanently_delete_document(&document_id)
+    })
 }
 
 #[tauri::command]
-pub fn empty_trash(state: State<'_, AppState>) -> Result<EmptyTrashResult, CommandError> {
-    empty_trash_contract(&state)
+pub fn empty_trash(
+    library: LibrarySummary,
+    state: State<'_, AppState>,
+) -> Result<EmptyTrashResult, CommandError> {
+    empty_trash_contract(&state, &library)
 }
 
-fn empty_trash_contract(state: &AppState) -> Result<EmptyTrashResult, CommandError> {
-    state.service()?.empty_trash().map_err(CommandError::from)
+fn empty_trash_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+) -> Result<EmptyTrashResult, CommandError> {
+    state.with_library(library, |service| service.empty_trash())
 }
 
 #[tauri::command]
@@ -512,129 +535,151 @@ fn list_tags_contract(state: &AppState) -> Result<Vec<TagSummary>, CommandError>
 }
 
 #[tauri::command]
-pub fn create_tag(name: String, state: State<'_, AppState>) -> Result<TagSummary, CommandError> {
-    create_tag_contract(&state, name)
+pub fn create_tag(
+    library: LibrarySummary,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<TagSummary, CommandError> {
+    create_tag_contract(&state, &library, name)
 }
 
-fn create_tag_contract(state: &AppState, name: String) -> Result<TagSummary, CommandError> {
-    state
-        .service()?
-        .create_tag(name)
-        .map_err(CommandError::from)
+fn create_tag_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    name: String,
+) -> Result<TagSummary, CommandError> {
+    state.with_library(library, |service| service.create_tag(name))
 }
 
 #[tauri::command]
 pub fn rename_tag(
+    library: LibrarySummary,
     tag_id: String,
     name: String,
     state: State<'_, AppState>,
 ) -> Result<TagSummary, CommandError> {
-    rename_tag_contract(&state, tag_id, name)
+    rename_tag_contract(&state, &library, tag_id, name)
 }
 
 fn rename_tag_contract(
     state: &AppState,
+    library: &LibrarySummary,
     tag_id: String,
     name: String,
 ) -> Result<TagSummary, CommandError> {
-    state
-        .service()?
-        .rename_tag(&tag_id, name)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| service.rename_tag(&tag_id, name))
 }
 
 #[tauri::command]
-pub fn delete_tag(tag_id: String, state: State<'_, AppState>) -> Result<(), CommandError> {
-    delete_tag_contract(&state, tag_id)
+pub fn delete_tag(
+    library: LibrarySummary,
+    tag_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    delete_tag_contract(&state, &library, tag_id)
 }
 
-fn delete_tag_contract(state: &AppState, tag_id: String) -> Result<(), CommandError> {
-    state
-        .service()?
-        .delete_tag(&tag_id)
-        .map_err(CommandError::from)
+fn delete_tag_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    tag_id: String,
+) -> Result<(), CommandError> {
+    state.with_library(library, |service| service.delete_tag(&tag_id))
 }
 
 #[tauri::command]
 pub fn add_tag_to_document(
+    library: LibrarySummary,
     document_id: String,
     tag_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
-    add_tag_to_document_contract(&state, document_id, tag_id)
+    add_tag_to_document_contract(&state, &library, document_id, tag_id)
 }
 
 fn add_tag_to_document_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
     tag_id: String,
 ) -> Result<DocumentSummary, CommandError> {
-    state
-        .service()?
-        .add_tag_to_document(&document_id, &tag_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.add_tag_to_document(&document_id, &tag_id)
+    })
 }
 
 #[tauri::command]
 pub fn remove_tag_from_document(
+    library: LibrarySummary,
     document_id: String,
     tag_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
-    remove_tag_from_document_contract(&state, document_id, tag_id)
+    remove_tag_from_document_contract(&state, &library, document_id, tag_id)
 }
 
 fn remove_tag_from_document_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
     tag_id: String,
 ) -> Result<DocumentSummary, CommandError> {
-    state
-        .service()?
-        .remove_tag_from_document(&document_id, &tag_id)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.remove_tag_from_document(&document_id, &tag_id)
+    })
 }
 
 #[tauri::command]
 pub fn update_document_metadata(
+    library: LibrarySummary,
     document_id: String,
     update: DocumentMetadataUpdate,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
-    update_document_metadata_contract(&state, document_id, update)
+    update_document_metadata_contract(&state, &library, document_id, update)
 }
 
 fn update_document_metadata_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
     update: DocumentMetadataUpdate,
 ) -> Result<DocumentSummary, CommandError> {
-    state
-        .service()?
-        .update_document_metadata(&document_id, update)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.update_document_metadata(&document_id, update)
+    })
 }
 
 #[tauri::command]
 pub async fn batch_organize_documents(
+    library: LibrarySummary,
     request: BatchDocumentOperationRequest,
     state: State<'_, AppState>,
 ) -> Result<BatchDocumentOperationResult, CommandError> {
     let job_id = request.job_id.clone();
     let cancellation = state.begin_batch(&job_id).map_err(CommandError::from)?;
-    let service = state.service_handle();
-    let task = tauri::async_runtime::spawn_blocking(move || {
-        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
-        service
-            .batch_organize_documents(request, || cancellation.load(Ordering::Relaxed))
-            .map_err(CommandError::from)
-    })
-    .await;
+    let task = spawn_batch_organize_task(&state, library, request, cancellation).await;
     state.finish_batch(&job_id).map_err(CommandError::from)?;
     task.map_err(|error| CommandError {
         code: "batchTask".to_string(),
         message: format!("批量操作无法完成：{error}"),
     })?
+}
+
+fn spawn_batch_organize_task(
+    state: &AppState,
+    library: LibrarySummary,
+    request: BatchDocumentOperationRequest,
+    cancellation: Arc<AtomicBool>,
+) -> tauri::async_runtime::JoinHandle<Result<BatchDocumentOperationResult, CommandError>> {
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(&library)?;
+        service
+            .batch_organize_documents(request, || cancellation.load(Ordering::Relaxed))
+            .map_err(CommandError::from)
+    })
 }
 
 #[tauri::command]
@@ -679,6 +724,7 @@ pub async fn search_documents(
 
 #[tauri::command]
 pub async fn index_pending_documents(
+    library: LibrarySummary,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<IndexRunResult, CommandError> {
@@ -686,11 +732,7 @@ pub async fn index_pending_documents(
     tauri::async_runtime::spawn_blocking(move || {
         let mut result = IndexRunResult::default();
         loop {
-            let document = service
-                .lock()
-                .map_err(|_| LibraryError::StateLock)?
-                .index_next_pending_document()
-                .map_err(CommandError::from)?;
+            let document = index_next_pending_for_library(&service, &library)?;
             let Some(document) = document else {
                 break;
             };
@@ -704,6 +746,7 @@ pub async fn index_pending_documents(
                 let _ = app.emit(
                     "document-index-changed",
                     DocumentIndexChangedEvent {
+                        library: library.clone(),
                         phase: DocumentIndexPhase::Processing,
                         document_ids: Vec::new(),
                         result: Some(result.clone()),
@@ -714,6 +757,7 @@ pub async fn index_pending_documents(
         let _ = app.emit(
             "document-index-changed",
             DocumentIndexChangedEvent {
+                library,
                 phase: DocumentIndexPhase::Completed,
                 document_ids: Vec::new(),
                 result: Some(result.clone()),
@@ -726,6 +770,17 @@ pub async fn index_pending_documents(
         code: "indexTask".to_string(),
         message: format!("索引任务无法完成：{error}"),
     })?
+}
+
+fn index_next_pending_for_library(
+    service: &Arc<Mutex<LibraryService>>,
+    library: &LibrarySummary,
+) -> Result<Option<DocumentSummary>, CommandError> {
+    let mut current = service.lock().map_err(|_| LibraryError::StateLock)?;
+    current.ensure_current_library(library)?;
+    current
+        .index_next_pending_document()
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -742,14 +797,15 @@ fn pending_index_count_contract(state: &AppState) -> Result<i64, CommandError> {
 
 #[tauri::command]
 pub async fn retry_document_index(
+    library: LibrarySummary,
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentSummary, CommandError> {
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
+        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(&library)?;
         service
-            .lock()
-            .map_err(|_| LibraryError::StateLock)?
             .retry_document_index(&document_id)
             .map_err(CommandError::from)
     })
@@ -762,34 +818,36 @@ pub async fn retry_document_index(
 
 #[tauri::command]
 pub fn get_document_preview(
+    library: LibrarySummary,
     document_id: String,
     page: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<DocumentPreview, CommandError> {
-    get_document_preview_contract(&state, document_id, page)
+    get_document_preview_contract(&state, &library, document_id, page)
 }
 
 fn get_document_preview_contract(
     state: &AppState,
+    library: &LibrarySummary,
     document_id: String,
     page: Option<u32>,
 ) -> Result<DocumentPreview, CommandError> {
-    state
-        .service()?
-        .get_document_preview(&document_id, page)
-        .map_err(CommandError::from)
+    state.with_library(library, |service| {
+        service.get_document_preview(&document_id, page)
+    })
 }
 
 #[tauri::command]
 pub async fn get_document_thumbnail(
+    library: LibrarySummary,
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<DocumentThumbnail, CommandError> {
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
+        let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(&library)?;
         service
-            .lock()
-            .map_err(|_| LibraryError::StateLock)?
             .get_document_thumbnail(&document_id)
             .map_err(CommandError::from)
     })
@@ -802,6 +860,7 @@ pub async fn get_document_thumbnail(
 
 #[tauri::command]
 pub async fn save_document_thumbnail(
+    library: LibrarySummary,
     document_id: String,
     content_hash: String,
     thumbnail_data_url: String,
@@ -809,9 +868,9 @@ pub async fn save_document_thumbnail(
 ) -> Result<DocumentThumbnail, CommandError> {
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
+        let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(&library)?;
         service
-            .lock()
-            .map_err(|_| LibraryError::StateLock)?
             .save_document_thumbnail(&document_id, &content_hash, &thumbnail_data_url)
             .map_err(CommandError::from)
     })
@@ -823,15 +882,20 @@ pub async fn save_document_thumbnail(
 }
 
 #[tauri::command]
-pub fn open_document(document_id: String, state: State<'_, AppState>) -> Result<(), CommandError> {
-    open_document_contract(&state, document_id)
+pub fn open_document(
+    library: LibrarySummary,
+    document_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    open_document_contract(&state, &library, document_id)
 }
 
-fn open_document_contract(state: &AppState, document_id: String) -> Result<(), CommandError> {
-    state
-        .service()?
-        .open_document(&document_id)
-        .map_err(CommandError::from)
+fn open_document_contract(
+    state: &AppState,
+    library: &LibrarySummary,
+    document_id: String,
+) -> Result<(), CommandError> {
+    state.with_library(library, |service| service.open_document(&document_id))
 }
 
 #[tauri::command]
@@ -898,24 +962,39 @@ mod tests {
     use super::{
         add_tag_to_document_contract, bootstrap_contract, create_collection_contract,
         create_library_contract, create_tag_contract, delete_collection_contract,
-        delete_tag_contract, empty_trash_contract, inspect_library_location_contract,
-        list_collections_contract, list_document_format_capabilities, list_tags_contract,
-        list_trash_documents_contract, move_collection_contract,
-        move_document_to_collection_contract, move_document_to_trash_contract,
-        pending_index_count_contract, permanently_delete_document_contract,
-        remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
-        resolve_import_item_contract, restore_document_contract, retry_import_item_contract,
+        delete_tag_contract, empty_trash_contract, index_next_pending_for_library,
+        inspect_library_location_contract, list_collections_contract,
+        list_document_format_capabilities, list_tags_contract, list_trash_documents_contract,
+        move_collection_contract, move_document_to_collection_contract,
+        move_document_to_trash_contract, open_library_contract, pending_index_count_contract,
+        permanently_delete_document_contract, remove_tag_from_document_contract,
+        rename_collection_contract, rename_tag_contract, resolve_import_item_contract,
+        restore_document_contract, retry_import_item_contract, spawn_batch_organize_task,
         spawn_import_task, start_import_contract, update_document_metadata_contract, AppState,
         CommandError, LibraryChangedEvent,
     };
     use crate::library::{
         BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
         DocumentPreview, DocumentSearchFilters, DocumentSearchQuery, DocumentThumbnail,
-        ImportDecision, ImportItemStatus, ImportSource, LibraryService, LibrarySummary,
-        LocationStatus,
+        ImportDecision, ImportItemStatus, ImportSource, IndexStatus, LibraryService,
+        LibrarySummary, LocationStatus,
     };
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    fn copy_directory(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn create_and_bootstrap_commands_use_the_serialized_contract() {
@@ -1025,12 +1104,13 @@ mod tests {
 
         let root = tempdir().unwrap();
         let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
-        create_library_contract(
+        let library = create_library_contract(
             &state,
             root.path().join("Library").to_string_lossy().into_owned(),
         )
         .unwrap();
-        let collection = create_collection_contract(&state, "项目".to_string(), None).unwrap();
+        let collection =
+            create_collection_contract(&state, &library, "项目".to_string(), None).unwrap();
         let source_path = root.path().join("document.txt");
         std::fs::write(&source_path, "document").unwrap();
         let document_id = start_import_contract(
@@ -1142,7 +1222,8 @@ mod tests {
         let root = tempdir().unwrap();
         let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
         let library_path = root.path().join("Library");
-        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let library =
+            create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
         let source_path = root.path().join("source.txt");
         std::fs::write(&source_path, "contract contents").unwrap();
 
@@ -1186,9 +1267,13 @@ mod tests {
         .unwrap()
         .items
         .remove(0);
-        let resolved =
-            resolve_import_item_contract(&state, duplicate.item_id, ImportDecision::UseExisting)
-                .unwrap();
+        let resolved = resolve_import_item_contract(
+            &state,
+            &library,
+            duplicate.item_id,
+            ImportDecision::UseExisting,
+        )
+        .unwrap();
         assert_eq!(resolved.status, ImportItemStatus::Skipped);
         assert_eq!(
             serde_json::to_value(ImportDecision::UseExisting).unwrap(),
@@ -1205,7 +1290,7 @@ mod tests {
         .items
         .remove(0);
         std::fs::write(&missing_path, "retried").unwrap();
-        let retried = retry_import_item_contract(&state, failed.item_id).unwrap();
+        let retried = retry_import_item_contract(&state, &library, failed.item_id).unwrap();
         let value = serde_json::to_value(retried).unwrap();
         assert_eq!(value["status"], "imported");
         assert!(value.get("retryable").is_some());
@@ -1215,7 +1300,7 @@ mod tests {
     fn start_import_task_returns_while_the_service_is_locked() {
         let root = tempdir().unwrap();
         let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
-        create_library_contract(
+        let library = create_library_contract(
             &state,
             root.path().join("Library").to_string_lossy().into_owned(),
         )
@@ -1227,6 +1312,7 @@ mod tests {
         let progress = Arc::new(Mutex::new(Vec::new()));
         let task = spawn_import_task(
             &state,
+            library,
             vec![source_path.to_string_lossy().into_owned()],
             None,
             ImportSource::FilePicker,
@@ -1248,21 +1334,314 @@ mod tests {
     }
 
     #[test]
+    fn queued_import_does_not_write_to_a_library_opened_after_the_request() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second");
+        create_library_contract(&state, first_path.to_string_lossy().into_owned()).unwrap();
+        create_library_contract(&state, second_path.to_string_lossy().into_owned()).unwrap();
+        let first =
+            open_library_contract(&state, first_path.to_string_lossy().into_owned()).unwrap();
+        let source = root.path().join("queued.txt");
+        std::fs::write(&source, "belongs to First").unwrap();
+
+        let mut guard = state.service().unwrap();
+        let task = spawn_import_task(
+            &state,
+            first,
+            vec![source.to_string_lossy().into_owned()],
+            None,
+            ImportSource::FilePicker,
+            |_| {},
+        );
+        guard.open_library(&second_path).unwrap();
+        drop(guard);
+
+        let error = tauri::async_runtime::block_on(task).unwrap().unwrap_err();
+        assert_eq!(error.code, "invalidLibrary");
+        assert!(state
+            .service()
+            .unwrap()
+            .list_documents()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_dir(second_path.join("documents"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"belongs to First");
+    }
+
+    #[test]
+    fn queued_batch_does_not_trash_a_document_in_a_copied_library() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("app-state");
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second Copy");
+        let source = root.path().join("document.txt");
+        std::fs::write(&source, "keep both copies").unwrap();
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        let first = service.create_library(&first_path).unwrap();
+        let document = service.import_document(&source).unwrap();
+        drop(service);
+        copy_directory(&first_path, &second_path);
+
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        service.bootstrap().unwrap();
+        let state = AppState::new(service);
+        let request = BatchDocumentOperationRequest {
+            job_id: "queued-batch".to_string(),
+            document_ids: vec![document.id.clone()],
+            operation: BatchDocumentOperation::MoveToTrash,
+        };
+        let cancellation = state.begin_batch(&request.job_id).unwrap();
+        let mut guard = state.service().unwrap();
+        let task = spawn_batch_organize_task(&state, first.clone(), request, cancellation);
+        assert_eq!(guard.open_library(&second_path).unwrap().id, first.id);
+        drop(guard);
+
+        let error = tauri::async_runtime::block_on(task).unwrap().unwrap_err();
+        assert_eq!(error.code, "invalidLibrary");
+        assert_eq!(
+            state.service().unwrap().list_documents().unwrap(),
+            vec![document.clone()]
+        );
+        assert!(second_path
+            .join("documents")
+            .join(&document.id)
+            .join(&document.file_name)
+            .is_file());
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep both copies");
+        state.finish_batch("queued-batch").unwrap();
+    }
+
+    #[test]
+    fn queued_indexing_does_not_process_a_copied_library() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("app-state");
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second Copy");
+        let source = root.path().join("document.txt");
+        std::fs::write(&source, "index only First").unwrap();
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        let first = service.create_library(&first_path).unwrap();
+        let document = service.import_document(&source).unwrap();
+        drop(service);
+        copy_directory(&first_path, &second_path);
+
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        service.bootstrap().unwrap();
+        let state = AppState::new(service);
+        let mut guard = state.service().unwrap();
+        let handle = state.service_handle();
+        let task = tauri::async_runtime::spawn_blocking(move || {
+            index_next_pending_for_library(&handle, &first)
+        });
+        guard.open_library(&second_path).unwrap();
+        drop(guard);
+
+        let error = tauri::async_runtime::block_on(task).unwrap().unwrap_err();
+        assert_eq!(error.code, "invalidLibrary");
+        let documents = state.service().unwrap().list_documents().unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].id, document.id);
+        assert_eq!(documents[0].index_status, IndexStatus::Pending);
+        assert_eq!(std::fs::read(&source).unwrap(), b"index only First");
+    }
+
+    #[test]
+    fn stale_single_delete_keeps_the_copied_library_document() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("app-state");
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second Copy");
+        let source = root.path().join("document.txt");
+        std::fs::write(&source, "keep B document").unwrap();
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        let first = service.create_library(&first_path).unwrap();
+        let document = service.import_document(&source).unwrap();
+        drop(service);
+        copy_directory(&first_path, &second_path);
+
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        service.bootstrap().unwrap();
+        let state = AppState::new(service);
+        assert_eq!(
+            state
+                .service()
+                .unwrap()
+                .open_library(&second_path)
+                .unwrap()
+                .id,
+            first.id
+        );
+
+        let error =
+            move_document_to_trash_contract(&state, &first, document.id.clone()).unwrap_err();
+        assert_eq!(error.code, "invalidLibrary");
+        assert_eq!(
+            state.service().unwrap().list_documents().unwrap(),
+            vec![document.clone()]
+        );
+        assert!(second_path
+            .join("documents")
+            .join(&document.id)
+            .join(&document.file_name)
+            .is_file());
+
+        state.service().unwrap().open_library(&first_path).unwrap();
+        move_document_to_trash_contract(&state, &first, document.id.clone()).unwrap();
+        assert!(state
+            .service()
+            .unwrap()
+            .list_documents()
+            .unwrap()
+            .is_empty());
+        state.service().unwrap().open_library(&second_path).unwrap();
+        assert_eq!(
+            state.service().unwrap().list_documents().unwrap(),
+            vec![document]
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep B document");
+    }
+
+    #[test]
+    fn stale_restore_and_permanent_delete_keep_the_copied_library_trash() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("app-state");
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second Copy");
+        let source = root.path().join("document.txt");
+        std::fs::write(&source, "keep B trash").unwrap();
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        let first = service.create_library(&first_path).unwrap();
+        let document = service.import_document(&source).unwrap();
+        service.move_document_to_trash(&document.id).unwrap();
+        drop(service);
+        copy_directory(&first_path, &second_path);
+
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        service.bootstrap().unwrap();
+        let state = AppState::new(service);
+        state.service().unwrap().open_library(&second_path).unwrap();
+
+        for error in [
+            restore_document_contract(&state, &first, document.id.clone()).unwrap_err(),
+            permanently_delete_document_contract(&state, &first, document.id.clone()).unwrap_err(),
+        ] {
+            assert_eq!(error.code, "invalidLibrary");
+        }
+        assert_eq!(
+            state
+                .service()
+                .unwrap()
+                .list_trash_documents()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(second_path
+            .join("documents")
+            .join(&document.id)
+            .join(&document.file_name)
+            .is_file());
+
+        state.service().unwrap().open_library(&first_path).unwrap();
+        restore_document_contract(&state, &first, document.id.clone()).unwrap();
+        move_document_to_trash_contract(&state, &first, document.id.clone()).unwrap();
+        permanently_delete_document_contract(&state, &first, document.id.clone()).unwrap();
+        assert!(state
+            .service()
+            .unwrap()
+            .list_trash_documents()
+            .unwrap()
+            .is_empty());
+        state.service().unwrap().open_library(&second_path).unwrap();
+        assert_eq!(
+            state
+                .service()
+                .unwrap()
+                .list_trash_documents()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep B trash");
+    }
+
+    #[test]
+    fn stale_metadata_update_does_not_change_the_copied_library() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("app-state");
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second Copy");
+        let source = root.path().join("document.txt");
+        std::fs::write(&source, "keep B metadata").unwrap();
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        let first = service.create_library(&first_path).unwrap();
+        let document = service.import_document(&source).unwrap();
+        drop(service);
+        copy_directory(&first_path, &second_path);
+
+        let mut service = LibraryService::new(&state_dir).unwrap();
+        service.bootstrap().unwrap();
+        let state = AppState::new(service);
+        state.service().unwrap().open_library(&second_path).unwrap();
+        let update = DocumentMetadataUpdate {
+            title: "已修改".to_string(),
+            description: None,
+            document_date: None,
+            collection_id: "inbox".to_string(),
+            tag_ids: Vec::new(),
+        };
+
+        let error =
+            update_document_metadata_contract(&state, &first, document.id.clone(), update.clone())
+                .unwrap_err();
+        assert_eq!(error.code, "invalidLibrary");
+        assert_eq!(
+            state.service().unwrap().list_documents().unwrap(),
+            vec![document.clone()]
+        );
+
+        state.service().unwrap().open_library(&first_path).unwrap();
+        let updated =
+            update_document_metadata_contract(&state, &first, document.id.clone(), update).unwrap();
+        assert_eq!(updated.title, "已修改");
+        state.service().unwrap().open_library(&second_path).unwrap();
+        assert_eq!(
+            state.service().unwrap().list_documents().unwrap(),
+            vec![document]
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep B metadata");
+    }
+
+    #[test]
     fn collection_commands_use_camel_case_contract() {
         let root = tempdir().unwrap();
         let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
         let library_path = root.path().join("Library");
-        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let library =
+            create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
 
         let collections = list_collections_contract(&state).unwrap();
         assert_eq!(collections[0].id, "inbox");
-        let parent = create_collection_contract(&state, "Parent".to_string(), None).unwrap();
-        let child =
-            create_collection_contract(&state, "Child".to_string(), Some(parent.id.clone()))
-                .unwrap();
+        let parent =
+            create_collection_contract(&state, &library, "Parent".to_string(), None).unwrap();
+        let child = create_collection_contract(
+            &state,
+            &library,
+            "Child".to_string(),
+            Some(parent.id.clone()),
+        )
+        .unwrap();
         let renamed =
-            rename_collection_contract(&state, child.id.clone(), "Renamed".to_string()).unwrap();
-        let moved = move_collection_contract(&state, renamed.id.clone(), None).unwrap();
+            rename_collection_contract(&state, &library, child.id.clone(), "Renamed".to_string())
+                .unwrap();
+        let moved = move_collection_contract(&state, &library, renamed.id.clone(), None).unwrap();
 
         let source_path = root.path().join("document.txt");
         std::fs::write(&source_path, "document").unwrap();
@@ -1276,6 +1655,7 @@ mod tests {
         .remove(0);
         let document = move_document_to_collection_contract(
             &state,
+            &library,
             imported.document_id.unwrap(),
             moved.id.clone(),
         )
@@ -1288,7 +1668,7 @@ mod tests {
         assert!(collection_value.get("isInbox").is_some());
         assert!(collection_value.get("documentCount").is_some());
 
-        let deleted = delete_collection_contract(&state, moved.id).unwrap();
+        let deleted = delete_collection_contract(&state, &library, moved.id).unwrap();
         let delete_value = serde_json::to_value(deleted).unwrap();
         assert!(delete_value.get("collectionId").is_some());
         assert!(delete_value.get("targetCollectionId").is_some());
@@ -1300,7 +1680,8 @@ mod tests {
         let root = tempdir().unwrap();
         let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
         let library_path = root.path().join("Library");
-        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let library =
+            create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
         let source_path = root.path().join("document.txt");
         std::fs::write(&source_path, "document").unwrap();
         let document_id = start_import_contract(
@@ -1314,14 +1695,16 @@ mod tests {
         .document_id
         .unwrap();
 
-        let work = create_tag_contract(&state, "工作".to_string()).unwrap();
-        let important = create_tag_contract(&state, "重要".to_string()).unwrap();
-        let renamed = rename_tag_contract(&state, work.id.clone(), "项目".to_string()).unwrap();
+        let work = create_tag_contract(&state, &library, "工作".to_string()).unwrap();
+        let important = create_tag_contract(&state, &library, "重要".to_string()).unwrap();
+        let renamed =
+            rename_tag_contract(&state, &library, work.id.clone(), "项目".to_string()).unwrap();
         assert_eq!(renamed.name, "项目");
         assert_eq!(list_tags_contract(&state).unwrap().len(), 2);
 
         let updated = update_document_metadata_contract(
             &state,
+            &library,
             document_id.clone(),
             DocumentMetadataUpdate {
                 title: "项目文档".to_string(),
@@ -1337,14 +1720,19 @@ mod tests {
         assert_eq!(value["tags"].as_array().unwrap().len(), 2);
         assert!(value.get("sourcePath").is_some());
 
-        let removed =
-            remove_tag_from_document_contract(&state, document_id.clone(), important.id.clone())
-                .unwrap();
+        let removed = remove_tag_from_document_contract(
+            &state,
+            &library,
+            document_id.clone(),
+            important.id.clone(),
+        )
+        .unwrap();
         assert_eq!(removed.tags.len(), 1);
         let added =
-            add_tag_to_document_contract(&state, document_id, important.id.clone()).unwrap();
+            add_tag_to_document_contract(&state, &library, document_id, important.id.clone())
+                .unwrap();
         assert_eq!(added.tags.len(), 2);
-        delete_tag_contract(&state, important.id).unwrap();
+        delete_tag_contract(&state, &library, important.id).unwrap();
         assert_eq!(list_tags_contract(&state).unwrap().len(), 1);
     }
 
@@ -1353,8 +1741,10 @@ mod tests {
         let root = tempdir().unwrap();
         let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
         let library_path = root.path().join("Library");
-        create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
-        let collection = create_collection_contract(&state, "归档".to_string(), None).unwrap();
+        let library =
+            create_library_contract(&state, library_path.to_string_lossy().into_owned()).unwrap();
+        let collection =
+            create_collection_contract(&state, &library, "归档".to_string(), None).unwrap();
         let source_path = root.path().join("document.txt");
         std::fs::write(&source_path, "document").unwrap();
         let document_id = start_import_contract(
@@ -1367,10 +1757,15 @@ mod tests {
         .remove(0)
         .document_id
         .unwrap();
-        move_document_to_collection_contract(&state, document_id.clone(), collection.id.clone())
-            .unwrap();
+        move_document_to_collection_contract(
+            &state,
+            &library,
+            document_id.clone(),
+            collection.id.clone(),
+        )
+        .unwrap();
 
-        move_document_to_trash_contract(&state, document_id.clone()).unwrap();
+        move_document_to_trash_contract(&state, &library, document_id.clone()).unwrap();
         let trash = list_trash_documents_contract(&state).unwrap();
         assert_eq!(trash.len(), 1);
         let value = serde_json::to_value(&trash[0]).unwrap();
@@ -1378,14 +1773,14 @@ mod tests {
         assert_eq!(value["originalCollectionName"], "归档");
         assert!(value.get("deletedAt").is_some());
 
-        let restored = restore_document_contract(&state, document_id.clone()).unwrap();
+        let restored = restore_document_contract(&state, &library, document_id.clone()).unwrap();
         assert_eq!(restored.collection_id, collection.id);
 
-        move_document_to_trash_contract(&state, document_id.clone()).unwrap();
-        permanently_delete_document_contract(&state, document_id).unwrap();
+        move_document_to_trash_contract(&state, &library, document_id.clone()).unwrap();
+        permanently_delete_document_contract(&state, &library, document_id).unwrap();
         assert!(list_trash_documents_contract(&state).unwrap().is_empty());
 
-        let empty = empty_trash_contract(&state).unwrap();
+        let empty = empty_trash_contract(&state, &library).unwrap();
         let value = serde_json::to_value(empty).unwrap();
         assert_eq!(value["deletedCount"], 0);
         assert_eq!(value["failedCount"], 0);

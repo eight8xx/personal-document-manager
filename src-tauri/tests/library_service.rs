@@ -54,6 +54,65 @@ fn creates_portable_library_and_reopens_it_from_recent_state() {
 }
 
 #[test]
+fn failed_creation_cleans_the_new_location_and_can_retry_the_same_path() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let new_dir = root.path().join("New Library");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    let first = service.create_library(&first_dir).unwrap();
+    let recent_before = service.list_recent_libraries();
+    let recent_file = state_dir.join("recent_libraries.json");
+    let recent_bytes = fs::read(&recent_file).unwrap();
+
+    fs::remove_file(&recent_file).unwrap();
+    fs::create_dir(&recent_file).unwrap();
+    let error = service.create_library(&new_dir).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert_eq!(service.current_library(), Some(&first));
+    assert_eq!(service.list_recent_libraries(), recent_before);
+    assert!(service.list_documents().unwrap().is_empty());
+    assert!(
+        !new_dir.exists(),
+        "failed creation must leave the path reusable"
+    );
+
+    fs::remove_dir(&recent_file).unwrap();
+    fs::write(&recent_file, recent_bytes).unwrap();
+    let created = service.create_library(&new_dir).unwrap();
+    assert_eq!(created.path, new_dir.to_string_lossy());
+    assert_eq!(service.current_library(), Some(&created));
+    assert!(new_dir.join(".pdm").join("library.json").is_file());
+}
+
+#[test]
+fn failed_creation_restores_an_existing_empty_location_for_retry() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let empty_dir = root.path().join("Already Empty");
+    fs::create_dir(&empty_dir).unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    let first = service.create_library(&first_dir).unwrap();
+    let recent_file = state_dir.join("recent_libraries.json");
+    let recent_bytes = fs::read(&recent_file).unwrap();
+
+    fs::remove_file(&recent_file).unwrap();
+    fs::create_dir(&recent_file).unwrap();
+    assert!(service.create_library(&empty_dir).is_err());
+    assert_eq!(service.current_library(), Some(&first));
+    assert!(empty_dir.is_dir());
+    assert_eq!(fs::read_dir(&empty_dir).unwrap().count(), 0);
+
+    fs::remove_dir(&recent_file).unwrap();
+    fs::write(&recent_file, recent_bytes).unwrap();
+    assert_eq!(
+        service.create_library(&empty_dir).unwrap().path,
+        empty_dir.to_string_lossy()
+    );
+}
+
+#[test]
 fn does_not_fall_back_to_an_older_library_when_the_last_one_is_missing() {
     let root = tempdir().unwrap();
     let state_dir = root.path().join("app-state");
@@ -97,6 +156,172 @@ fn switches_between_recent_libraries_without_deleting_them() {
     assert_eq!(remaining.len(), 1);
     assert!(second_dir.join(".pdm").join("library.json").is_file());
     assert!(second_dir.join("documents").is_dir());
+}
+
+#[test]
+fn successful_switch_uses_the_new_library_for_queries_imports_deletes_and_restart() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let first_source = root.path().join("first.md");
+    let second_source = root.path().join("second.md");
+    let added_source = root.path().join("added.md");
+    fs::write(&first_source, "first").unwrap();
+    fs::write(&second_source, "second").unwrap();
+    fs::write(&added_source, "added to second").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    service.create_library(&first_dir).unwrap();
+    let first_document = service.import_document(&first_source).unwrap();
+    let second = service.create_library(&second_dir).unwrap();
+    let second_document = service.import_document(&second_source).unwrap();
+    service.open_library(&first_dir).unwrap();
+
+    assert_eq!(service.open_library(&second_dir).unwrap().id, second.id);
+    assert_eq!(
+        service.list_documents().unwrap(),
+        vec![second_document.clone()]
+    );
+    let added = service.import_document(&added_source).unwrap();
+    assert!(second_dir
+        .join("documents")
+        .join(&added.id)
+        .join(&added.file_name)
+        .is_file());
+    service.move_document_to_trash(&second_document.id).unwrap();
+    assert_eq!(service.list_documents().unwrap(), vec![added.clone()]);
+    assert!(first_dir
+        .join("documents")
+        .join(&first_document.id)
+        .join(&first_document.file_name)
+        .is_file());
+
+    drop(service);
+    let mut restarted = LibraryService::new(&state_dir).unwrap();
+    assert_eq!(
+        restarted.bootstrap().unwrap().current_library.unwrap().id,
+        second.id
+    );
+    assert_eq!(restarted.list_documents().unwrap(), vec![added]);
+}
+
+#[test]
+fn unreadable_target_keeps_the_previous_library_available() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let source = root.path().join("first.md");
+    fs::write(&source, "readable after failed switch").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    let first = service.create_library(&first_dir).unwrap();
+    let document = service.import_document(&source).unwrap();
+    service.create_library(&second_dir).unwrap();
+    service.open_library(&first_dir).unwrap();
+    fs::write(second_dir.join(".pdm").join("library.json"), "invalid JSON").unwrap();
+
+    assert!(service.open_library(&second_dir).is_err());
+    assert_eq!(service.current_library().unwrap().id, first.id);
+    assert_eq!(service.list_documents().unwrap(), vec![document.clone()]);
+    assert_eq!(
+        service.get_document_preview(&document.id, None).unwrap(),
+        DocumentPreview::Markdown {
+            text: "readable after failed switch".to_string(),
+        }
+    );
+}
+
+#[test]
+fn failed_recent_write_keeps_the_previous_library_for_reads_and_imports() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let source = root.path().join("after-failure.md");
+    fs::write(&source, "remain in First").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    let first = service.create_library(&first_dir).unwrap();
+    service.create_library(&second_dir).unwrap();
+    service.open_library(&first_dir).unwrap();
+
+    let recent_file = state_dir.join("recent_libraries.json");
+    fs::remove_file(&recent_file).unwrap();
+    fs::create_dir(&recent_file).unwrap();
+
+    let error = service.open_library(&second_dir).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert_eq!(service.current_library().unwrap().id, first.id);
+    assert_eq!(service.list_recent_libraries()[0].path, first.path);
+    assert!(service.list_documents().unwrap().is_empty());
+
+    let imported = service.import_document(&source).unwrap();
+    assert_eq!(service.list_documents().unwrap(), vec![imported.clone()]);
+    assert!(first_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name)
+        .is_file());
+    assert!(!second_dir.join("documents").join(&imported.id).exists());
+}
+
+#[test]
+fn failed_target_scan_keeps_the_previous_library_and_recent_record() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let first_source = root.path().join("first.md");
+    let second_source = root.path().join("second.md");
+    let after_failure_source = root.path().join("after-failure.md");
+    fs::write(&first_source, "first").unwrap();
+    fs::write(&second_source, "second").unwrap();
+    fs::write(&after_failure_source, "after failure").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    let first = service.create_library(&first_dir).unwrap();
+    let first_document = service.import_document(&first_source).unwrap();
+    service.create_library(&second_dir).unwrap();
+    let second_document = service.import_document(&second_source).unwrap();
+    service.open_library(&first_dir).unwrap();
+    let recent_before = fs::read(state_dir.join("recent_libraries.json")).unwrap();
+
+    fs::write(
+        second_dir
+            .join("documents")
+            .join(&second_document.id)
+            .join(&second_document.file_name),
+        "changed outside the application",
+    )
+    .unwrap();
+    let target_db = Connection::open(second_dir.join(".pdm").join("library.sqlite3")).unwrap();
+    target_db
+        .execute_batch(
+            "CREATE TRIGGER fail_external_scan BEFORE UPDATE OF processing_status ON documents
+             BEGIN SELECT RAISE(FAIL, 'scan failed'); END;",
+        )
+        .unwrap();
+    drop(target_db);
+
+    let error = service.open_library(&second_dir).unwrap_err();
+    assert!(error.to_string().contains("scan failed"));
+    assert_eq!(service.current_library().unwrap().id, first.id);
+    assert_eq!(service.list_documents().unwrap(), vec![first_document]);
+    assert_eq!(service.list_recent_libraries()[0].path, first.path);
+    assert_eq!(
+        fs::read(state_dir.join("recent_libraries.json")).unwrap(),
+        recent_before
+    );
+
+    let imported = service.import_document(&after_failure_source).unwrap();
+    assert!(first_dir
+        .join("documents")
+        .join(&imported.id)
+        .join(&imported.file_name)
+        .is_file());
+    assert!(!second_dir.join("documents").join(&imported.id).exists());
 }
 
 #[test]
@@ -713,6 +938,193 @@ fn duplicate_imports_wait_for_use_existing_import_anyway_or_cancel() {
         .resolve_import_item("missing-item", ImportDecision::Cancel)
         .unwrap_err();
     assert_eq!(error.code(), "importItemNotFound");
+}
+
+#[test]
+fn import_progress_keeps_its_origin_library_after_a_switch() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let source = root.path().join("document.txt");
+    fs::write(&source, "belongs to First").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    let first = service.create_library(&first_dir).unwrap();
+    service.create_library(&second_dir).unwrap();
+    service.open_library(&first_dir).unwrap();
+
+    let mut events = Vec::new();
+    service
+        .start_import_with_progress(vec![source.to_string_lossy().into_owned()], |progress| {
+            events.push(serde_json::to_value(progress).unwrap());
+        })
+        .unwrap();
+    service.open_library(&second_dir).unwrap();
+
+    assert!(!events.is_empty());
+    for event in events {
+        assert_eq!(event["library"]["id"], first.id);
+        assert_eq!(event["library"]["path"], first.path);
+    }
+}
+
+#[test]
+fn duplicate_decision_cannot_create_a_document_in_another_library() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let source = root.path().join("same.txt");
+    fs::write(&source, "same contents").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    service.create_library(&first_dir).unwrap();
+    service
+        .start_import(vec![source.to_string_lossy().into_owned()])
+        .unwrap();
+    let pending = service
+        .start_import(vec![source.to_string_lossy().into_owned()])
+        .unwrap()
+        .items
+        .remove(0);
+    assert_eq!(pending.status, ImportItemStatus::Duplicate);
+
+    service.create_library(&second_dir).unwrap();
+    let error = service
+        .resolve_import_item(&pending.item_id, ImportDecision::ImportAnyway)
+        .unwrap_err();
+    assert_eq!(error.code(), "invalidImportDecision");
+    assert!(error.to_string().contains("其他资料库"));
+    assert!(service.list_documents().unwrap().is_empty());
+    assert_eq!(fs::read(&source).unwrap(), b"same contents");
+    assert_eq!(
+        fs::read_dir(second_dir.join("documents")).unwrap().count(),
+        0
+    );
+
+    service.open_library(&first_dir).unwrap();
+    let imported = service
+        .resolve_import_item(&pending.item_id, ImportDecision::ImportAnyway)
+        .unwrap();
+    assert_eq!(imported.status, ImportItemStatus::Imported);
+    assert_eq!(service.list_documents().unwrap().len(), 2);
+}
+
+#[test]
+fn changed_source_decisions_cannot_modify_a_copied_library() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second Copy");
+    let source = root.path().join("changing.txt");
+    fs::write(&source, "first version").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    let first = service.create_library(&first_dir).unwrap();
+    let original = service
+        .start_import(vec![source.to_string_lossy().into_owned()])
+        .unwrap()
+        .items
+        .remove(0);
+    let document_id = original.document_id.unwrap();
+    drop(service);
+
+    fs::create_dir_all(second_dir.join(".pdm")).unwrap();
+    fs::create_dir_all(second_dir.join("documents").join(&document_id)).unwrap();
+    fs::create_dir_all(second_dir.join("trash")).unwrap();
+    fs::create_dir_all(second_dir.join("thumbnails")).unwrap();
+    fs::copy(
+        first_dir.join(".pdm").join("library.json"),
+        second_dir.join(".pdm").join("library.json"),
+    )
+    .unwrap();
+    fs::copy(
+        first_dir.join(".pdm").join("library.sqlite3"),
+        second_dir.join(".pdm").join("library.sqlite3"),
+    )
+    .unwrap();
+    let first_copy = first_dir
+        .join("documents")
+        .join(&document_id)
+        .join("changing.txt");
+    let second_copy = second_dir
+        .join("documents")
+        .join(&document_id)
+        .join("changing.txt");
+    fs::copy(&first_copy, &second_copy).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.bootstrap().unwrap();
+    fs::write(&source, "second version").unwrap();
+    let create_pending = service
+        .start_import(vec![source.to_string_lossy().into_owned()])
+        .unwrap()
+        .items
+        .remove(0);
+    let replace_pending = service
+        .start_import(vec![source.to_string_lossy().into_owned()])
+        .unwrap()
+        .items
+        .remove(0);
+    assert_eq!(create_pending.status, ImportItemStatus::SourceChanged);
+    assert_eq!(replace_pending.status, ImportItemStatus::SourceChanged);
+
+    let opened_copy = service.open_library(&second_dir).unwrap();
+    assert_eq!(opened_copy.id, first.id);
+    let before_documents = service.list_documents().unwrap();
+    let before_bytes = fs::read(&second_copy).unwrap();
+    for (item_id, decision) in [
+        (&create_pending.item_id, ImportDecision::CreateNew),
+        (&replace_pending.item_id, ImportDecision::ReplaceExisting),
+    ] {
+        let error = service.resolve_import_item(item_id, decision).unwrap_err();
+        assert_eq!(error.code(), "invalidImportDecision");
+        assert!(error.to_string().contains("其他资料库"));
+    }
+    assert_eq!(service.list_documents().unwrap(), before_documents);
+    assert_eq!(fs::read(&second_copy).unwrap(), before_bytes);
+    assert_eq!(fs::read(&source).unwrap(), b"second version");
+
+    service.open_library(&first_dir).unwrap();
+    let replaced = service
+        .resolve_import_item(&replace_pending.item_id, ImportDecision::ReplaceExisting)
+        .unwrap();
+    assert_eq!(replaced.status, ImportItemStatus::Imported);
+    assert_eq!(fs::read(&first_copy).unwrap(), b"second version");
+}
+
+#[test]
+fn failed_import_retry_cannot_import_into_another_library() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let source = root.path().join("available-later.txt");
+    let mut service = LibraryService::new(&state_dir).unwrap();
+
+    service.create_library(&first_dir).unwrap();
+    let failed = service
+        .start_import(vec![source.to_string_lossy().into_owned()])
+        .unwrap()
+        .items
+        .remove(0);
+    assert_eq!(failed.status, ImportItemStatus::Failed);
+    service.create_library(&second_dir).unwrap();
+    fs::write(&source, "available now").unwrap();
+
+    let error = service.retry_import_item(&failed.item_id).unwrap_err();
+    assert_eq!(error.code(), "invalidImportDecision");
+    assert!(error.to_string().contains("其他资料库"));
+    assert!(service.list_documents().unwrap().is_empty());
+    assert_eq!(
+        fs::read_dir(second_dir.join("documents")).unwrap().count(),
+        0
+    );
+
+    service.open_library(&first_dir).unwrap();
+    let retried = service.retry_import_item(&failed.item_id).unwrap();
+    assert_eq!(retried.status, ImportItemStatus::Imported);
+    assert_eq!(service.list_documents().unwrap().len(), 1);
 }
 
 #[test]
@@ -2235,7 +2647,7 @@ fn monitor_coalesces_consecutive_saves_and_refreshes_content() {
     fs::write(&source_path, source_bytes).unwrap();
 
     let mut service = LibraryService::new(&state_dir).unwrap();
-    service.create_library(&library_dir).unwrap();
+    let library = service.create_library(&library_dir).unwrap();
     let imported = service.import_document(&source_path).unwrap();
     service.index_pending_documents().unwrap();
     let copy = library_dir
@@ -2299,6 +2711,92 @@ fn monitor_coalesces_consecutive_saves_and_refreshes_content() {
         .collect::<Vec<_>>();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result.as_ref().unwrap().processed, 1);
+    let event = serde_json::to_value(&completed[0]).unwrap();
+    assert_eq!(event["library"]["id"], library.id);
+    assert_eq!(event["library"]["path"], library.path);
+}
+
+#[test]
+fn delayed_monitor_events_keep_their_library_when_switching_between_libraries() {
+    use std::sync::mpsc;
+
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let first_dir = root.path().join("First");
+    let second_dir = root.path().join("Second");
+    let first_source = root.path().join("first.txt");
+    let second_source = root.path().join("second.txt");
+    fs::write(&first_source, "first source").unwrap();
+    fs::write(&second_source, "second source").unwrap();
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    let first = service.create_library(&first_dir).unwrap();
+    let first_document = service.import_document(&first_source).unwrap();
+    service.index_pending_documents().unwrap();
+    let second = service.create_library(&second_dir).unwrap();
+    let second_document = service.import_document(&second_source).unwrap();
+    service.index_pending_documents().unwrap();
+    service.open_library(&first_dir).unwrap();
+    let first_copy = first_dir
+        .join("documents")
+        .join(&first_document.id)
+        .join(&first_document.file_name);
+    let second_copy = second_dir
+        .join("documents")
+        .join(&second_document.id)
+        .join(&second_document.file_name);
+
+    let service = Arc::new(Mutex::new(service));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+    let first_id = first.id.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let monitor = ExternalChangeMonitor::start(
+        Arc::clone(&service),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+        move |event| {
+            if event.phase == DocumentIndexPhase::Processing && event.library.id == first_id {
+                started_tx.send(event.clone()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+            }
+            callback_events.lock().unwrap().push(event);
+        },
+    )
+    .unwrap();
+
+    fs::write(&first_copy, "first external change").unwrap();
+    let delayed = started_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+    assert_eq!(delayed.library.id, first.id);
+    assert_eq!(delayed.library.path, first.path);
+
+    service.lock().unwrap().open_library(&second_dir).unwrap();
+    fs::write(&second_copy, "second external change").unwrap();
+    release_tx.send(()).unwrap();
+    assert!(wait_until(Duration::from_secs(4), || {
+        let service = service.lock().unwrap();
+        search(
+            &service,
+            "second external change",
+            DocumentSearchFilters::default(),
+        )
+        .len()
+            == 1
+    }));
+    drop(monitor);
+
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| {
+        event.phase == DocumentIndexPhase::Processing && event.library.id == second.id
+    }));
+    assert!(events.iter().any(|event| {
+        event.phase == DocumentIndexPhase::Completed && event.library.id == second.id
+    }));
+    assert!(!events.iter().any(|event| {
+        event.phase == DocumentIndexPhase::Completed && event.library.id == first.id
+    }));
+    assert_eq!(fs::read(&first_source).unwrap(), b"first source");
+    assert_eq!(fs::read(&second_source).unwrap(), b"second source");
 }
 
 #[test]

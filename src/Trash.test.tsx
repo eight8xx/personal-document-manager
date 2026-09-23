@@ -90,6 +90,37 @@ function trashSummary(
 }
 
 describe("回收站、恢复与永久删除", () => {
+  it("rejects an old library's trash move after switching in strict backend mode", async () => {
+    const document = documentFor("old-library-document", "旧资料库文档");
+    const secondPath = "D:\\Archive";
+    const client = new FakeBackendClient({
+      strictLibraryIdentity: true,
+      bootstrap: {
+        currentLibrary: library,
+        recentLibraries: [
+          {
+            path: secondPath,
+            name: "归档",
+            lastOpenedAt: "2026-09-12T08:00:00Z",
+            isAvailable: true
+          }
+        ]
+      },
+      documents: [document],
+      collections,
+      tags: [tag]
+    });
+
+    await client.openLibrary(secondPath);
+    await expect(client.moveDocumentToTrash(library, document.id)).rejects.toMatchObject({
+      code: "invalidLibrary"
+    });
+    expect((await client.listDocuments()).map((item) => item.id)).toEqual([
+      document.id
+    ]);
+    expect(await client.listTrashDocuments()).toEqual([]);
+  });
+
   it("moves a document to trash and restores it to the original collection", async () => {
     const user = userEvent.setup();
     const document = documentFor("project", "项目文档");
@@ -147,7 +178,7 @@ describe("回收站、恢复与永久删除", () => {
     });
     const originalDelete = client.permanentlyDeleteDocument.bind(client);
     let attempts = 0;
-    client.permanentlyDeleteDocument = async (documentId) => {
+    client.permanentlyDeleteDocument = async (owner, documentId) => {
       attempts += 1;
       if (attempts === 1) {
         throw new BackendError({
@@ -155,7 +186,7 @@ describe("回收站、恢复与永久删除", () => {
           message: "无法删除资料库副本。"
         });
       }
-      return originalDelete(documentId);
+      return originalDelete(owner, documentId);
     };
 
     render(<App client={client} />);
@@ -201,7 +232,7 @@ describe("回收站、恢复与永久删除", () => {
     });
     const originalEmpty = client.emptyTrash.bind(client);
     let attempts = 0;
-    client.emptyTrash = async () => {
+    client.emptyTrash = async (owner) => {
       attempts += 1;
       if (attempts === 1) {
         throw new BackendError({
@@ -209,7 +240,7 @@ describe("回收站、恢复与永久删除", () => {
           message: "清空回收站时发生错误。"
         });
       }
-      return originalEmpty();
+      return originalEmpty(owner);
     };
 
     render(<App client={client} />);
@@ -251,7 +282,7 @@ describe("回收站、恢复与永久删除", () => {
     });
     const originalEmpty = client.emptyTrash.bind(client);
     let attempts = 0;
-    client.emptyTrash = async (): Promise<EmptyTrashResult> => {
+    client.emptyTrash = async (owner): Promise<EmptyTrashResult> => {
       attempts += 1;
       if (attempts === 1) {
         return {
@@ -275,7 +306,7 @@ describe("回收站、恢复与永久删除", () => {
           ]
         };
       }
-      return originalEmpty();
+      return originalEmpty(owner);
     };
 
     render(<App client={client} />);

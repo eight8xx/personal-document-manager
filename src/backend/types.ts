@@ -270,6 +270,7 @@ export interface IndexRunResult {
 export type DocumentIndexPhase = "processing" | "completed";
 
 export interface DocumentIndexChangedEvent {
+  library: LibrarySummary;
   phase: DocumentIndexPhase;
   documentIds: string[];
   result: IndexRunResult | null;
@@ -320,6 +321,7 @@ export interface ImportBatch {
 }
 
 export interface ImportProgress {
+  library: LibrarySummary;
   batchId: string;
   total: number;
   completed: number;
@@ -374,33 +376,40 @@ export interface BackendClient {
   pickDocumentFile(): Promise<string | null>;
   pickDocumentFiles(): Promise<string[]>;
   pickDocumentFolder(): Promise<string | null>;
-  importDocument(path: string): Promise<DocumentSummary>;
+  importDocument(library: LibrarySummary, path: string): Promise<DocumentSummary>;
   startImport(
+    library: LibrarySummary,
     paths: string[],
     targetCollectionId?: string | null,
     source?: ImportSource
   ): Promise<ImportBatch>;
   resolveImportItem(
+    library: LibrarySummary,
     itemId: string,
     decision: ImportDecision
   ): Promise<ImportItemResult>;
-  retryImportItem(itemId: string): Promise<ImportItemResult>;
+  retryImportItem(library: LibrarySummary, itemId: string): Promise<ImportItemResult>;
   subscribeToImportProgress(
     handler: ImportProgressHandler
   ): Promise<() => void>;
   listDocuments(): Promise<DocumentSummary[]>;
   subscribeToFileDrops(handler: FileDropHandler): Promise<() => void>;
   getDocumentPreview(
+    library: LibrarySummary,
     documentId: string,
     page?: number
   ): Promise<DocumentPreview>;
-  getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail>;
+  getDocumentThumbnail(
+    library: LibrarySummary,
+    documentId: string
+  ): Promise<DocumentThumbnail>;
   saveDocumentThumbnail(
+    library: LibrarySummary,
     documentId: string,
     contentHash: string,
     thumbnailDataUrl: string
   ): Promise<DocumentThumbnail>;
-  openDocument(documentId: string): Promise<void>;
+  openDocument(library: LibrarySummary, documentId: string): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
   listDocumentFormatCapabilities(): Promise<DocumentFormatCapability[]>;
   listRecentLibraries(): Promise<RecentLibrary[]>;
@@ -408,44 +417,55 @@ export interface BackendClient {
   openLibraryDirectory(path: string): Promise<void>;
   listCollections(): Promise<CollectionSummary[]>;
   createCollection(
+    library: LibrarySummary,
     name: string,
     parentId: string | null
   ): Promise<CollectionSummary>;
   renameCollection(
+    library: LibrarySummary,
     collectionId: string,
     name: string
   ): Promise<CollectionSummary>;
   moveCollection(
+    library: LibrarySummary,
     collectionId: string,
     parentId: string | null
   ): Promise<CollectionSummary>;
-  deleteCollection(collectionId: string): Promise<CollectionDeleteResult>;
+  deleteCollection(
+    library: LibrarySummary,
+    collectionId: string
+  ): Promise<CollectionDeleteResult>;
   moveDocumentToCollection(
+    library: LibrarySummary,
     documentId: string,
     collectionId: string
   ): Promise<DocumentSummary>;
-  moveDocumentToTrash(documentId: string): Promise<void>;
+  moveDocumentToTrash(library: LibrarySummary, documentId: string): Promise<void>;
   listTrashDocuments(): Promise<TrashDocumentSummary[]>;
-  restoreDocument(documentId: string): Promise<DocumentSummary>;
-  permanentlyDeleteDocument(documentId: string): Promise<void>;
-  emptyTrash(): Promise<EmptyTrashResult>;
+  restoreDocument(library: LibrarySummary, documentId: string): Promise<DocumentSummary>;
+  permanentlyDeleteDocument(library: LibrarySummary, documentId: string): Promise<void>;
+  emptyTrash(library: LibrarySummary): Promise<EmptyTrashResult>;
   listTags(): Promise<TagSummary[]>;
-  createTag(name: string): Promise<TagSummary>;
-  renameTag(tagId: string, name: string): Promise<TagSummary>;
-  deleteTag(tagId: string): Promise<void>;
+  createTag(library: LibrarySummary, name: string): Promise<TagSummary>;
+  renameTag(library: LibrarySummary, tagId: string, name: string): Promise<TagSummary>;
+  deleteTag(library: LibrarySummary, tagId: string): Promise<void>;
   addTagToDocument(
+    library: LibrarySummary,
     documentId: string,
     tagId: string
   ): Promise<DocumentSummary>;
   removeTagFromDocument(
+    library: LibrarySummary,
     documentId: string,
     tagId: string
   ): Promise<DocumentSummary>;
   updateDocumentMetadata(
+    library: LibrarySummary,
     documentId: string,
     update: DocumentMetadataUpdate
   ): Promise<DocumentSummary>;
   batchOrganizeDocuments(
+    library: LibrarySummary,
     request: BatchDocumentOperationRequest
   ): Promise<BatchDocumentOperationResult>;
   cancelBatchDocumentOperation(jobId: string): Promise<boolean>;
@@ -453,8 +473,11 @@ export interface BackendClient {
     request: DocumentSearchQuery
   ): Promise<DocumentSearchResponse>;
   pendingIndexCount(): Promise<number>;
-  indexPendingDocuments(): Promise<IndexRunResult>;
-  retryDocumentIndex(documentId: string): Promise<DocumentSummary>;
+  indexPendingDocuments(library: LibrarySummary): Promise<IndexRunResult>;
+  retryDocumentIndex(
+    library: LibrarySummary,
+    documentId: string
+  ): Promise<DocumentSummary>;
   subscribeToDocumentIndexChanges(
     handler: DocumentIndexChangedHandler
   ): Promise<() => void>;

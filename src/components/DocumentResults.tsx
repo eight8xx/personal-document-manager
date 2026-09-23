@@ -7,7 +7,7 @@ import {
   RotateCcw,
   Trash2
 } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
@@ -22,6 +22,7 @@ import type {
   DocumentSummary,
   DocumentThumbnail
 } from "../backend/types";
+import { LibraryContext } from "../backend/libraryContext";
 import {
   documentSupportsGeneratedThumbnail,
   documentUsesLocalImage,
@@ -391,6 +392,7 @@ function DocumentThumbnailVisual({
   client: BackendClient;
   document: DocumentSummary;
 }) {
+  const library = useContext(LibraryContext);
   const [thumbnail, setThumbnail] = useState<DocumentThumbnail | null>(null);
   const usesGeneratedThumbnail =
     documentSupportsGeneratedThumbnail(document) &&
@@ -404,9 +406,15 @@ function DocumentThumbnailVisual({
         active = false;
       };
     }
+    if (!library) {
+      setThumbnail({ kind: "fallback", reason: "当前资料库不可用。" });
+      return () => {
+        active = false;
+      };
+    }
 
     void client
-      .getDocumentThumbnail(document.id)
+      .getDocumentThumbnail(library, document.id)
       .then((result) => {
         if (active) {
           setThumbnail(result);
@@ -426,6 +434,7 @@ function DocumentThumbnailVisual({
     };
   }, [
     client,
+    library,
     document.id,
     document.contentHash,
     document.fileSize,

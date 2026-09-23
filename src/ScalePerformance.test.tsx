@@ -91,6 +91,7 @@ describe("一万份资料库的列表与网格渲染规模", () => {
 
     act(() => {
       client.emitDocumentIndexChanged({
+        library,
         phase: "processing",
         documentIds: [],
         result: { processed: 40, searchable: 39, failed: 1 }

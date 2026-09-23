@@ -1,4 +1,5 @@
 import { BackendError, toBackendError } from "./error";
+import { sameLibraryIdentity } from "./libraryIdentity";
 import {
   documentFormatCapabilities,
   documentFormatForPath,
@@ -42,6 +43,7 @@ import type {
 
 export interface FakeBackendOptions {
   bootstrap?: BootstrapState;
+  strictLibraryIdentity?: boolean;
   selectedDirectory?: string | null;
   selectedDocument?: string | null;
   selectedDocuments?: string[];
@@ -174,6 +176,7 @@ export class FakeBackendClient implements BackendClient {
   private collections: CollectionSummary[];
   private tags: TagSummary[];
   private readonly selectedDirectory: string | null;
+  private readonly strictLibraryIdentity: boolean;
   private readonly selectedDocument: string | null;
   private readonly selectedDocuments: string[];
   private readonly selectedFolder: string | null;
@@ -252,6 +255,7 @@ export class FakeBackendClient implements BackendClient {
 
   constructor(options: FakeBackendOptions = {}) {
     this.state = structuredClone(options.bootstrap ?? emptyBootstrap);
+    this.strictLibraryIdentity = options.strictLibraryIdentity ?? false;
     this.documents = structuredClone(options.documents ?? []);
     this.trashDocuments = structuredClone(options.trashDocuments ?? []);
     this.collections = structuredClone(options.collections ?? [inbox]);
@@ -370,7 +374,11 @@ export class FakeBackendClient implements BackendClient {
     return this.selectedFolder;
   }
 
-  async importDocument(path: string): Promise<DocumentSummary> {
+  async importDocument(
+    _library: LibrarySummary,
+    path: string
+  ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`import:${path}`);
     if (this.importDocumentImpl) {
       const document = await this.importDocumentImpl(path);
@@ -394,10 +402,12 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async startImport(
+    _library: LibrarySummary,
     paths: string[],
     targetCollectionId: string | null = null,
     source: ImportSource = "filePicker"
   ): Promise<ImportBatch> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(
       `startImport:${paths.join("|")}${
         targetCollectionId ? `:${targetCollectionId}` : ""
@@ -436,6 +446,7 @@ export class FakeBackendClient implements BackendClient {
     const collectionId = target?.id ?? "inbox";
     const items: ImportItemResult[] = [];
     this.emitImportProgress({
+      library: _library,
       batchId,
       total: paths.length,
       completed: 0,
@@ -450,7 +461,7 @@ export class FakeBackendClient implements BackendClient {
       let item: ImportItemResult;
 
       try {
-        const document = await this.importDocument(path);
+        const document = await this.importDocument(_library, path);
         document.collectionId = collectionId;
         this.refreshCollectionCounts();
         item = {
@@ -489,6 +500,7 @@ export class FakeBackendClient implements BackendClient {
 
       items.push(item);
       this.emitImportProgress({
+        library: _library,
         batchId,
         total: paths.length,
         completed: index + 1,
@@ -510,9 +522,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async resolveImportItem(
+    _library: LibrarySummary,
     itemId: string,
     decision: ImportDecision
   ): Promise<ImportItemResult> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`resolveImportItem:${itemId}:${decision}`);
     if (this.resolveImportItemImpl) {
       const resolved = await this.resolveImportItemImpl(itemId, decision);
@@ -554,7 +568,11 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(item);
   }
 
-  async retryImportItem(itemId: string): Promise<ImportItemResult> {
+  async retryImportItem(
+    _library: LibrarySummary,
+    itemId: string
+  ): Promise<ImportItemResult> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`retryImportItem:${itemId}`);
     if (this.retryImportItemImpl) {
       const resolved = await this.retryImportItemImpl(itemId);
@@ -720,7 +738,8 @@ export class FakeBackendClient implements BackendClient {
     ).length;
   }
 
-  async indexPendingDocuments(): Promise<IndexRunResult> {
+  async indexPendingDocuments(_library: LibrarySummary): Promise<IndexRunResult> {
+    this.assertCurrentLibrary(_library);
     this.calls.push("indexPendingDocuments");
     if (this.indexPendingDocumentsImpl) {
       return this.indexPendingDocumentsImpl();
@@ -752,7 +771,11 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(result);
   }
 
-  async retryDocumentIndex(documentId: string): Promise<DocumentSummary> {
+  async retryDocumentIndex(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`retryDocumentIndex:${documentId}`);
     if (this.retryDocumentIndexImpl) {
       const updated = await this.retryDocumentIndexImpl(documentId);
@@ -817,9 +840,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async getDocumentPreview(
+    _library: LibrarySummary,
     documentId: string,
     page?: number
   ): Promise<DocumentPreview> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`getDocumentPreview:${documentId}`);
     if (this.getDocumentPreviewImpl) {
       return this.getDocumentPreviewImpl(documentId, page);
@@ -888,7 +913,11 @@ export class FakeBackendClient implements BackendClient {
     };
   }
 
-  async getDocumentThumbnail(documentId: string): Promise<DocumentThumbnail> {
+  async getDocumentThumbnail(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<DocumentThumbnail> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`getDocumentThumbnail:${documentId}`);
     if (this.getDocumentThumbnailImpl) {
       return this.getDocumentThumbnailImpl(documentId);
@@ -926,10 +955,12 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async saveDocumentThumbnail(
+    _library: LibrarySummary,
     documentId: string,
     contentHash: string,
     thumbnailDataUrl: string
   ): Promise<DocumentThumbnail> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`saveDocumentThumbnail:${documentId}:${contentHash}`);
     if (this.saveDocumentThumbnailImpl) {
       const thumbnail = await this.saveDocumentThumbnailImpl(
@@ -962,7 +993,11 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(thumbnail);
   }
 
-  async openDocument(documentId: string): Promise<void> {
+  async openDocument(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<void> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`openDocument:${documentId}`);
     if (this.openDocumentImpl) {
       await this.openDocumentImpl(documentId);
@@ -1015,9 +1050,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async createCollection(
+    _library: LibrarySummary,
     name: string,
     parentId: string | null
   ): Promise<CollectionSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`createCollection:${name}:${parentId ?? "null"}`);
     const trimmedName = name.trim();
     if (!trimmedName) {
@@ -1045,9 +1082,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async renameCollection(
+    _library: LibrarySummary,
     collectionId: string,
     name: string
   ): Promise<CollectionSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`renameCollection:${collectionId}:${name}`);
     const collection = this.requireCollection(collectionId);
     if (collection.isInbox) {
@@ -1068,9 +1107,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async moveCollection(
+    _library: LibrarySummary,
     collectionId: string,
     parentId: string | null
   ): Promise<CollectionSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`moveCollection:${collectionId}:${parentId ?? "null"}`);
     const collection = this.requireCollection(collectionId);
     if (collection.isInbox) {
@@ -1103,8 +1144,10 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async deleteCollection(
+    _library: LibrarySummary,
     collectionId: string
   ): Promise<CollectionDeleteResult> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`deleteCollection:${collectionId}`);
     const collection = this.requireCollection(collectionId);
     if (collection.isInbox) {
@@ -1141,9 +1184,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async moveDocumentToCollection(
+    _library: LibrarySummary,
     documentId: string,
     collectionId: string
   ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`moveDocumentToCollection:${documentId}:${collectionId}`);
     const document = this.documents.find((item) => item.id === documentId);
     if (!document) {
@@ -1164,7 +1209,11 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(document);
   }
 
-  async moveDocumentToTrash(documentId: string): Promise<void> {
+  async moveDocumentToTrash(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<void> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`moveDocumentToTrash:${documentId}`);
     const document = this.requireDocument(documentId);
     this.documents = this.documents.filter((item) => item.id !== documentId);
@@ -1191,7 +1240,11 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(this.trashDocuments);
   }
 
-  async restoreDocument(documentId: string): Promise<DocumentSummary> {
+  async restoreDocument(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`restoreDocument:${documentId}`);
     const trashDocument = this.trashDocuments.find(
       (item) => item.document.id === documentId
@@ -1220,7 +1273,11 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(restored);
   }
 
-  async permanentlyDeleteDocument(documentId: string): Promise<void> {
+  async permanentlyDeleteDocument(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<void> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`permanentlyDeleteDocument:${documentId}`);
     if (
       !this.trashDocuments.some((item) => item.document.id === documentId)
@@ -1236,7 +1293,8 @@ export class FakeBackendClient implements BackendClient {
     this.refreshTagCounts();
   }
 
-  async emptyTrash(): Promise<EmptyTrashResult> {
+  async emptyTrash(_library: LibrarySummary): Promise<EmptyTrashResult> {
+    this.assertCurrentLibrary(_library);
     this.calls.push("emptyTrash");
     const items = this.trashDocuments.map(({ document }) => ({
       documentId: document.id,
@@ -1259,7 +1317,8 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(this.tags);
   }
 
-  async createTag(name: string): Promise<TagSummary> {
+  async createTag(_library: LibrarySummary, name: string): Promise<TagSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`createTag:${name}`);
     const trimmedName = name.trim();
     this.validateTagName(trimmedName);
@@ -1284,7 +1343,12 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(tag);
   }
 
-  async renameTag(tagId: string, name: string): Promise<TagSummary> {
+  async renameTag(
+    _library: LibrarySummary,
+    tagId: string,
+    name: string
+  ): Promise<TagSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`renameTag:${tagId}:${name}`);
     const trimmedName = name.trim();
     this.validateTagName(trimmedName);
@@ -1313,7 +1377,8 @@ export class FakeBackendClient implements BackendClient {
     return structuredClone(tag);
   }
 
-  async deleteTag(tagId: string): Promise<void> {
+  async deleteTag(_library: LibrarySummary, tagId: string): Promise<void> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`deleteTag:${tagId}`);
     this.requireTag(tagId);
     this.tags = this.tags.filter((tag) => tag.id !== tagId);
@@ -1323,9 +1388,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async addTagToDocument(
+    _library: LibrarySummary,
     documentId: string,
     tagId: string
   ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`addTagToDocument:${documentId}:${tagId}`);
     const document = this.requireDocument(documentId);
     const tag = this.requireTag(tagId);
@@ -1337,9 +1404,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async removeTagFromDocument(
+    _library: LibrarySummary,
     documentId: string,
     tagId: string
   ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(`removeTagFromDocument:${documentId}:${tagId}`);
     const document = this.requireDocument(documentId);
     this.requireTag(tagId);
@@ -1349,9 +1418,11 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async updateDocumentMetadata(
+    _library: LibrarySummary,
     documentId: string,
     update: DocumentMetadataUpdate
   ): Promise<DocumentSummary> {
+    this.assertCurrentLibrary(_library);
     this.calls.push(
       `updateDocumentMetadata:${documentId}:${update.title}:${
         update.documentDate ?? "null"
@@ -1398,8 +1469,10 @@ export class FakeBackendClient implements BackendClient {
   }
 
   async batchOrganizeDocuments(
+    library: LibrarySummary,
     request: BatchDocumentOperationRequest
   ): Promise<BatchDocumentOperationResult> {
+    this.assertCurrentLibrary(library);
     this.calls.push(
       `batchOrganizeDocuments:${request.jobId}:${request.operation.kind}`
     );
@@ -1426,24 +1499,27 @@ export class FakeBackendClient implements BackendClient {
           switch (request.operation.kind) {
             case "moveToCollection":
               await this.moveDocumentToCollection(
+                library,
                 documentId,
                 request.operation.collectionId
               );
               break;
             case "addTag":
               await this.addTagToDocument(
+                library,
                 documentId,
                 request.operation.tagId
               );
               break;
             case "removeTag":
               await this.removeTagFromDocument(
+                library,
                 documentId,
                 request.operation.tagId
               );
               break;
             case "moveToTrash":
-              await this.moveDocumentToTrash(documentId);
+              await this.moveDocumentToTrash(library, documentId);
               break;
           }
           results.push({
@@ -1499,6 +1575,18 @@ export class FakeBackendClient implements BackendClient {
       currentLibrary: this.state.currentLibrary,
       recentLibraries: [...this.state.recentLibraries]
     };
+  }
+
+  private assertCurrentLibrary(library: LibrarySummary) {
+    if (
+      this.strictLibraryIdentity &&
+      !sameLibraryIdentity(library, this.state.currentLibrary)
+    ) {
+      throw new BackendError({
+        code: "invalidLibrary",
+        message: "资料库已切换，请在当前资料库重新发起操作。"
+      });
+    }
   }
 
   private findStoredImportItem(itemId: string): ImportItemResult {

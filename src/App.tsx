@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { tauriBackendClient } from "./backend/client";
 import { toBackendError } from "./backend/error";
+import { LibraryContext } from "./backend/libraryContext";
 import type {
   BackendClient,
   LibrarySummary,
@@ -14,6 +15,10 @@ import { SettingsDialog } from "./components/SettingsDialog";
 
 interface AppProps {
   client?: BackendClient;
+}
+
+function libraryIdentity(library: Pick<LibrarySummary, "id" | "path">) {
+  return JSON.stringify([library.id, library.path]);
 }
 
 function useSystemTheme() {
@@ -41,11 +46,35 @@ export function App({ client = tauriBackendClient }: AppProps) {
 
   const [loading, setLoading] = useState(true);
   const [library, setLibrary] = useState<LibrarySummary | null>(null);
+  const [showImportRestartNotice, setShowImportRestartNotice] = useState(false);
   const [recentLibraries, setRecentLibraries] = useState<RecentLibrary[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState("");
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const settingsTriggerRef = useRef<HTMLElement | null>(null);
+  const sidebarSettingsRef = useRef<HTMLButtonElement | null>(null);
+  const unfinishedImportOwnerRef = useRef<Pick<
+    LibrarySummary,
+    "id" | "path"
+  > | null>(null);
+  const importRestartLibrariesRef = useRef(new Set<string>());
+
+  const reportUnfinishedImport = useCallback(
+    (owner: LibrarySummary, unfinished: boolean) => {
+      if (unfinished) {
+        unfinishedImportOwnerRef.current = {
+          id: owner.id,
+          path: owner.path
+        };
+      } else if (
+        unfinishedImportOwnerRef.current?.id === owner.id &&
+        unfinishedImportOwnerRef.current.path === owner.path
+      ) {
+        unfinishedImportOwnerRef.current = null;
+      }
+    },
+    []
+  );
 
   const openSettings = useCallback(() => {
     if (document.activeElement instanceof HTMLElement) {
@@ -56,7 +85,10 @@ export function App({ client = tauriBackendClient }: AppProps) {
 
   const closeSettings = useCallback(() => {
     setSettingsOpen(false);
-    window.setTimeout(() => settingsTriggerRef.current?.focus(), 0);
+    window.setTimeout(() => {
+      const trigger = settingsTriggerRef.current;
+      (trigger?.isConnected ? trigger : sidebarSettingsRef.current)?.focus();
+    }, 0);
   }, []);
 
   useEffect(() => {
@@ -93,8 +125,26 @@ export function App({ client = tauriBackendClient }: AppProps) {
 
     try {
       const nextLibrary = await client.openLibrary(path);
+      const unfinishedOwner = unfinishedImportOwnerRef.current;
+      if (
+        library &&
+        unfinishedOwner?.id === library.id &&
+        unfinishedOwner.path === library.path
+      ) {
+        importRestartLibrariesRef.current.add(libraryIdentity(library));
+      }
+      setShowImportRestartNotice(
+        importRestartLibrariesRef.current.delete(libraryIdentity(nextLibrary))
+      );
+      unfinishedImportOwnerRef.current = null;
       setLibrary(nextLibrary);
-      setRecentLibraries(await client.listRecentLibraries());
+      try {
+        setRecentLibraries(await client.listRecentLibraries());
+      } catch (caught) {
+        setError(
+          `已切换资料库，但无法刷新最近资料库列表：${toBackendError(caught).message}`
+        );
+      }
     } catch (caught) {
       setError(toBackendError(caught).message);
     } finally {
@@ -156,11 +206,17 @@ export function App({ client = tauriBackendClient }: AppProps) {
 
       {library ? (
         <>
-          <LibraryWorkspace
-            client={client}
-            library={library}
-            onOpenSettings={openSettings}
-          />
+          <LibraryContext.Provider value={library}>
+            <LibraryWorkspace
+              key={`${library.id}:${library.path}`}
+              client={client}
+              library={library}
+              showImportRestartNotice={showImportRestartNotice}
+              settingsButtonRef={sidebarSettingsRef}
+              onUnfinishedImportChange={reportUnfinishedImport}
+              onOpenSettings={openSettings}
+            />
+          </LibraryContext.Provider>
           {settingsOpen ? (
             <SettingsDialog
               library={library}
