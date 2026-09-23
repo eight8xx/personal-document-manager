@@ -79,7 +79,9 @@ pub(super) fn initialize_store_schema(connection: &Connection) -> LibraryResult<
             tag_ids TEXT NOT NULL DEFAULT '[]',
             matched_rule_ids TEXT NOT NULL DEFAULT '[]',
             error_message TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            item_id TEXT,
+            resolved_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS receive_import_log_created_idx
@@ -93,6 +95,9 @@ pub(super) fn initialize_store_schema(connection: &Connection) -> LibraryResult<
         "first_scan_confirmed_at",
         "INTEGER",
     )?;
+    // 来源变化待决项要能被界面处理：日志行需要记录待决项 id 与处理时间。
+    ensure_column(connection, "receive_import_log", "item_id", "TEXT")?;
+    ensure_column(connection, "receive_import_log", "resolved_at", "TEXT")?;
     Ok(())
 }
 
@@ -328,7 +333,9 @@ pub(super) fn list_receive_sources(connection: &Connection) -> LibraryResult<Vec
         "SELECT id, kind, display_name, path, enabled, status, status_message,
                 last_scanned_at,
                 (SELECT COUNT(*) FROM receive_import_log log
-                  WHERE log.source_id = receive_sources.id AND log.status = 'pending')
+                  WHERE log.source_id = receive_sources.id
+                    AND log.status = 'sourceChanged'
+                    AND log.resolved_at IS NULL)
          FROM receive_sources
          ORDER BY kind ASC, created_at ASC, id ASC",
     )?;
@@ -453,13 +460,14 @@ pub(super) fn record_import_log(
     tag_ids: &[String],
     matched_rule_ids: &[String],
     error_message: Option<&str>,
+    item_id: Option<&str>,
     timestamp: &str,
 ) -> LibraryResult<()> {
     connection.execute(
         "INSERT INTO receive_import_log
             (id, source_id, source_path, file_name, status, document_id, collection_id,
-             tag_ids, matched_rule_ids, error_message, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             tag_ids, matched_rule_ids, error_message, created_at, item_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             Uuid::new_v4().to_string(),
             source_id,
@@ -472,9 +480,28 @@ pub(super) fn record_import_log(
             serde_json::to_string(matched_rule_ids).unwrap_or_else(|_| "[]".to_string()),
             error_message,
             timestamp,
+            item_id,
         ],
     )?;
     Ok(())
+}
+
+/// 按导入项 id 把对应的待决日志行标记为已决（写入 `resolved_at`）。
+///
+/// 只匹配 `item_id` 相同且尚未结算的行：待决项也可能来自人工导入、没有日志行，
+/// 那时这里一行都不改（返回 0），不会误标别的待决。行本身保留，供用户回看。
+pub(super) fn resolve_import_log_by_item(
+    connection: &Connection,
+    item_id: &str,
+    timestamp: &str,
+) -> LibraryResult<usize> {
+    let updated = connection.execute(
+        "UPDATE receive_import_log
+            SET resolved_at = ?2
+          WHERE item_id = ?1 AND resolved_at IS NULL",
+        params![item_id, timestamp],
+    )?;
+    Ok(updated)
 }
 
 /// 读取最近的接收导入日志。
@@ -484,7 +511,7 @@ pub(super) fn list_import_log(
 ) -> LibraryResult<Vec<ReceiveImportLogEntry>> {
     let mut statement = connection.prepare(
         "SELECT source_id, source_path, file_name, status, document_id, collection_id,
-                tag_ids, matched_rule_ids, error_message, created_at
+                tag_ids, matched_rule_ids, error_message, created_at, item_id, resolved_at
            FROM receive_import_log
           ORDER BY created_at DESC, id DESC
           LIMIT ?1",
@@ -504,6 +531,12 @@ pub(super) fn list_import_log(
             matched_rule_ids: serde_json::from_str(&matched).unwrap_or_default(),
             error_message: row.get(8)?,
             created_at: row.get(9)?,
+            // 已结算的待决项不再提供 item_id，避免界面重复处理同一条。
+            item_id: match row.get::<_, Option<String>>(11)? {
+                Some(_) => None,
+                None => row.get(10)?,
+            },
+            resolved_at: row.get(11)?,
         })
     })?;
     let mut entries = Vec::new();
@@ -788,6 +821,7 @@ mod tests {
                 &["tag-a".to_string()],
                 &["rule-1".to_string()],
                 None,
+                Some("item-1"),
                 "2026-09-23T08:00:01Z",
             )
             .unwrap();
@@ -802,6 +836,7 @@ mod tests {
                 &[],
                 &[],
                 Some("文件损坏"),
+                None,
                 "2026-09-23T08:00:02Z",
             )
             .unwrap();
