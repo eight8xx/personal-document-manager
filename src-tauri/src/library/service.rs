@@ -25,6 +25,10 @@ use super::formats::{
     require_capability_for_file_type, unsupported_message, PreviewStrategy, TextExtractionStrategy,
     ThumbnailStrategy, ValidationStrategy,
 };
+use super::limits::{
+    bound_extracted_text, read_stream_limited, ArchiveLimits, ExpansionBudget,
+    MAX_EXTRACTED_TEXT_CHARS,
+};
 use super::models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,
@@ -53,6 +57,8 @@ const DELETE_TOMBSTONE_PREFIX: &str = ".pdm-delete-";
 const DELETE_TOMBSTONE_SUFFIX: &str = ".tombstone";
 const REPLACEMENT_BACKUP_SUFFIX: &str = ".previous";
 const IMPORT_TEMPORARY_SUFFIX: &str = ".importing";
+/// 纯文本读取的字节上限：UTF-8 每字符最多 4 字节，另加 4 字节用于识别截断。
+const MAX_TEXT_READ_BYTES: u64 = MAX_EXTRACTED_TEXT_CHARS as u64 * 4 + 4;
 
 pub struct LibraryService {
     state_dir: PathBuf,
@@ -3199,21 +3205,28 @@ impl LibraryService {
                 })
             }
             PreviewStrategy::PlainText => Ok(DocumentPreview::Text {
-                text: read_utf8_text(&path)?,
+                text: bounded_preview_text(read_utf8_text(&path)?),
             }),
             PreviewStrategy::SafeMarkdown => Ok(DocumentPreview::Markdown {
-                text: read_utf8_text(&path)?,
+                text: bounded_preview_text(read_utf8_text(&path)?),
             }),
             PreviewStrategy::DocxLayout => {
-                let bytes = fs::read(&path)?;
-                let degraded_features = inspect_docx_degradations(&bytes);
+                let bytes = read_archive_within_limits(&path, ArchiveLimits::for_preview())?;
+                let mut degraded_features = inspect_docx_degradations(&bytes);
                 let sanitized = ooxml::sanitize_docx_package(&bytes)?;
+                let text = bound_extracted_text(extract_docx_text_from_bytes(&bytes)?);
+                if text.truncated {
+                    push_unique_feature(
+                        &mut degraded_features,
+                        format!("正文超过 {MAX_EXTRACTED_TEXT_CHARS} 个字符，预览只显示前半部分"),
+                    );
+                }
                 Ok(DocumentPreview::Docx {
                     data_url: data_url(
                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         &sanitized,
                     ),
-                    text: extract_docx_text_from_bytes(&bytes)?,
+                    text: text.text,
                     notice: if degraded_features.is_empty() {
                         "DOCX 版式预览为本地只读近似呈现。".to_string()
                     } else {
@@ -3223,17 +3236,24 @@ impl LibraryService {
                 })
             }
             PreviewStrategy::PptxPages => {
-                let bytes = fs::read(&path)?;
+                let bytes = read_archive_within_limits(&path, ArchiveLimits::for_preview())?;
                 let extraction = extract_pptx_text_from_bytes(&bytes)?;
                 let mut degraded_features = inspect_pptx_degradations(&bytes);
                 merge_features(&mut degraded_features, extraction.degraded_features);
                 let sanitized = ooxml::sanitize_pptx_package(&bytes)?;
+                let text = bound_extracted_text(extraction.text);
+                if text.truncated {
+                    push_unique_feature(
+                        &mut degraded_features,
+                        format!("正文超过 {MAX_EXTRACTED_TEXT_CHARS} 个字符，预览只显示前半部分"),
+                    );
+                }
                 Ok(DocumentPreview::Pptx {
                     data_url: data_url(
                         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                         &sanitized,
                     ),
-                    text: extraction.text,
+                    text: text.text,
                     notice: if degraded_features.is_empty() {
                         "PPTX 版式预览为本地只读近似呈现。".to_string()
                     } else {
@@ -4054,6 +4074,28 @@ fn is_import_temporary_name(name: &std::ffi::OsStr) -> bool {
 
 fn is_replacement_artifact_name(name: &std::ffi::OsStr) -> bool {
     is_replacement_backup_name(name) || is_import_temporary_name(name)
+}
+
+/// 在读入整份压缩文档之前校验输入大小：超限时直接失败，不为超限文件分配整块内存。
+fn read_archive_within_limits(path: &Path, limits: ArchiveLimits) -> LibraryResult<Vec<u8>> {
+    let budget = ExpansionBudget::new(limits);
+    let metadata = fs::metadata(path)?;
+    budget.check_input_size(metadata.len())?;
+    let bytes = fs::read(path)?;
+    budget.check_input_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
+/// 预览返回的纯文本按上限截断；截断时在末尾给出可理解的降级说明。
+fn bounded_preview_text(text: String) -> String {
+    let bounded = bound_extracted_text(text);
+    if !bounded.truncated {
+        return bounded.text;
+    }
+    format!(
+        "{}\n\n……（正文超过 {MAX_EXTRACTED_TEXT_CHARS} 个字符的预览上限，已截断）",
+        bounded.text
+    )
 }
 
 /// 打开资料库时对账中断遗留的文件操作。数据库记录是权威：墓碑和替换备份都要么让
@@ -4894,6 +4936,20 @@ fn validate_file_content(
     path: &Path,
     capability: &super::formats::DocumentFormatCapability,
 ) -> Result<(), String> {
+    // 压缩文档在导入时就按输入上限拦下，避免把超限文件整份复制进资料库。
+    if matches!(
+        capability.validation,
+        ValidationStrategy::DocxPackage
+            | ValidationStrategy::PptxPackage
+            | ValidationStrategy::XlsxPackage
+    ) {
+        let input_bytes = fs::metadata(path)
+            .map_err(|error| format!("无法读取文件内容：{error}"))?
+            .len();
+        ExpansionBudget::new(ArchiveLimits::for_index())
+            .check_input_size(input_bytes)
+            .map_err(|error| error.to_string())?;
+    }
     match capability.validation {
         ValidationStrategy::PdfSignature => {
             let prefix = read_prefix(path, 1024)?;
@@ -4921,7 +4977,8 @@ fn validate_file_content(
 }
 
 fn validate_pptx_package(path: &Path) -> Result<(), String> {
-    let archive = fs::read(path).map_err(|error| format!("无法读取文件内容：{error}"))?;
+    let archive = read_archive_within_limits(path, ArchiveLimits::for_index())
+        .map_err(|error| error.to_string())?;
     validate_pptx_bytes(&archive).map_err(|error| error.to_string())
 }
 
@@ -5196,8 +5253,12 @@ fn data_url(media_type: &str, bytes: &[u8]) -> String {
 }
 
 fn read_utf8_text(path: &Path) -> LibraryResult<String> {
-    let bytes = fs::read(path)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    // 文本按字节流读取并设上限：UTF-8 每个字符最多 4 字节，再多读一点用于识别截断。
+    // 这样超大文本不会在被截断之前先整份读进内存（字符级上限见 bound_extracted_text）。
+    let file = File::open(path)?;
+    let mut buffer = Vec::new();
+    file.take(MAX_TEXT_READ_BYTES).read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 fn ensure_document_copy_exists(path: &Path) -> LibraryResult<()> {
@@ -5256,7 +5317,7 @@ fn memchr_indices(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 }
 
 fn extract_docx_text(path: &Path) -> LibraryResult<String> {
-    let archive = fs::read(path)?;
+    let archive = read_archive_within_limits(path, ArchiveLimits::for_index())?;
     extract_docx_text_from_bytes(&archive)
 }
 
@@ -5274,6 +5335,8 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
     let Ok(entry_names) = zip_entry_names(archive) else {
         return Vec::new();
     };
+    // 降级检查属于预览工作：所有部件共用一份预览预算，累计超限后剩余部件按读取失败跳过。
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_preview());
     let mut features = Vec::new();
     let mut push_feature = |feature: &str| {
         if !features.iter().any(|candidate| candidate == feature) {
@@ -5296,7 +5359,7 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
         if !(lowercase_name.ends_with(".xml") || lowercase_name.ends_with(".rels")) {
             continue;
         }
-        let Ok(xml) = read_zip_entry(archive, &entry_name) else {
+        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "DOCX", &mut budget) else {
             continue;
         };
         let xml_text = String::from_utf8_lossy(&xml);
@@ -5341,7 +5404,7 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
 }
 
 fn extract_pptx_text(path: &Path) -> LibraryResult<String> {
-    let archive = fs::read(path)?;
+    let archive = read_archive_within_limits(path, ArchiveLimits::for_index())?;
     extract_pptx_text_from_bytes(&archive).map(|extraction| extraction.text)
 }
 
@@ -5356,9 +5419,11 @@ fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction>
         ));
     }
 
+    // 所有幻灯片与图表共用一份索引预算，累计解压量超限后剩余页按降级处理。
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_index());
     let mut slide_text = Vec::new();
     for (index, entry_name) in slide_names.iter().enumerate() {
-        match read_zip_entry_for(archive, entry_name, "PPTX")
+        match read_zip_entry_for(archive, entry_name, "PPTX", &mut budget)
             .and_then(|xml| extract_powerpoint_text(&xml, false))
         {
             Ok(text) if !text.trim().is_empty() => slide_text.push(text),
@@ -5371,7 +5436,7 @@ fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction>
     }
 
     for entry_name in graph.chart_parts {
-        match read_zip_entry_for(archive, &entry_name, "PPTX")
+        match read_zip_entry_for(archive, &entry_name, "PPTX", &mut budget)
             .and_then(|xml| extract_powerpoint_text(&xml, true))
         {
             Ok(text) if !text.trim().is_empty() => slide_text.push(text),
@@ -5450,9 +5515,11 @@ fn extract_powerpoint_text(xml: &[u8], chart_values: bool) -> LibraryResult<Stri
 }
 
 fn inspect_pptx_degradations(archive: &[u8]) -> Vec<String> {
-    let Ok(entry_names) = zip_entry_names_for(archive, "PPTX") else {
+    let Ok(entry_names) = zip_entry_names_for(archive, "PPTX", ArchiveLimits::for_preview()) else {
         return Vec::new();
     };
+    // 降级检查属于预览工作：所有部件共用一份预览预算，超限后剩余部件按读取失败跳过。
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_preview());
     let mut features = Vec::new();
 
     for entry_name in entry_names {
@@ -5473,7 +5540,7 @@ fn inspect_pptx_degradations(archive: &[u8]) -> Vec<String> {
         if !lowercase_name.ends_with(".rels") {
             continue;
         }
-        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "PPTX") else {
+        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "PPTX", &mut budget) else {
             continue;
         };
         let xml_text = String::from_utf8_lossy(&xml);
@@ -5503,16 +5570,22 @@ fn push_unique_feature(features: &mut Vec<String>, feature: String) {
 }
 
 fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
-    zip_entry_names_for(archive, "DOCX")
+    zip_entry_names_for(archive, "DOCX", ArchiveLimits::for_preview())
 }
 
-fn zip_entry_names_for(archive: &[u8], format: &str) -> LibraryResult<Vec<String>> {
+fn zip_entry_names_for(
+    archive: &[u8],
+    format: &str,
+    limits: ArchiveLimits,
+) -> LibraryResult<Vec<String>> {
+    ExpansionBudget::new(limits).check_input_size(archive.len() as u64)?;
     let eocd = find_zip_eocd(archive).ok_or_else(|| {
         LibraryError::Preview(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
     })?;
     let entry_count = read_u16(archive, eocd + 10)? as usize;
     let mut cursor = read_u32(archive, eocd + 16)? as usize;
-    let mut names = Vec::with_capacity(entry_count);
+    // 每个中央目录项至少 46 字节，按文件长度收敛预分配。
+    let mut names = Vec::with_capacity(entry_count.min(archive.len() / 46 + 1));
 
     for _ in 0..entry_count {
         if read_u32(archive, cursor)? != 0x0201_4b50 {
@@ -5543,10 +5616,18 @@ fn zip_entry_names_for(archive: &[u8], format: &str) -> LibraryResult<Vec<String
 }
 
 fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
-    read_zip_entry_for(archive, target_name, "DOCX")
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_index());
+    read_zip_entry_for(archive, target_name, "DOCX", &mut budget)
 }
 
-fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> LibraryResult<Vec<u8>> {
+/// 在既有预算内读取单个条目：先按声明大小与压缩比筛选，再限流解压并计入累计量。
+fn read_zip_entry_for(
+    archive: &[u8],
+    target_name: &str,
+    format: &str,
+    budget: &mut ExpansionBudget,
+) -> LibraryResult<Vec<u8>> {
+    budget.check_input_size(archive.len() as u64)?;
     let eocd = find_zip_eocd(archive).ok_or_else(|| {
         LibraryError::Preview(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
     })?;
@@ -5586,6 +5667,12 @@ fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> Librar
                     "暂不支持 ZIP64 格式的 {format} 文件。"
                 )));
             }
+            budget.check_entry_size(target_name, uncompressed_size as u64)?;
+            budget.check_compression_ratio(
+                target_name,
+                compressed_size as u64,
+                uncompressed_size as u64,
+            )?;
 
             let data_start = zip_local_data_start(archive, local_header_offset, format)?;
             let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
@@ -5595,13 +5682,17 @@ fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> Librar
                 LibraryError::Preview(format!("{format} 文件结构无效：正文超出文件范围。"))
             })?;
             return match compression {
-                0 => Ok(compressed.to_vec()),
-                8 => {
-                    let mut decoder = DeflateDecoder::new(Cursor::new(compressed));
-                    let mut output = Vec::with_capacity(uncompressed_size);
-                    decoder.read_to_end(&mut output)?;
-                    Ok(output)
+                0 => {
+                    let contents = compressed.to_vec();
+                    budget.charge(target_name, contents.len())?;
+                    Ok(contents)
                 }
+                8 => read_stream_limited(
+                    DeflateDecoder::new(Cursor::new(compressed)),
+                    target_name,
+                    uncompressed_size as u64,
+                    budget,
+                ),
                 method => Err(LibraryError::Preview(format!(
                     "{format} 使用了不支持的压缩方式：{method}。"
                 ))),
@@ -5852,7 +5943,7 @@ fn fts_phrase(query: &str) -> String {
 
 fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
     let capability = require_capability_for_file_type(file_type)?;
-    match capability.text_extraction {
+    let text = match capability.text_extraction {
         TextExtractionStrategy::PdfText => extract_pdf_text(path),
         TextExtractionStrategy::DocxText => extract_docx_text(path),
         TextExtractionStrategy::PlainText => read_utf8_text(path),
@@ -5862,7 +5953,10 @@ fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
         TextExtractionStrategy::TableText => Err(LibraryError::Preview(
             "表格正文提取尚未实现。".to_string(),
         )),
-    }
+    }?;
+    // 索引正文有明确上限：只把前 MAX_EXTRACTED_TEXT_CHARS 个字符写进 FTS，
+    // 避免单份大文档把索引撑到无界（上限同时用于预览截断提示）。
+    Ok(bound_extracted_text(text).text)
 }
 
 fn extract_pdf_text(path: &Path) -> LibraryResult<String> {
