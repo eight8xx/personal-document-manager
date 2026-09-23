@@ -32,16 +32,22 @@ use super::limits::{
 use super::models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,
-    CollectionDeleteResult, CollectionSummary, DocumentIndexChangedEvent, DocumentIndexPhase,
-    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
-    DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
-    DocumentThumbnail, EmptyTrashItemResult, EmptyTrashItemStatus, EmptyTrashResult, ImportBatch,
-    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, ImportSource,
-    IndexRunResult, IndexStatus, LibraryLocationInspection, LibraryMetadata, LibrarySummary,
-    LocationStatus, RecentLibrary, RecentLibraryRecord, SearchMatchKind, TablePreviewRequest,
-    TableSheet, TagSummary, TrashDocumentSummary,
+    ClassificationPreviewItem, ClassificationPreviewRequest, ClassificationPreviewResponse,
+    ClassificationRule, ClassificationRuleInput, ClassificationRuleOperation,
+    CollectionDeleteResult, CollectionSummary,
+    DocumentIndexChangedEvent, DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview,
+    DocumentProcessingStatus, DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse,
+    DocumentSearchResult, DocumentSummary, DocumentThumbnail, EmptyTrashItemResult,
+    EmptyTrashItemStatus, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
+    ImportItemStatus, ImportProgress, ImportSource, IndexRunResult, IndexStatus,
+    LibraryLocationInspection, LibraryMetadata, LibrarySummary, LocationStatus,
+    ReceiveDirectoryListing, ReceiveDirectoryListingItem, ReceiveDirectoryOperation,
+    ReceiveImportLogEntry, ReceiveSource, ReceiveSourceCandidate, ReceiveSourceCandidates,
+    ReceiveSourceInput, ReceiveSourceKind, ReceiveSourceScanResult, ReceiveSourceStatus,
+    RecentLibrary, RecentLibraryRecord, SearchMatchKind, TablePreviewRequest, TableSheet, TagSummary,
+    TrashDocumentSummary,
 };
-use super::{ooxml, table, thumbnail};
+use super::{ooxml, store, table, thumbnail};
 
 const FORMAT_VERSION: u32 = 1;
 const INTERNAL_DIR: &str = ".pdm";
@@ -61,6 +67,30 @@ const IMPORT_TEMPORARY_SUFFIX: &str = ".importing";
 const MAX_TEXT_READ_BYTES: u64 = MAX_EXTRACTED_TEXT_CHARS as u64 * 4 + 4;
 /// 表格预览未指定列数时的默认列数；上限由 `limits` 模块统一约束。
 const DEFAULT_TABLE_PREVIEW_COLUMNS: usize = 16;
+/// 首次启用接收目录时一次列出的文件数上限，避免超大目录拖慢界面。
+const MAX_RECEIVE_LISTING_ITEMS: usize = 500;
+/// 接收目录扫描的递归深度上限（QQ 的 FileRecv 常有按日期分层的子目录）。
+const MAX_RECEIVE_SCAN_DEPTH: usize = 4;
+/// 失败项在周期补扫里自动重试前的冷却时间（秒），避免刷日志。
+const RECEIVE_RETRY_COOLDOWN_SECONDS: i64 = 60;
+/// 接收目录里默认排除的临时/中间文件后缀。
+const RECEIVE_TEMP_EXTENSIONS: [&str; 15] = [
+    "tmp",
+    "temp",
+    "part",
+    "partial",
+    "crdownload",
+    "download",
+    "filepart",
+    "bak",
+    "db",
+    "db-wal",
+    "db-shm",
+    "sqlite",
+    "sqlite3",
+    "dat",
+    "lnk",
+];
 
 pub struct LibraryService {
     state_dir: PathBuf,
@@ -88,6 +118,34 @@ struct ActiveImportBatch {
     items: Vec<ImportItemResult>,
     total: usize,
     target_collection_id: Option<String>,
+    /// 本批是否把已启用的分类规则应用到新建成功的文档上。
+    classification: ClassificationMode,
+    /// 接收目录导入时记录来源，逐项写入接收导入日志并更新来源状态。
+    receive_source_id: Option<String>,
+}
+
+/// 本批新建文档是否应用分类规则。
+///
+/// 人工批量导入默认应用（与 `preview_classification` 的语义一致），
+/// 用户选择「不应用」时由命令层显式传 `KeepExisting`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassificationMode {
+    ApplyRules,
+    KeepExisting,
+}
+
+impl ClassificationMode {
+    fn applies(self) -> bool {
+        matches!(self, Self::ApplyRules)
+    }
+}
+
+/// 一条源路径的分类结果；`matched_rule_ids` 按规则顺序排列。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassificationPlan {
+    collection_id: String,
+    tag_ids: Vec<String>,
+    matched_rule_ids: Vec<String>,
 }
 
 struct ImportItemContext {
@@ -733,12 +791,39 @@ impl LibraryService {
         paths: Vec<String>,
         target_collection_id: Option<String>,
         source: ImportSource,
+        on_progress: F,
+    ) -> LibraryResult<ImportBatch>
+    where
+        F: FnMut(ImportProgress),
+    {
+        self.start_import_to_collection_with_classification(
+            paths,
+            target_collection_id,
+            source,
+            true,
+            on_progress,
+        )
+    }
+
+    /// 人工批量导入的入口：`apply_classification` 为假时完全保留原有导入行为
+    /// （不套用规则集合与标签），对应界面里「不应用，按原有方式导入」。
+    pub fn start_import_to_collection_with_classification<F>(
+        &mut self,
+        paths: Vec<String>,
+        target_collection_id: Option<String>,
+        source: ImportSource,
+        apply_classification: bool,
         mut on_progress: F,
     ) -> LibraryResult<ImportBatch>
     where
         F: FnMut(ImportProgress),
     {
-        let first = self.begin_import_batch(paths, target_collection_id, source)?;
+        let first = self.begin_import_batch_with_classification(
+            paths,
+            target_collection_id,
+            source,
+            apply_classification,
+        )?;
         let batch_id = first.batch_id.clone();
         on_progress(first);
         let result = self.drive_import_batch(&batch_id, &mut on_progress);
@@ -759,6 +844,58 @@ impl LibraryService {
         paths: Vec<String>,
         target_collection_id: Option<String>,
         source: ImportSource,
+    ) -> LibraryResult<ImportProgress> {
+        self.begin_import_batch_with_classification(
+            paths,
+            target_collection_id,
+            source,
+            true,
+        )
+    }
+
+    /// 开始一批导入并显式指定是否应用分类规则。
+    pub fn begin_import_batch_with_classification(
+        &mut self,
+        paths: Vec<String>,
+        target_collection_id: Option<String>,
+        source: ImportSource,
+        apply_classification: bool,
+    ) -> LibraryResult<ImportProgress> {
+        self.begin_import_batch_with_mode(
+            paths,
+            target_collection_id,
+            source,
+            if apply_classification {
+                ClassificationMode::ApplyRules
+            } else {
+                ClassificationMode::KeepExisting
+            },
+            None,
+        )
+    }
+
+    /// 开始一批接收目录导入：记录来源，逐项写接收导入日志并应用分类规则。
+    pub fn begin_receive_import_batch(
+        &mut self,
+        source_id: &str,
+        paths: Vec<String>,
+    ) -> LibraryResult<ImportProgress> {
+        self.begin_import_batch_with_mode(
+            paths,
+            None,
+            ImportSource::FilePicker,
+            ClassificationMode::ApplyRules,
+            Some(source_id.to_string()),
+        )
+    }
+
+    fn begin_import_batch_with_mode(
+        &mut self,
+        paths: Vec<String>,
+        target_collection_id: Option<String>,
+        source: ImportSource,
+        classification: ClassificationMode,
+        receive_source_id: Option<String>,
     ) -> LibraryResult<ImportProgress> {
         let library = self
             .current_library()
@@ -795,6 +932,8 @@ impl LibraryService {
                 items: Vec::with_capacity(total),
                 total,
                 target_collection_id,
+                classification,
+                receive_source_id,
             },
         );
         Ok(progress)
@@ -842,6 +981,8 @@ impl LibraryService {
         };
         let target_collection_id = batch.target_collection_id.clone();
         let total = batch.total;
+        let classification = batch.classification;
+        let receive_source_id = batch.receive_source_id.clone();
         let current_file_name = entry.file_name();
         let current_source_path = entry.source_path();
 
@@ -851,6 +992,7 @@ impl LibraryService {
                 false,
                 None,
                 target_collection_id.clone(),
+                classification,
             )?,
             ScanEntry::Ignored { source_path } => {
                 let file_name = display_file_name(&source_path);
@@ -894,11 +1036,23 @@ impl LibraryService {
             .get_mut(batch_id)
             .ok_or_else(|| import_batch_not_found(batch_id))?;
         batch.items.push(item.clone());
+        let completed = batch.items.len();
+        let batch_id_text = batch.batch_id.clone();
+
+        // 接收目录导入逐项写日志：命中规则、实际集合与标签都留痕，供用户事后改正。
+        if let Some(source_id) = receive_source_id.as_deref() {
+            let matched_rule_ids = self
+                .classification_plan(&item.source_path, classification, None)?
+                .map(|plan| plan.matched_rule_ids)
+                .unwrap_or_default();
+            self.record_receive_import_log(source_id, &item, &matched_rule_ids)?;
+        }
+
         Ok(ImportProgress {
             library,
-            batch_id: batch.batch_id.clone(),
+            batch_id: batch_id_text,
             total,
-            completed: batch.items.len(),
+            completed,
             current_file_name,
             current_source_path: Some(current_source_path),
             item: Some(item),
@@ -994,7 +1148,7 @@ impl LibraryService {
                 let pending = context.pending.ok_or_else(|| {
                     LibraryError::ImportFile("重复导入项缺少待处理上下文。".to_string())
                 })?;
-                self.create_new_document(item_id.to_string(), pending)
+                self.create_new_document(item_id.to_string(), pending, ClassificationMode::ApplyRules)
             }
             (ImportItemStatus::Duplicate, ImportDecision::Cancel)
             | (ImportItemStatus::SourceChanged, ImportDecision::Cancel) => Ok(ImportItemResult {
@@ -1007,7 +1161,7 @@ impl LibraryService {
                 let pending = context.pending.ok_or_else(|| {
                     LibraryError::ImportFile("来源变化导入项缺少待处理上下文。".to_string())
                 })?;
-                self.create_new_document(item_id.to_string(), pending)
+                self.create_new_document(item_id.to_string(), pending, ClassificationMode::ApplyRules)
             }
             (ImportItemStatus::SourceChanged, ImportDecision::ReplaceExisting) => {
                 let pending = context.pending.ok_or_else(|| {
@@ -1043,6 +1197,7 @@ impl LibraryService {
             false,
             Some(item_id.to_string()),
             target_collection_id,
+            ClassificationMode::ApplyRules,
         )
     }
 
@@ -1071,12 +1226,14 @@ impl LibraryService {
         force_import: bool,
         existing_item_id: Option<String>,
         target_collection_id: Option<String>,
+        classification: ClassificationMode,
     ) -> LibraryResult<ImportItemResult> {
         let mut item = self.process_import_file_impl(
             source_path,
             force_import,
             existing_item_id,
             target_collection_id.clone(),
+            classification,
         )?;
         if item.target_collection_id.is_none() {
             item.target_collection_id = target_collection_id.clone();
@@ -1091,6 +1248,7 @@ impl LibraryService {
         force_import: bool,
         existing_item_id: Option<String>,
         target_collection_id: Option<String>,
+        classification: ClassificationMode,
     ) -> LibraryResult<ImportItemResult> {
         let item_id = existing_item_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let original_source_path = source_path.to_string_lossy().into_owned();
@@ -1273,6 +1431,7 @@ impl LibraryService {
                 existing_document_id: String::new(),
                 target_collection_id,
             },
+            classification,
         )
     }
 
@@ -1316,9 +1475,29 @@ impl LibraryService {
         &mut self,
         item_id: String,
         pending: PendingImport,
+        classification: ClassificationMode,
     ) -> LibraryResult<ImportItemResult> {
-        let (collection_id, target_notice) =
+        let (resolved_collection_id, target_notice) =
             self.resolve_target_collection(pending.target_collection_id.as_deref())?;
+        // 只有用户确实指定了目标集合（并且它仍然存在）时才算「显式目标」；
+        // 否则由分类规则决定集合，未命中才落回收件箱。
+        let explicit_collection_id = pending
+            .target_collection_id
+            .as_deref()
+            .filter(|_| target_notice.is_none());
+        let plan = self.classification_plan(
+            &pending.source_path,
+            classification,
+            explicit_collection_id,
+        )?;
+        let collection_id = plan
+            .as_ref()
+            .map(|plan| plan.collection_id.clone())
+            .unwrap_or(resolved_collection_id);
+        let tag_ids = plan
+            .as_ref()
+            .map(|plan| plan.tag_ids.clone())
+            .unwrap_or_default();
         let library_root = self
             .current
             .as_ref()
@@ -1470,6 +1649,14 @@ impl LibraryService {
                     ],
                 )
                 .map_err(|error| ("database", error.to_string()))?;
+            for tag_id in &tag_ids {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO document_tags (document_id, tag_id) VALUES (?1, ?2)",
+                        params![&document.id, tag_id],
+                    )
+                    .map_err(|error| ("tag", format!("无法应用分类标签：{error}")))?;
+            }
             transaction
                 .execute(
                     "
@@ -3781,6 +3968,910 @@ struct DocumentRefreshFailure {
     file_size: Option<i64>,
     content_hash: Option<String>,
     file_modified_at: Option<i64>,
+}
+
+impl LibraryService {
+    fn library_connection(&self) -> LibraryResult<&Connection> {
+        Ok(&self
+            .current
+            .as_ref()
+            .ok_or(LibraryError::NoCurrentLibrary)?
+            .connection)
+    }
+
+    /// 按当前启用规则为一条源路径算出分类计划；`KeepExisting` 时返回 `None`。
+    fn classification_plan(
+        &self,
+        source_path: &str,
+        mode: ClassificationMode,
+        explicit_collection_id: Option<&str>,
+    ) -> LibraryResult<Option<ClassificationPlan>> {
+        if !mode.applies() {
+            return Ok(None);
+        }
+        let Some(library) = self.current.as_ref() else {
+            return Ok(None);
+        };
+        let rules = store::list_classification_rules(&library.connection)?;
+        Ok(Some(plan_classification(
+            &library.connection,
+            &rules,
+            source_path,
+            explicit_collection_id,
+        )?))
+    }
+
+    // ---- 分类规则（工作单 10） ----
+
+    pub fn list_classification_rules(&self) -> LibraryResult<Vec<ClassificationRule>> {
+        store::list_classification_rules(self.library_connection()?)
+    }
+
+    /// 应用一次规则编辑操作；引用了不存在的集合或标签时给出明确原因。
+    pub fn apply_classification_rule_operation(
+        &mut self,
+        operation: ClassificationRuleOperation,
+    ) -> LibraryResult<Vec<ClassificationRule>> {
+        let connection = self.library_connection()?;
+        validate_classification_operation(connection, &operation)?;
+        store::apply_classification_rule_operation(connection, &operation, &now())
+    }
+
+    /// 预览一批文件的分类结果；与真实导入共用 [`plan_classification`]。
+    pub fn preview_classification(
+        &self,
+        request: ClassificationPreviewRequest,
+    ) -> LibraryResult<ClassificationPreviewResponse> {
+        let connection = self.library_connection()?;
+        // 只有用户确实指定且仍然存在的目标集合才算显式目标，否则由规则决定。
+        let explicit_collection_id = match request.target_collection_id.as_deref() {
+            Some(target) => {
+                let (resolved, notice) = self.resolve_target_collection(Some(target))?;
+                notice.is_none().then_some(resolved)
+            }
+            None => None,
+        };
+        let rules = store::list_classification_rules(connection)?;
+        let mut items = Vec::with_capacity(request.paths.len());
+        for source_path in &request.paths {
+            let plan = plan_classification(
+                connection,
+                &rules,
+                source_path,
+                explicit_collection_id.as_deref(),
+            )?;
+            items.push(ClassificationPreviewItem {
+                source_path: source_path.clone(),
+                file_name: display_file_name(source_path),
+                file_type: supported_file_type(Path::new(source_path)).map(str::to_string),
+                collection_id: plan.collection_id,
+                tag_ids: plan.tag_ids,
+                matched_rule_ids: plan.matched_rule_ids,
+            });
+        }
+        Ok(ClassificationPreviewResponse { items })
+    }
+
+    // ---- 接收来源（工作单 11/12） ----
+
+    /// 读取当前资料库的接收来源；顺带刷新目录状态与待处理数。
+    pub fn list_receive_sources(&self) -> LibraryResult<Vec<ReceiveSource>> {
+        let connection = self.library_connection()?;
+        let mut sources = store::list_receive_sources(connection)?;
+        for source in sources.iter_mut() {
+            refresh_receive_source_status(connection, source)?;
+        }
+        Ok(sources)
+    }
+
+    pub fn list_receive_source_candidates(
+        &self,
+        kind: ReceiveSourceKind,
+    ) -> LibraryResult<ReceiveSourceCandidates> {
+        let library_root = PathBuf::from(&self.library_summary()?.path);
+        Ok(ReceiveSourceCandidates {
+            kind,
+            candidates: receive_source_candidates(kind, &library_root),
+        })
+    }
+
+    /// 新增或更新一个接收来源；路径变化时重新要求用户确认清单。
+    pub fn upsert_receive_source(
+        &mut self,
+        source_id: Option<&str>,
+        input: ReceiveSourceInput,
+    ) -> LibraryResult<Vec<ReceiveSource>> {
+        let display_name = input.display_name.trim().to_string();
+        if display_name.is_empty() {
+            return Err(LibraryError::InvalidLocation(
+                "接收来源名称不能为空。".to_string(),
+            ));
+        }
+        if input.path.trim().is_empty() {
+            return Err(LibraryError::InvalidLocation(
+                "请先选择并确认接收目录。".to_string(),
+            ));
+        }
+        let library_root = PathBuf::from(&self.library_summary()?.path);
+        let confirmed = validate_receive_path(&library_root, input.path.trim())?;
+        let confirmed_text = confirmed.to_string_lossy().into_owned();
+        let normalized_input = ReceiveSourceInput {
+            kind: input.kind,
+            display_name,
+            path: confirmed_text.clone(),
+            enabled: input.enabled,
+        };
+
+        let connection = self.library_connection()?;
+        let previous_path = source_id.and_then(|id| {
+            store::list_receive_sources(connection)
+                .ok()
+                .and_then(|sources| {
+                    sources
+                        .into_iter()
+                        .find(|source| source.id == id)
+                        .and_then(|source| source.path)
+                })
+        });
+        let path_changed = previous_path
+            .as_deref()
+            .is_none_or(|previous| !paths_equal(previous, &confirmed_text));
+
+        store::upsert_receive_source(connection, source_id, &normalized_input, &now())?;
+        let sources = store::list_receive_sources(connection)?;
+        let target = match source_id {
+            Some(id) => sources.iter().find(|source| source.id == id),
+            None => sources
+                .iter()
+                .find(|source| paths_equal(source.path.as_deref().unwrap_or_default(), &confirmed_text)),
+        };
+        if let Some(source) = target {
+            if path_changed {
+                // 重新定位后必须重新走一次「首次清单」，未确认前不自动导入既有文件。
+                connection.execute(
+                    "UPDATE receive_sources SET last_scanned_at = NULL, updated_at = ?2 WHERE id = ?1",
+                    params![&source.id, now()],
+                )?;
+            }
+        }
+        self.list_receive_sources()
+    }
+
+    pub fn remove_receive_source(&mut self, source_id: &str) -> LibraryResult<Vec<ReceiveSource>> {
+        let connection = self.library_connection()?;
+        store::remove_receive_source(connection, source_id)?;
+        self.list_receive_sources()
+    }
+
+    /// 首次启用或重新定位后列出目录内已有的受支持文件。
+    pub fn list_receive_directory_files(
+        &self,
+        source_id: &str,
+    ) -> LibraryResult<ReceiveDirectoryListing> {
+        let connection = self.library_connection()?;
+        let source = load_receive_source(connection, source_id)?;
+        let Some(path) = source.path.clone() else {
+            return Err(LibraryError::InvalidLocation(
+                "该接收来源尚未确认目录。".to_string(),
+            ));
+        };
+        let root = PathBuf::from(&path);
+        if !root.is_dir() {
+            return Err(LibraryError::InvalidLocation(format!(
+                "接收目录不存在或无法访问：{path}。请重新确认目录。"
+            )));
+        }
+        let mut items = Vec::new();
+        for file in collect_receive_files(&root, MAX_RECEIVE_SCAN_DEPTH)
+            .into_iter()
+            .take(MAX_RECEIVE_LISTING_ITEMS)
+        {
+            let file_path = file.to_string_lossy().into_owned();
+            let metadata = fs::metadata(&file).ok();
+            items.push(ReceiveDirectoryListingItem {
+                previously_skipped: store::is_source_skipped(connection, source_id, &file_path)?,
+                path: file_path,
+                file_name: file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                file_type: supported_file_type(&file).map(str::to_string),
+                file_size: metadata
+                    .as_ref()
+                    .and_then(|metadata| i64::try_from(metadata.len()).ok())
+                    .unwrap_or(0),
+            });
+        }
+        Ok(ReceiveDirectoryListing {
+            source_id: source.id,
+            path,
+            items,
+        })
+    }
+
+    /// 记录用户明确跳过的既有文件；它们不会被后续补扫或实时导入自动导入。
+    pub fn skip_receive_directory_files(
+        &mut self,
+        operation: ReceiveDirectoryOperation,
+    ) -> LibraryResult<Vec<ReceiveSource>> {
+        let connection = self.library_connection()?;
+        load_receive_source(connection, &operation.source_id)?;
+        store::record_skipped_sources(
+            connection,
+            &operation.source_id,
+            &operation.paths,
+            &now(),
+        )?;
+        mark_receive_source_scanned(connection, &operation.source_id)?;
+        self.list_receive_sources()
+    }
+
+    /// 列表内尚未被用户跳过、且仍需导入的文件。
+    ///
+    /// 已经导入过（含相同内容跳过）的源文件不会再被重复导入，避免周期补扫刷日志；
+    /// 失败项在冷却时间后重试，来源内容变化的待决项不再自动重复导入。
+    pub fn receive_pending_files(&self, source_id: &str) -> LibraryResult<Vec<String>> {
+        let connection = self.library_connection()?;
+        let source = load_receive_source(connection, source_id)?;
+        if !source.enabled {
+            return Ok(Vec::new());
+        }
+        // 首次启用或刚重新定位的来源要等用户在清单里做完选择，补扫不自动导入既有文件。
+        if source.last_scanned_at.is_none() {
+            return Ok(Vec::new());
+        }
+        let Some(path) = source.path.clone() else {
+            return Ok(Vec::new());
+        };
+        let root = PathBuf::from(&path);
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let history = receive_handled_files(connection, source_id)?;
+        let mut pending = Vec::new();
+        for file in collect_receive_files(&root, MAX_RECEIVE_SCAN_DEPTH) {
+            let file_path = file.to_string_lossy().into_owned();
+            if store::is_source_skipped(connection, source_id, &file_path)? {
+                continue;
+            }
+            if let Some((status, created_at)) = history.get(&file_path) {
+                let retry = match status {
+                    // 已导入过的文件只在源文件确实变化时再尝试（内容变化 → 待决项）。
+                    ImportItemStatus::Imported | ImportItemStatus::Duplicate => {
+                        source_file_changed(connection, &file_path, &file)?
+                    }
+                    // 失败项冷却一段时间后自动重试，避免每次补扫都刷日志。
+                    ImportItemStatus::Failed => {
+                        created_at.as_str() <= receive_retry_cutoff().as_str()
+                    }
+                    // 待决项等用户决定，已跳过/忽略的不再自动导入。
+                    _ => false,
+                };
+                if !retry {
+                    continue;
+                }
+            }
+            pending.push(file_path);
+        }
+        Ok(pending)
+    }
+
+    /// 读取最近的接收导入日志，供界面查看与事后改正分类结果。
+    pub fn list_receive_import_log(
+        &self,
+        limit: usize,
+    ) -> LibraryResult<Vec<ReceiveImportLogEntry>> {
+        let connection = self.library_connection()?;
+        store::list_import_log(connection, limit.clamp(1, 500))
+    }
+
+    /// 结束一批接收导入：汇总计数、更新来源状态并写回扫描时间。
+    pub fn finish_receive_import_batch(
+        &mut self,
+        batch_id: &str,
+    ) -> LibraryResult<ReceiveSourceScanResult> {
+        let source_id = {
+            let batch = self.active_import_batch(batch_id)?;
+            batch
+                .receive_source_id
+                .clone()
+                .ok_or_else(|| LibraryError::ImportFile("该批次不是接收目录导入。".to_string()))?
+        };
+        let batch = self.finish_import_batch(batch_id)?;
+        let connection = self.library_connection()?;
+        let result = receive_scan_result(&source_id, batch.items.len(), &batch.items);
+        mark_receive_source_scanned(connection, &source_id)?;
+        refresh_source_status_by_id(connection, &source_id)?;
+        Ok(result)
+    }
+
+    /// 写入一条接收导入日志（供界面事后查看与改正）。
+    fn record_receive_import_log(
+        &self,
+        source_id: &str,
+        item: &ImportItemResult,
+        matched_rule_ids: &[String],
+    ) -> LibraryResult<()> {
+        let connection = self.library_connection()?;
+        let plan = if item.status == ImportItemStatus::Imported {
+            item.document_id
+                .as_deref()
+                .and_then(|document_id| document_classification(connection, document_id).ok())
+        } else {
+            None
+        };
+        store::record_import_log(
+            connection,
+            source_id,
+            &item.source_path,
+            &item.file_name,
+            item.status,
+            item.document_id.as_deref(),
+            plan.as_ref()
+                .map(|plan| plan.collection_id.clone())
+                .or_else(|| item.collection_id.clone())
+                .as_deref(),
+            plan.as_ref()
+                .map(|plan| plan.tag_ids.clone())
+                .unwrap_or_default()
+                .as_slice(),
+            matched_rule_ids,
+            item.error_message.as_deref(),
+            &now(),
+        )
+    }
+
+    fn library_summary(&self) -> LibraryResult<LibrarySummary> {
+        self.current_library()
+            .cloned()
+            .ok_or(LibraryError::NoCurrentLibrary)
+    }
+}
+
+/// 规则命中判定：同一条规则内填写的条件必须全部满足，空条件表示不限制。
+fn rule_matches(
+    rule: &ClassificationRule,
+    source_path: &str,
+    file_name: &str,
+    file_type: Option<&str>,
+) -> bool {
+    let pattern = rule.file_name_pattern.trim();
+    if !pattern.is_empty()
+        && !file_name
+            .to_lowercase()
+            .contains(&pattern.to_lowercase())
+    {
+        return false;
+    }
+    if let Some(expected_type) = rule
+        .file_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if file_type != Some(expected_type) {
+            return false;
+        }
+    }
+    if let Some(directory) = rule
+        .source_directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !path_is_within(source_path, directory) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 判断 `path` 是否位于 `directory` 之下（忽略大小写与分隔符差异）。
+fn path_is_within(path: &str, directory: &str) -> bool {
+    let path_key = path.replace('\\', "/").to_lowercase();
+    let mut directory_key = directory.replace('\\', "/").to_lowercase();
+    while directory_key.ends_with('/') {
+        directory_key.pop();
+    }
+    if directory_key.is_empty() {
+        return true;
+    }
+    path_key == directory_key || path_key.starts_with(&format!("{directory_key}/"))
+}
+
+fn inbox_collection_id(connection: &Connection) -> LibraryResult<String> {
+    let id: Option<String> = connection
+        .query_row(
+            "SELECT id FROM collections WHERE is_inbox = 1 ORDER BY id ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id.unwrap_or_else(|| "inbox".to_string()))
+}
+
+/// 分类匹配的唯一实现：预览与实际导入都走这里。
+fn plan_classification(
+    connection: &Connection,
+    rules: &[ClassificationRule],
+    source_path: &str,
+    explicit_collection_id: Option<&str>,
+) -> LibraryResult<ClassificationPlan> {
+    let file_name = display_file_name(source_path);
+    let file_type = supported_file_type(Path::new(source_path));
+    let matched = rules
+        .iter()
+        .filter(|rule| rule.enabled && rule_matches(rule, source_path, &file_name, file_type))
+        .collect::<Vec<_>>();
+
+    let collection_id = match explicit_collection_id {
+        Some(explicit) => explicit.to_string(),
+        None => match matched.iter().find_map(|rule| rule.collection_id.clone()) {
+            Some(collection_id) => collection_id,
+            None => inbox_collection_id(connection)?,
+        },
+    };
+
+    let mut tag_ids = Vec::new();
+    for rule in &matched {
+        for tag_id in &rule.tag_ids {
+            if !tag_ids.iter().any(|existing| existing == tag_id) {
+                tag_ids.push(tag_id.clone());
+            }
+        }
+    }
+
+    Ok(ClassificationPlan {
+        collection_id,
+        tag_ids,
+        matched_rule_ids: matched.iter().map(|rule| rule.id.clone()).collect(),
+    })
+}
+
+/// 校验规则编辑里引用的集合与标签确实存在，避免只靠外键报错。
+fn validate_classification_operation(
+    connection: &Connection,
+    operation: &ClassificationRuleOperation,
+) -> LibraryResult<()> {
+    let inputs: Vec<&ClassificationRuleInput> = match operation {
+        ClassificationRuleOperation::Create { rule } => vec![rule],
+        ClassificationRuleOperation::Update { rule } => vec![&rule.input],
+        _ => Vec::new(),
+    };
+    for input in inputs {
+        if input.name.trim().is_empty() {
+            return Err(LibraryError::InvalidCollection(
+                "规则名称不能为空。".to_string(),
+            ));
+        }
+        if input
+            .file_name_pattern
+            .trim()
+            .is_empty()
+            && input.file_type.is_none()
+            && input.source_directory.is_none()
+            && input.collection_id.is_none()
+            && input.tag_ids.is_empty()
+        {
+            return Err(LibraryError::InvalidCollection(
+                "请至少填写一个匹配条件，或指定目标集合与标签。".to_string(),
+            ));
+        }
+        if let Some(collection_id) = input.collection_id.as_deref() {
+            ensure_collection_exists(connection, collection_id)?;
+        }
+        for tag_id in &input.tag_ids {
+            ensure_tag_exists(connection, tag_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn load_receive_source(connection: &Connection, source_id: &str) -> LibraryResult<ReceiveSource> {
+    store::list_receive_sources(connection)?
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| LibraryError::InvalidLocation("接收来源不存在。".to_string()))
+}
+
+/// 目录状态：不存在 → missing，无法读取 → unreadable，否则 ready。
+fn receive_status_for(path: &Path) -> (ReceiveSourceStatus, Option<String>) {
+    match fs::read_dir(path) {
+        Ok(_) => (ReceiveSourceStatus::Ready, None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            ReceiveSourceStatus::Missing,
+            Some("接收目录不存在或已被移动，请重新确认目录。".to_string()),
+        ),
+        Err(error) => (
+            ReceiveSourceStatus::Unreadable,
+            Some(format!("无法读取接收目录：{error}。")),
+        ),
+    }
+}
+
+fn refresh_receive_source_status(
+    connection: &Connection,
+    source: &mut ReceiveSource,
+) -> LibraryResult<()> {
+    match source.path.clone() {
+        Some(path) => {
+            let (status, message) = receive_status_for(Path::new(&path));
+            source.status = status;
+            source.status_message = message;
+        }
+        None => {
+            source.status = ReceiveSourceStatus::Unconfigured;
+            source.status_message = Some("尚未确认接收目录。".to_string());
+        }
+    }
+    connection.execute(
+        "UPDATE receive_sources SET status = ?2, status_message = ?3 WHERE id = ?1",
+        params![
+            &source.id,
+            receive_status_to_str(source.status),
+            source.status_message.as_deref()
+        ],
+    )?;
+    // 待处理项是「同一来源内容变化」等待用户决定的项，由导入日志里的 sourceChanged 表示。
+    source.pending_count = connection.query_row(
+        "SELECT COUNT(*) FROM receive_import_log WHERE source_id = ?1 AND status = 'sourceChanged'",
+        params![&source.id],
+        |row| row.get(0),
+    )?;
+    Ok(())
+}
+
+fn refresh_source_status_by_id(connection: &Connection, source_id: &str) -> LibraryResult<()> {
+    let mut source = load_receive_source(connection, source_id)?;
+    refresh_receive_source_status(connection, &mut source)
+}
+
+fn receive_status_to_str(status: ReceiveSourceStatus) -> &'static str {
+    match status {
+        ReceiveSourceStatus::Unconfigured => "unconfigured",
+        ReceiveSourceStatus::Ready => "ready",
+        ReceiveSourceStatus::Missing => "missing",
+        ReceiveSourceStatus::Unreadable => "unreadable",
+    }
+}
+
+fn mark_receive_source_scanned(connection: &Connection, source_id: &str) -> LibraryResult<()> {
+    connection.execute(
+        "UPDATE receive_sources SET last_scanned_at = ?2, updated_at = ?2 WHERE id = ?1",
+        params![source_id, now()],
+    )?;
+    Ok(())
+}
+
+/// 校验确认的接收目录：必须是可访问的文件夹，且与资料库互不包含。
+fn validate_receive_path(library_root: &Path, path: &str) -> LibraryResult<PathBuf> {
+    let candidate = PathBuf::from(path);
+    let metadata = fs::metadata(&candidate).map_err(|error| {
+        LibraryError::InvalidLocation(format!("无法访问接收目录：{error}"))
+    })?;
+    if !metadata.is_dir() {
+        return Err(LibraryError::InvalidLocation(
+            "接收目录必须是文件夹。".to_string(),
+        ));
+    }
+    let candidate = dunce_canonicalize(&candidate)?;
+    let library_root = normalize_path(library_root)?;
+    let candidate_key = comparable_path(&candidate);
+    let library_key = comparable_path(&library_root);
+    if candidate_key == library_key
+        || candidate_key.starts_with(&format!("{library_key}\\"))
+        || candidate_key.starts_with(&format!("{library_key}/"))
+    {
+        return Err(LibraryError::InvalidLocation(
+            "不能把资料库自身或其内部目录设为接收目录。".to_string(),
+        ));
+    }
+    if library_key.starts_with(&format!("{candidate_key}\\"))
+        || library_key.starts_with(&format!("{candidate_key}/"))
+    {
+        return Err(LibraryError::InvalidLocation(
+            "接收目录不能包含资料库本身，否则会把资料库副本当成新文件。".to_string(),
+        ));
+    }
+    Ok(candidate)
+}
+
+/// 本机候选接收目录；候选只用于帮助定位，未经用户确认不会开始扫描。
+fn receive_source_candidates(
+    kind: ReceiveSourceKind,
+    library_root: &Path,
+) -> Vec<ReceiveSourceCandidate> {
+    let Some(home) = user_home_directory() else {
+        return Vec::new();
+    };
+    let documents = home.join("Documents");
+    let mut candidates: Vec<(PathBuf, &str)> = Vec::new();
+    match kind {
+        ReceiveSourceKind::Wechat => {
+            candidates.push((documents.join("WeChat Files"), "微信默认文档目录"));
+            candidates.push((documents.join("xwechat_files"), "微信 4.x 默认文档目录"));
+        }
+        ReceiveSourceKind::Qq => {
+            let tencent = documents.join("Tencent Files");
+            candidates.push((tencent.clone(), "QQ 默认文档目录"));
+            let mut accounts = fs::read_dir(&tencent)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| path.is_dir())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            accounts.sort();
+            for account in accounts {
+                candidates.push((account.join("FileRecv"), "QQ 用户接收文件目录"));
+            }
+        }
+        ReceiveSourceKind::Other => {}
+    }
+
+    let library_key = comparable_path(library_root);
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for (path, evidence) in candidates {
+        if !path.is_dir() {
+            continue;
+        }
+        let key = comparable_path(&path);
+        if key == library_key || !seen.insert(key) {
+            continue;
+        }
+        result.push(ReceiveSourceCandidate {
+            path: path.to_string_lossy().into_owned(),
+            evidence: evidence.to_string(),
+        });
+    }
+    result
+}
+
+fn user_home_directory() -> Option<PathBuf> {
+    for key in ["USERPROFILE", "HOME"] {
+        if let Ok(value) = std::env::var(key) {
+            let path = PathBuf::from(value.trim());
+            if !path.as_os_str().is_empty() && path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// 接收目录里的可导入文件：普通文件、受支持类型，且不是临时文件或聊天数据库。
+fn is_receive_candidate_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return false;
+    };
+    let lowercase = name.to_ascii_lowercase();
+    if lowercase.starts_with('.') || lowercase.starts_with('~') {
+        return false;
+    }
+    if let Some(extension) = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+    {
+        if RECEIVE_TEMP_EXTENSIONS.contains(&extension.as_str()) {
+            return false;
+        }
+    }
+    let stem = lowercase
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(lowercase.as_str());
+    !["-temp", "_temp", ".temp", " temp", "-partial", ".part"]
+        .iter()
+        .any(|suffix| stem.ends_with(suffix))
+}
+
+fn is_ignored_receive_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return false;
+    };
+    let lowercase = name.to_ascii_lowercase();
+    if lowercase.starts_with('.') {
+        return true;
+    }
+    matches!(
+        lowercase.as_str(),
+        "$recycle.bin" | "system volume information" | "cache" | "temp" | "tmp"
+    )
+}
+
+/// 列出接收目录内所有可导入文件（含子目录，深度受限），按路径排序。
+fn collect_receive_files(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_receive_files_into(root, depth, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_receive_files_into(directory: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth == 0 || files.len() >= MAX_RECEIVE_LISTING_ITEMS * 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            continue;
+        }
+        if metadata.is_dir() {
+            if !is_ignored_receive_directory(&path) {
+                collect_receive_files_into(&path, depth - 1, files);
+            }
+            continue;
+        }
+        if !metadata.is_file() || !is_receive_candidate_file(&path) {
+            continue;
+        }
+        if supported_file_type(&path).is_none() {
+            continue;
+        }
+        files.push(path);
+    }
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// 汇总一批接收导入的结果。
+fn receive_scan_result(
+    source_id: &str,
+    scanned_count: usize,
+    items: &[ImportItemResult],
+) -> ReceiveSourceScanResult {
+    let mut imported_count = 0;
+    let mut skipped_count = 0;
+    let mut pending_count = 0;
+    let mut failed_count = 0;
+    for item in items {
+        match item.status {
+            ImportItemStatus::Imported => imported_count += 1,
+            ImportItemStatus::SourceChanged => pending_count += 1,
+            ImportItemStatus::Failed => failed_count += 1,
+            ImportItemStatus::Duplicate | ImportItemStatus::Ignored | ImportItemStatus::Skipped => {
+                skipped_count += 1
+            }
+        }
+    }
+    ReceiveSourceScanResult {
+        source_id: source_id.to_string(),
+        scanned_count: scanned_count as i64,
+        imported_count,
+        skipped_count,
+        pending_count,
+        failed_count,
+    }
+}
+
+/// 读取一个来源已处理过的源文件及其最近一次导入状态。
+fn receive_handled_files(
+    connection: &Connection,
+    source_id: &str,
+) -> LibraryResult<HashMap<String, (ImportItemStatus, String)>> {
+    let mut statement = connection.prepare(
+        // 同一毫秒内的多条日志用 rowid（插入顺序）决定先后，避免随机 UUID 改变“最近一次”的判定。
+        "SELECT source_path, status, created_at
+           FROM receive_import_log
+          WHERE source_id = ?1
+          ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let rows = statement.query_map(params![source_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut handled = HashMap::new();
+    for row in rows {
+        let (path, status, created_at) = row?;
+        handled.insert(path, (import_status_from_name(&status), created_at));
+    }
+    Ok(handled)
+}
+
+fn import_status_from_name(value: &str) -> ImportItemStatus {
+    match value {
+        "imported" => ImportItemStatus::Imported,
+        "duplicate" => ImportItemStatus::Duplicate,
+        "sourceChanged" => ImportItemStatus::SourceChanged,
+        "failed" => ImportItemStatus::Failed,
+        "ignored" => ImportItemStatus::Ignored,
+        _ => ImportItemStatus::Skipped,
+    }
+}
+
+/// 失败项自动重试的冷却时间戳（与 `now()` 同一格式，便于字符串比较）。
+fn receive_retry_cutoff() -> String {
+    (Utc::now() - chrono::TimeDelta::seconds(RECEIVE_RETRY_COOLDOWN_SECONDS))
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// 源文件的内容是否已经与资料库记录不同（内容变化 → 保留待决项）。
+///
+/// 先用大小/修改时间快速排除，只有指纹变化时才计算哈希，避免每次补扫都重算全目录。
+fn source_file_changed(
+    connection: &Connection,
+    source_path: &str,
+    path: &Path,
+) -> LibraryResult<bool> {
+    let recorded: Option<(i64, Option<i64>, Option<String>)> = connection
+        .query_row(
+            "SELECT d.file_size, d.file_modified_at, d.content_hash
+               FROM sources s
+               JOIN documents d ON d.id = s.document_id
+              WHERE s.source_identifier = ?1 AND d.deleted_at IS NULL
+              ORDER BY s.last_imported_at DESC, s.rowid DESC
+              LIMIT 1",
+            params![source_path.to_ascii_lowercase()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((file_size, file_modified_at, content_hash)) = recorded else {
+        return Ok(true);
+    };
+    let metadata = fs::metadata(path)?;
+    let current_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+    if current_size == file_size && modified_at(&metadata) == file_modified_at {
+        return Ok(false);
+    }
+    let Some(expected_hash) = content_hash.filter(|hash| !hash.is_empty()) else {
+        return Ok(true);
+    };
+    match sha256_file(path) {
+        Ok(hash) => Ok(hash != expected_hash),
+        Err(_) => Ok(true),
+    }
+}
+
+/// 读取一个文档当前生效的集合与标签，供接收导入日志记录实际结果。
+fn document_classification(
+    connection: &Connection,
+    document_id: &str,
+) -> LibraryResult<ClassificationPlan> {
+    let collection_id: Option<String> = connection
+        .query_row(
+            "SELECT collection_id FROM documents WHERE id = ?1",
+            params![document_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let mut statement = connection.prepare(
+        "SELECT tag_id FROM document_tags WHERE document_id = ?1 ORDER BY tag_id ASC",
+    )?;
+    let rows = statement.query_map(params![document_id], |row| row.get::<_, String>(0))?;
+    let mut tag_ids = Vec::new();
+    for row in rows {
+        tag_ids.push(row?);
+    }
+    Ok(ClassificationPlan {
+        collection_id: collection_id.unwrap_or_else(|| "inbox".to_string()),
+        tag_ids,
+        matched_rule_ids: Vec::new(),
+    })
 }
 
 fn refresh_document_copy(

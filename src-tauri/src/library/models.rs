@@ -512,9 +512,12 @@ pub struct ClassificationRuleUpdate {
     pub input: ClassificationRuleInput,
 }
 
-/// 规则编辑操作；JSON 形状与前端判别联合一致（internally tagged）。
+/// 规则编辑操作；JSON 形状与前端判别联合一致（internally tagged，字段名 camelCase）。
+///
+/// `rename_all_fields` 是必需的：`rename_all` 只作用于变体名，字段仍需 camelCase
+/// 才能与前端发来的 `ruleId` / `orderedRuleIds` 对上。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ClassificationRuleOperation {
     Create {
         rule: ClassificationRuleInput,

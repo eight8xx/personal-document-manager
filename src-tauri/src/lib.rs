@@ -31,6 +31,20 @@ pub fn run() {
                 },
             )?;
             state.set_external_change_monitor(monitor)?;
+
+            // 接收目录补扫：打开资料库后周期性发现新文件；关闭应用即退出，无常驻进程。
+            let receive_handle = app.handle().clone();
+            let receive_monitor = commands::ReceiveDirectoryMonitor::start(
+                state.service_handle(),
+                Duration::from_secs(2),
+                move |library, results| {
+                    let _ = receive_handle.emit(
+                        "receive-import-completed",
+                        commands::ReceiveImportCompletedEvent { library, results },
+                    );
+                },
+            )?;
+            state.set_receive_directory_monitor(receive_monitor)?;
             app.manage(state);
             Ok(())
         })
@@ -79,6 +93,18 @@ pub fn run() {
             commands::list_recent_libraries,
             commands::forget_recent_library,
             commands::open_library_directory,
+            commands::list_classification_rules,
+            commands::apply_classification_rule_operation,
+            commands::preview_classification,
+            commands::list_receive_sources,
+            commands::list_receive_source_candidates,
+            commands::upsert_receive_source,
+            commands::remove_receive_source,
+            commands::list_receive_directory_files,
+            commands::apply_receive_directory_selection,
+            commands::skip_receive_directory_files,
+            commands::scan_receive_sources,
+            commands::list_receive_import_log,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run personal document manager");
