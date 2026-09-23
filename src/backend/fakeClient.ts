@@ -37,6 +37,8 @@ import type {
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
+  TablePreviewRequest,
+  TableSheet,
   TagSummary,
   TrashDocumentSummary
 } from "./types";
@@ -991,6 +993,81 @@ export class FakeBackendClient implements BackendClient {
     };
     this.documentThumbnails[documentId] = structuredClone(thumbnail);
     return structuredClone(thumbnail);
+  }
+
+  /** 表格文档的默认工作表清单：CSV 一张合成表，XLSX 两张表。 */
+  async listDocumentSheets(
+    _library: LibrarySummary,
+    documentId: string
+  ): Promise<TableSheet[]> {
+    this.assertCurrentLibrary(_library);
+    this.calls.push(`listDocumentSheets:${documentId}`);
+    const document = this.requireDocument(documentId);
+    const capability = documentFormatForType(document.fileType);
+    if (capability?.preview !== "tablePaged") {
+      throw new BackendError({
+        code: "preview",
+        message: `${document.fileType} 不是表格文档。`
+      });
+    }
+    if (capability.id === "csv") {
+      return [{ index: 0, name: "CSV", rowCount: null, columnCount: null }];
+    }
+    return [
+      { index: 0, name: "汇总", rowCount: 12, columnCount: 4 },
+      { index: 1, name: "明细", rowCount: 200, columnCount: 6 }
+    ];
+  }
+
+  /** 表格文档的默认分页预览：按请求范围生成确定性单元格。 */
+  async getTablePreview(
+    _library: LibrarySummary,
+    documentId: string,
+    request: TablePreviewRequest = {}
+  ): Promise<Extract<DocumentPreview, { kind: "table" }>> {
+    this.assertCurrentLibrary(_library);
+    this.calls.push(`getTablePreview:${documentId}`);
+    const document = this.requireDocument(documentId);
+    const capability = documentFormatForType(document.fileType);
+    if (capability?.preview !== "tablePaged") {
+      throw new BackendError({
+        code: "preview",
+        message: `${document.fileType} 不是表格文档。`
+      });
+    }
+
+    const sheets = await this.listDocumentSheets(_library, documentId);
+    const sheetIndex = request.sheetIndex ?? 0;
+    const sheet = sheets.find((candidate) => candidate.index === sheetIndex);
+    if (!sheet) {
+      throw new BackendError({
+        code: "preview",
+        message: `工作表 ${sheetIndex} 不存在。`
+      });
+    }
+
+    const startRow = Math.max(0, request.startRow ?? 0);
+    const rowCount = Math.max(1, request.rowCount ?? 50);
+    const columnCount = Math.max(1, request.columnCount ?? 8);
+    const totalRows = sheet.rowCount ?? 120;
+    const visibleRows = Math.max(0, Math.min(rowCount, totalRows - startRow));
+    const cells = Array.from({ length: visibleRows }, (_, offset) =>
+      Array.from({ length: columnCount }, (_, column) =>
+        `R${startRow + offset + 1}C${column + 1}`
+      )
+    );
+
+    return {
+      kind: "table",
+      sheets,
+      sheetIndex,
+      startRow,
+      cells,
+      columnCount,
+      hasMoreRows: startRow + visibleRows < totalRows,
+      degradedFeatures: [],
+      notice: null
+    };
   }
 
   async openDocument(

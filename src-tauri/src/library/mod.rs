@@ -1,5 +1,6 @@
 mod error;
 mod formats;
+mod limits;
 mod models;
 mod ooxml;
 mod pdf_security;
@@ -11,6 +12,12 @@ pub use formats::{
     canonical_file_type, document_format_capabilities, DocumentFormatCapability, DocumentFormatId,
     FormatSecurity, PreviewStrategy, SecurityPolicy, TextExtractionStrategy, ThumbnailStrategy,
     ValidationStrategy,
+};
+pub use limits::{
+    ArchiveLimits, ExpansionBudget, INDEX_ARCHIVE_EXPANDED_BYTES, MAX_ARCHIVE_INPUT_BYTES,
+    MAX_ENTRY_COMPRESSION_RATIO, MAX_ENTRY_DECLARED_BYTES, MAX_EXTRACTED_TEXT_CHARS,
+    MAX_TABLE_PREVIEW_COLUMNS, MAX_TABLE_PREVIEW_ROWS, PREVIEW_ARCHIVE_EXPANDED_BYTES,
+    TABLE_PREVIEW_ARCHIVE_EXPANDED_BYTES,
 };
 pub use models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,

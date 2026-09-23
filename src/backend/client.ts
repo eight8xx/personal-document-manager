@@ -29,6 +29,7 @@ import type {
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
+  TableSheet,
   TagSummary,
   TrashDocumentSummary
 } from "./types";
@@ -134,6 +135,17 @@ export const tauriBackendClient: BackendClient = {
       documentId,
       contentHash,
       thumbnailDataUrl
+    }),
+  listDocumentSheets: (library, documentId) =>
+    invoke<TableSheet[]>("list_document_sheets", { library, documentId }),
+  getTablePreview: (library, documentId, request = {}) =>
+    invoke<Extract<DocumentPreview, { kind: "table" }>>("get_table_preview", {
+      library,
+      documentId,
+      sheetIndex: request.sheetIndex ?? 0,
+      startRow: request.startRow ?? 0,
+      rowCount: request.rowCount ?? 0,
+      columnCount: request.columnCount ?? 0
     }),
   openDocument: (library, documentId) =>
     invoke<void>("open_document", { library, documentId }),

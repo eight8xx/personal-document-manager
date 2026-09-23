@@ -118,9 +118,41 @@ export type DocumentPreview =
       message: string;
     }
   | {
+      kind: "table";
+      /** 表格预览：CSV 与 XLSX 共用同一载荷形状。 */
+      /** 可切换的工作表；CSV 只有一张合成表。 */
+      sheets: TableSheet[];
+      sheetIndex: number;
+      /** 本次返回的起始行，从 0 开始。 */
+      startRow: number;
+      /** 本次返回的单元格，每行长度不超过 columnCount，不补齐缺失单元格。 */
+      cells: string[][];
+      columnCount: number;
+      /** 是否还有更多行可读取。 */
+      hasMoreRows: boolean;
+      degradedFeatures: string[];
+      notice: string | null;
+    }
+  | {
       kind: "unsupported";
       message: string;
     };
+
+/** 表格文档（CSV/XLSX）的工作表元数据。 */
+export interface TableSheet {
+  index: number;
+  name: string;
+  /** 已知时的工作表行数；无缓存或未扫描时为 null。 */
+  rowCount: number | null;
+  columnCount: number | null;
+}
+
+export interface TablePreviewRequest {
+  sheetIndex?: number;
+  startRow?: number;
+  rowCount?: number;
+  columnCount?: number;
+}
 
 export type DocumentThumbnail =
   | {
@@ -139,7 +171,9 @@ export type DocumentFormatId =
   | "markdown"
   | "jpg"
   | "png"
-  | "pptx";
+  | "pptx"
+  | "csv"
+  | "xlsx";
 
 export type FormatSecurityPolicy = "blocked" | "userInitiated";
 
@@ -164,14 +198,17 @@ export interface DocumentFormatCapability {
     | "plainText"
     | "jpegSignature"
     | "pngSignature"
-    | "pptxPackage";
+    | "pptxPackage"
+    | "csvText"
+    | "xlsxPackage";
   preview:
     | "pdfPages"
     | "docxLayout"
     | "plainText"
     | "safeMarkdown"
     | "localImage"
-    | "pptxPages";
+    | "pptxPages"
+    | "tablePaged";
   thumbnail:
     | "pdfFirstPage"
     | "localImage"
@@ -182,7 +219,8 @@ export interface DocumentFormatCapability {
     | "docxText"
     | "plainText"
     | "none"
-    | "pptxText";
+    | "pptxText"
+    | "tableText";
   searchable: boolean;
   mediaType: string | null;
   renderer: string;
@@ -409,6 +447,15 @@ export interface BackendClient {
     contentHash: string,
     thumbnailDataUrl: string
   ): Promise<DocumentThumbnail>;
+  listDocumentSheets(
+    library: LibrarySummary,
+    documentId: string
+  ): Promise<TableSheet[]>;
+  getTablePreview(
+    library: LibrarySummary,
+    documentId: string,
+    request?: TablePreviewRequest
+  ): Promise<Extract<DocumentPreview, { kind: "table" }>>;
   openDocument(library: LibrarySummary, documentId: string): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
   listDocumentFormatCapabilities(): Promise<DocumentFormatCapability[]>;

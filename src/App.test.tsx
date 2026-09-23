@@ -445,7 +445,9 @@ describe("App", () => {
 
     expect(await screen.findByText("导入失败")).toBeInTheDocument();
     expect(
-      screen.getByText(/仅支持 PDF、DOCX、TXT、Markdown、JPG、PNG 和 PPTX/)
+      screen.getByText(
+        /仅支持 PDF、DOCX、TXT、Markdown、JPG、PNG、PPTX、CSV 和 XLSX/
+      )
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("main", { name: "文档列表" })

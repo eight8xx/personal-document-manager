@@ -3242,6 +3242,11 @@ impl LibraryService {
                     degraded_features,
                 })
             }
+            // 表格分页预览由 08/09 实现；在此之前明确返回失败预览，不伪造内容。
+            PreviewStrategy::TablePaged => Ok(DocumentPreview::Failure {
+                code: "preview".to_string(),
+                message: "表格预览尚未实现。".to_string(),
+            }),
         }
     }
 
@@ -4909,6 +4914,9 @@ fn validate_file_content(
         ValidationStrategy::DocxPackage => expect_prefix(path, b"PK", "文件内容不是有效的 DOCX。"),
         ValidationStrategy::PlainText => Ok(()),
         ValidationStrategy::PptxPackage => validate_pptx_package(path),
+        // 表格格式的包校验由 08/09 实现；在此之前明确拒绝，避免把未校验内容当成有效文档。
+        ValidationStrategy::CsvText => Err("CSV 解析尚未实现。".to_string()),
+        ValidationStrategy::XlsxPackage => Err("XLSX 解析尚未实现。".to_string()),
     }
 }
 
@@ -5850,6 +5858,10 @@ fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
         TextExtractionStrategy::PlainText => read_utf8_text(path),
         TextExtractionStrategy::None => Ok(String::new()),
         TextExtractionStrategy::PptxText => extract_pptx_text(path),
+        // 表格正文提取由 08/09 实现；在此之前不索引内容，但文档本身保持可用。
+        TextExtractionStrategy::TableText => Err(LibraryError::Preview(
+            "表格正文提取尚未实现。".to_string(),
+        )),
     }
 }
 

@@ -14,7 +14,17 @@ describe("文档格式能力表", () => {
   it("uses one complete capability definition for import, preview and safety", () => {
     expect(
       documentFormatCapabilities.map((capability) => capability.displayType)
-    ).toEqual(["PDF", "DOCX", "TXT", "Markdown", "JPG", "PNG", "PPTX"]);
+    ).toEqual([
+      "PDF",
+      "DOCX",
+      "TXT",
+      "Markdown",
+      "JPG",
+      "PNG",
+      "PPTX",
+      "CSV",
+      "XLSX"
+    ]);
     expect(importableDocumentTypes).toEqual([
       "PDF",
       "DOCX",
@@ -22,7 +32,9 @@ describe("文档格式能力表", () => {
       "Markdown",
       "JPG",
       "PNG",
-      "PPTX"
+      "PPTX",
+      "CSV",
+      "XLSX"
     ]);
     expect(importableDocumentExtensions).toEqual([
       "pdf",
@@ -33,7 +45,9 @@ describe("文档格式能力表", () => {
       "jpg",
       "jpeg",
       "png",
-      "pptx"
+      "pptx",
+      "csv",
+      "xlsx"
     ]);
 
     for (const capability of documentFormatCapabilities) {

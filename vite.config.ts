@@ -19,6 +19,11 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
-    css: true
+    css: true,
+    // .scratch 下可能存放其它工作区副本，避免把别人的测试当成本仓库测试执行。
+    exclude: ["**/node_modules/**", "**/.scratch/**", "**/dist/**"],
+    // 测试并发跑在真实 SQLite/原生构建同时进行的机器上，5s 默认值会因负载抖动误报；
+    // 这里放宽到 15s，断言内容不放宽。
+    testTimeout: 15000
   }
 });

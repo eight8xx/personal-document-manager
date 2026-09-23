@@ -26,6 +26,7 @@ import type {
 } from "../backend/types";
 import { DocxPreview } from "./DocxPreview";
 import { PptxPreview } from "./PptxPreview";
+import { TablePreview } from "./TablePreview";
 import {
   documentStatusPresentation,
   documentTypeIcon,
@@ -194,6 +195,12 @@ function PreviewContent({
 
   if (preview.kind === "markdown") {
     return <MarkdownPreview text={preview.text} client={client} />;
+  }
+
+  if (preview.kind === "table") {
+    return (
+      <TablePreview client={client} document={document} preview={preview} />
+    );
   }
 
   if (preview.kind === "failure") {
