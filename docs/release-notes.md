@@ -47,8 +47,10 @@ Office 与表格文档在应用内只读呈现：不执行宏、脚本、嵌入�
 
 ## 安装
 
-- `个人文档管理-Setup-0.1.0.exe`：NSIS 安装包，无需管理员权限，内置 WebView2 离线组件（因此约 209 MB），目标电脑无需联网下载运行环境。
-- `个人文档管理-Portable.exe`：便携版，双击即用；不含 WebView2 组件，目标电脑缺少 WebView2 Runtime 时请先运行安装版。
+- `personal-document-manager-Setup-0.1.0.exe`：NSIS 安装包，无需管理员权限，内置 WebView2 离线组件（因此约 209 MB），目标电脑无需联网下载运行环境。
+- `personal-document-manager-Portable.exe`：便携版，双击即用；不含 WebView2 组件，目标电脑缺少 WebView2 Runtime 时请先运行安装版。
+
+（本地执行 `npm run package:windows` 构建出的文件名使用中文产品名，与本页附件是同一构建。）
 
 安装包尚未进行代码签名，Windows 可能提示"已保护你的电脑"，选择"更多信息 → 仍要运行"。
 

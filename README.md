@@ -6,13 +6,18 @@
 
 ## 安装
 
-安装包位于 `release/个人文档管理-Setup-0.1.0.exe`。双击后按向导完成安装，无需管理员权限，也无需另装运行环境。
+**从 GitHub Releases 下载**：<https://github.com/eight8xx/personal-document-manager/releases/latest>
+
+- `personal-document-manager-Setup-0.1.0.exe`：NSIS 安装包，双击后按向导完成安装，无需管理员权限，也无需另装运行环境。
+- `personal-document-manager-Portable.exe`：便携版，双击直接运行，无需安装。
+
+**自行构建**：在仓库根目录运行 `npm install` 后执行 `npm run package:windows`，产物会输出到 `release/`（文件名使用中文产品名，与 Release 页面上的附件是同一构建）。
 
 安装完成后可从桌面快捷方式或开始菜单中的“个人文档管理”启动。
 
 ## 便携版
 
-`release/个人文档管理-Portable.exe` 可直接双击运行，无需安装。便携版与安装版使用相同的本地数据和最近资料库记录。便携版不包含 WebView2 安装组件；目标电脑缺少 WebView2 Runtime 时，请先运行安装版。
+便携版与安装版使用相同的本地数据和最近资料库记录。便携版不包含 WebView2 安装组件；目标电脑缺少 WebView2 Runtime 时，请先运行安装版。
 
 ## 首次运行
 
