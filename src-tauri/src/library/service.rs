@@ -51,6 +51,8 @@ const RECENT_FILE: &str = "recent_libraries.json";
 const MAX_RECENT_LIBRARIES: usize = 10;
 const DELETE_TOMBSTONE_PREFIX: &str = ".pdm-delete-";
 const DELETE_TOMBSTONE_SUFFIX: &str = ".tombstone";
+const REPLACEMENT_BACKUP_SUFFIX: &str = ".previous";
+const IMPORT_TEMPORARY_SUFFIX: &str = ".importing";
 
 pub struct LibraryService {
     state_dir: PathBuf,
@@ -477,7 +479,7 @@ impl LibraryService {
 
         let connection = open_database(&path)?;
         initialize_schema(&connection)?;
-        cleanup_delete_tombstones(&path, &connection)?;
+        let recovery_failures = reconcile_interrupted_copy_operations(&path, &connection)?;
 
         let summary = summary_from_metadata(&path, &metadata);
         let mut candidate = OpenLibrary {
@@ -485,6 +487,15 @@ impl LibraryService {
             connection,
         };
         Self::scan_external_changes_for(&mut candidate, true)?;
+        // 无法自动恢复的结论必须在启动扫描之后写入：扫描会把内容不一致的副本改写成
+        // “待索引”，随后重新索引就会丢掉恢复失败的原因，让用户看不到可诊断状态。
+        for failure in &recovery_failures {
+            report_recovery_failure(
+                &candidate.connection,
+                &failure.document_id,
+                &failure.message,
+            )?;
+        }
         self.record_recent(&summary)?;
         self.current = Some(candidate);
         Ok(summary)
@@ -534,7 +545,7 @@ impl LibraryService {
         fs::create_dir_all(&destination_directory)?;
 
         let destination_path = destination_directory.join(&file_name);
-        let temporary_path = destination_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        let temporary_path = import_temporary_path(&destination_directory);
         if let Err(error) = fs::copy(&source_path, &temporary_path) {
             let _ = fs::remove_file(&temporary_path);
             return Err(LibraryError::Io(error));
@@ -1207,7 +1218,7 @@ impl LibraryService {
         }
 
         let destination_path = destination_directory.join(&pending.file_name);
-        let temporary_path = destination_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        let temporary_path = import_temporary_path(&destination_directory);
         if let Err(error) = fs::copy(&pending.path, &temporary_path) {
             let _ = fs::remove_file(&temporary_path);
             let _ = fs::remove_dir_all(&destination_directory);
@@ -1511,7 +1522,7 @@ impl LibraryService {
             ));
         }
         let destination_path = document_directory.join(&pending.file_name);
-        let temporary_path = document_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        let temporary_path = import_temporary_path(&document_directory);
         if let Err(error) = fs::copy(&source_path, &temporary_path) {
             let _ = fs::remove_file(&temporary_path);
             return Ok(self.failure_item(
@@ -1555,7 +1566,7 @@ impl LibraryService {
         let old_copy = PathBuf::from(&library_root).join(old_library_path);
         let mut previous_copies = Vec::new();
         if old_copy != destination_path && old_copy.exists() {
-            let backup_path = document_directory.join(format!(".{}.previous", Uuid::new_v4()));
+            let backup_path = replacement_backup_path(&document_directory);
             if let Err(error) = fs::rename(&old_copy, &backup_path) {
                 let _ = fs::remove_file(&temporary_path);
                 return Ok(self.failure_item(
@@ -1571,7 +1582,7 @@ impl LibraryService {
             previous_copies.push((backup_path, old_copy));
         }
         if destination_path.exists() {
-            let backup_path = document_directory.join(format!(".{}.previous", Uuid::new_v4()));
+            let backup_path = replacement_backup_path(&document_directory);
             if let Err(error) = fs::rename(&destination_path, &backup_path) {
                 let _ = fs::remove_file(&temporary_path);
                 restore_previous_copies(&previous_copies);
@@ -4018,13 +4029,43 @@ fn is_delete_tombstone_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
     name.starts_with(prefix) && name.ends_with(DELETE_TOMBSTONE_SUFFIX)
 }
 
-fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> LibraryResult<()> {
+fn replacement_backup_path(directory: &Path) -> PathBuf {
+    directory.join(format!(".{}{REPLACEMENT_BACKUP_SUFFIX}", Uuid::new_v4()))
+}
+
+fn import_temporary_path(directory: &Path) -> PathBuf {
+    directory.join(format!(".{}{IMPORT_TEMPORARY_SUFFIX}", Uuid::new_v4()))
+}
+
+fn is_replacement_backup_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.ends_with(REPLACEMENT_BACKUP_SUFFIX)
+}
+
+fn is_import_temporary_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.ends_with(IMPORT_TEMPORARY_SUFFIX)
+}
+
+fn is_replacement_artifact_name(name: &std::ffi::OsStr) -> bool {
+    is_replacement_backup_name(name) || is_import_temporary_name(name)
+}
+
+/// 打开资料库时对账中断遗留的文件操作。数据库记录是权威：墓碑和替换备份都要么让
+/// 记录的副本重新可读，要么在记录已经指向其他内容时被清理。返回无法自动恢复的文档，
+/// 由调用方在启动扫描之后写入失败状态，避免结论被扫描覆盖。
+fn reconcile_interrupted_copy_operations(
+    library_root: &Path,
+    connection: &Connection,
+) -> LibraryResult<Vec<RecoveryFailure>> {
     let documents_directory = library_root.join(DOCUMENTS_DIR);
     let document_directories = match fs::read_dir(&documents_directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(LibraryError::Io(error)),
     };
+    let known_copies = library_copy_paths(library_root, connection)?;
+    let mut failures = Vec::new();
 
     for document_directory in document_directories {
         let document_directory = document_directory?;
@@ -4036,17 +4077,24 @@ fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> Li
             .file_name()
             .to_string_lossy()
             .into_owned();
-        let library_path = connection
+        let recorded = connection
             .query_row(
-                "SELECT library_path FROM documents WHERE id = ?1",
+                "SELECT library_path, content_hash, deleted_at FROM documents WHERE id = ?1",
                 params![&document_id],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
         let directory_path = document_directory.path();
-        let mut tombstones = fs::read_dir(&directory_path)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
+        let entries = fs::read_dir(&directory_path)?.collect::<Result<Vec<_>, _>>()?;
+
+        let mut tombstones = entries
+            .iter()
             .filter(|entry| is_delete_tombstone_name(&entry.file_name(), DELETE_TOMBSTONE_PREFIX))
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
@@ -4054,7 +4102,7 @@ fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> Li
         let had_tombstones = !tombstones.is_empty();
 
         for tombstone_path in tombstones {
-            match library_path.as_deref() {
+            match recorded.as_ref().map(|(library_path, _, _)| library_path) {
                 Some(library_path) => {
                     let original_path = document_path(library_root, library_path)?;
                     restore_library_copy_tombstone(&tombstone_path, &original_path)?;
@@ -4076,7 +4124,150 @@ fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> Li
                 Err(error) => return Err(LibraryError::Io(error)),
             }
         }
+
+        let mut backups = Vec::new();
+        let mut temporaries = Vec::new();
+        for entry in entries {
+            let name = entry.file_name();
+            if !is_replacement_artifact_name(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if known_copies.contains(&path) {
+                continue;
+            }
+            if is_replacement_backup_name(&name) {
+                backups.push(path);
+            } else {
+                temporaries.push(path);
+            }
+        }
+        if backups.is_empty() && temporaries.is_empty() {
+            continue;
+        }
+        backups.sort();
+        temporaries.sort();
+        // 备份一定是文档的原内容，临时副本只有在内容核对通过时才会被采用。
+        let leftovers = backups.into_iter().chain(temporaries).collect::<Vec<_>>();
+
+        match recorded.as_ref() {
+            Some((library_path, content_hash, None)) => {
+                if let Some(failure) = recover_interrupted_replacement(
+                    library_root,
+                    &document_id,
+                    library_path,
+                    content_hash.as_deref(),
+                    &leftovers,
+                )? {
+                    failures.push(failure);
+                }
+            }
+            _ => remove_leftover_files(&leftovers)?,
+        }
     }
+    Ok(failures)
+}
+
+/// 无法自动恢复的替换：打开资料库时保留文件现场，并把原因写进文档记录。
+struct RecoveryFailure {
+    document_id: String,
+    message: String,
+}
+
+/// 让记录的副本重新可读，或在不一致时报告可诊断的失败。返回后目录里不再有中断残留。
+fn recover_interrupted_replacement(
+    library_root: &Path,
+    document_id: &str,
+    library_path: &str,
+    content_hash: Option<&str>,
+    leftovers: &[PathBuf],
+) -> LibraryResult<Option<RecoveryFailure>> {
+    let destination = document_path(library_root, library_path)?;
+    if copy_matches_recorded_content(&destination, content_hash) {
+        remove_leftover_files(leftovers)?;
+        return Ok(None);
+    }
+
+    for candidate in leftovers {
+        if !copy_matches_recorded_content(candidate, content_hash) {
+            continue;
+        }
+        let remaining = leftovers
+            .iter()
+            .filter(|path| *path != candidate)
+            .cloned()
+            .collect::<Vec<_>>();
+        remove_library_copy(&destination)?;
+        fs::rename(candidate, &destination)?;
+        remove_leftover_files(&remaining)?;
+        return Ok(None);
+    }
+
+    Ok(Some(RecoveryFailure {
+        document_id: document_id.to_string(),
+        message: format!(
+            "上次替换副本未完成，且无法自动恢复：资料库副本与记录不一致（{}）。请从源文件重新导入。",
+            destination.display()
+        ),
+    }))
+}
+
+fn copy_matches_recorded_content(path: &Path, content_hash: Option<&str>) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(expected) = content_hash else {
+        // 没有记录哈希时无法核对内容，副本存在即视为一致。
+        return true;
+    };
+    sha256_file(path).is_ok_and(|hash| hash == expected)
+}
+
+fn library_copy_paths(
+    library_root: &Path,
+    connection: &Connection,
+) -> LibraryResult<HashSet<PathBuf>> {
+    let mut statement = connection.prepare("SELECT library_path FROM documents")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut paths = HashSet::new();
+    for row in rows {
+        if let Ok(path) = document_path(library_root, &row?) {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn remove_leftover_files(paths: &[PathBuf]) -> LibraryResult<()> {
+    for path in paths {
+        remove_library_copy(path)?;
+    }
+    Ok(())
+}
+
+fn report_recovery_failure(
+    connection: &Connection,
+    document_id: &str,
+    message: &str,
+) -> LibraryResult<()> {
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "
+        UPDATE documents
+        SET processing_status = 'failed',
+            index_status = 'failed',
+            error_stage = 'recovery',
+            error_message = ?1,
+            updated_at = ?2
+        WHERE id = ?3 AND deleted_at IS NULL
+        ",
+        params![message, now(), document_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM document_search WHERE document_id = ?1",
+        params![document_id],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
