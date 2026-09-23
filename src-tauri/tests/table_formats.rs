@@ -582,6 +582,36 @@ fn xlsx_index_path_bounds_retained_cells() {
     );
 }
 
+/// 稀疏表的翻页提示：首屏为空时给出「下一个含数据的行」，界面可以直接跳过去。
+#[test]
+fn xlsx_preview_reports_the_next_data_row_for_sparse_sheets() {
+    // 数据从 Excel 第 1000 行（0 基索引 999）开始，前 999 行都是空的。
+    let sparse = worksheet_xml(
+        r#"<row r="1000"><c r="A1000" t="inlineStr"><is><t>稀疏数据</t></is></c></row>
+           <row r="1001"><c r="A1001" t="inlineStr"><is><t>第二行数据</t></is></c></row>"#,
+    );
+    let package = xlsx_fixture(&["稀疏"], &[sparse], None, &[]);
+
+    let first = read_xlsx_table(&package, 0, 0, 50, 8, preview_limits()).unwrap();
+    assert!(first.cells.is_empty(), "首屏应当是空的：{:?}", first.cells);
+    assert_eq!(first.next_data_row, Some(999), "应直接指向第一个含数据的行");
+    assert!(first.has_more_rows);
+
+    // 跳过去就能看到数据（界面「下一页」的行为）。
+    let jumped = read_xlsx_table(&package, 0, 999, 50, 8, preview_limits()).unwrap();
+    assert_eq!(jumped.row_numbers, vec![999, 1000]);
+    assert_eq!(jumped.cells[0][0], "稀疏数据");
+    assert_eq!(jumped.cells[1][0], "第二行数据");
+    assert_eq!(jumped.next_data_row, None, "没有更多数据时不再提示");
+
+    // 稠密表：提示就是下一页的起点，旧行为不变。
+    let dense = worksheet_xml(&inline_rows("稠密", 120, 2));
+    let package = xlsx_fixture(&["稠密"], &[dense], None, &[]);
+    let page = read_xlsx_table(&package, 0, 0, 50, 8, preview_limits()).unwrap();
+    assert_eq!(page.row_numbers.first(), Some(&0));
+    assert_eq!(page.next_data_row, Some(50));
+}
+
 #[test]
 fn xlsx_clamps_requested_rows_and_columns_to_the_preview_limits() {
     let sheet = worksheet_xml(&inline_rows("宽表", 600, 80));
