@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,12 +7,15 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use personal_document_manager_lib::library::{
     BatchDocumentItemStatus, BatchDocumentOperation, BatchDocumentOperationRequest,
     DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus,
     DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse, DocumentThumbnail,
     EmptyTrashItemStatus, ExternalChangeMonitor, ImportDecision, ImportItemStatus, ImportSource,
-    IndexStatus, LibraryService, LocationStatus, SearchMatchKind,
+    IndexStatus, LibraryService, LocationStatus, SearchMatchKind, MAX_ARCHIVE_INPUT_BYTES,
+    MAX_ENTRY_DECLARED_BYTES, MAX_EXTRACTED_TEXT_CHARS,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -3460,12 +3464,654 @@ fn empty_trash_reports_partial_failures_and_keeps_failed_documents_retryable() {
     assert_eq!(remaining[0].document.id, blocked.id);
 }
 
+/// 超过输入上限的压缩文档在导入校验阶段就被拒绝，不复制进资料库，也不影响同批其他导入项。
+#[test]
+fn oversized_archive_is_rejected_before_it_is_copied_into_the_library() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let oversized = root.path().join("oversized.docx");
+    let healthy = root.path().join("healthy.txt");
+    write_sparse_archive(&oversized, MAX_ARCHIVE_INPUT_BYTES + 1);
+    fs::write(&healthy, "仍然可用的正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+
+    let batch = service
+        .start_import(vec![
+            oversized.to_string_lossy().into_owned(),
+            healthy.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+    assert_eq!(batch.imported_count, 1);
+    assert_eq!(batch.failed_count, 1);
+    let failure = batch
+        .items
+        .iter()
+        .find(|item| item.status == ImportItemStatus::Failed)
+        .expect("超限文档应单项失败");
+    assert_eq!(failure.error_stage.as_deref(), Some("validate"));
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("文档过大"),
+        "失败原因应说明超过输入上限：{:?}",
+        failure.error_message
+    );
+    assert!(failure.retryable);
+
+    let documents = service.list_documents().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].file_name, "healthy.txt");
+    assert_eq!(
+        fs::read_dir(library_dir.join("documents")).unwrap().count(),
+        1,
+        "超限文件不应被复制进资料库"
+    );
+    assert!(oversized.is_file(), "源文件保持不变");
+
+    service.index_pending_documents().unwrap();
+    assert_eq!(
+        search(&service, "仍然可用", DocumentSearchFilters::default()).len(),
+        1
+    );
+}
+
+/// 资料库副本超限时，预览与索引都在读入整份文件之前失败，其他文档保持可用。
+#[test]
+fn oversized_library_copy_fails_index_and_preview_without_reading_it() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let docx_path = root.path().join("meeting.docx");
+    let healthy_path = root.path().join("healthy.txt");
+    let docx_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>会议记录</w:t></w:r></w:p></w:body>
+</w:document>"#;
+    fs::write(
+        &docx_path,
+        stored_zip(&[("word/document.xml", docx_xml.as_bytes())]),
+    )
+    .unwrap();
+    fs::write(&healthy_path, "健康正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let docx = service.import_document(&docx_path).unwrap();
+    let healthy = service.import_document(&healthy_path).unwrap();
+    service.index_pending_documents().unwrap();
+    drop(service);
+
+    // 资料库副本被外部换成超过输入上限的文件。
+    let docx_copy = library_dir
+        .join("documents")
+        .join(&docx.id)
+        .join(&docx.file_name);
+    write_sparse_archive(&docx_copy, MAX_ARCHIVE_INPUT_BYTES + 1);
+
+    let mut reopened = LibraryService::new(&state_dir).unwrap();
+    reopened.open_library(&library_dir).unwrap();
+
+    let preview_error = reopened.get_document_preview(&docx.id, None).unwrap();
+    let DocumentPreview::Failure { code, message } = preview_error else {
+        panic!("超限副本的预览应当是明确失败：{preview_error:?}");
+    };
+    assert_eq!(code, "preview");
+    assert!(
+        message.contains("文档过大"),
+        "预览失败原因应说明超过输入上限：{message}"
+    );
+
+    let failed = reopened.retry_document_index(&docx.id).unwrap();
+    assert_eq!(failed.processing_status, DocumentProcessingStatus::Failed);
+    assert_eq!(failed.index_status, IndexStatus::Failed);
+    assert!(
+        failed
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("文档过大"),
+        "索引失败原因应说明超过输入上限：{:?}",
+        failed.error_message
+    );
+
+    let usable = reopened
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == healthy.id)
+        .unwrap();
+    assert_eq!(usable.processing_status, DocumentProcessingStatus::Ready);
+    assert_eq!(usable.index_status, IndexStatus::Searchable);
+    assert_eq!(
+        reopened.get_document_preview(&healthy.id, None).unwrap(),
+        DocumentPreview::Text {
+            text: "健康正文".to_string()
+        }
+    );
+    assert_eq!(
+        search(&reopened, "健康正文", DocumentSearchFilters::default()).len(),
+        1
+    );
+}
+
+/// 声明解压量超过单条目上限的条目在解压之前就被拒绝。
+#[test]
+fn entries_declaring_more_than_the_limit_are_rejected_before_decompression() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let bomb_path = root.path().join("bomb.pptx");
+    let healthy_path = root.path().join("healthy.txt");
+    // 压缩数据只有几十字节，声明的解压量却超过单条目上限：不检查就会按声明分配内存。
+    fs::write(
+        &bomb_path,
+        zip_with_declarations(&[
+            stored_spec("[Content_Types].xml", b"<Types/>"),
+            ZipEntrySpec {
+                name: "ppt/media/bomb.bin",
+                method: 8,
+                data: deflate_bytes(b"tiny payload"),
+                declared_uncompressed: MAX_ENTRY_DECLARED_BYTES as u32 + 1,
+            },
+        ]),
+    )
+    .unwrap();
+    let compressed = fs::metadata(&bomb_path).unwrap().len();
+    assert!(
+        compressed < 4096,
+        "样本应当是极小的压缩炸弹文件，实际 {compressed} 字节"
+    );
+    fs::write(&healthy_path, "健康正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let batch = service
+        .start_import(vec![
+            bomb_path.to_string_lossy().into_owned(),
+            healthy_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+    assert_eq!(batch.imported_count, 1);
+    assert_eq!(batch.failed_count, 1);
+    let failure = batch
+        .items
+        .iter()
+        .find(|item| item.status == ImportItemStatus::Failed)
+        .expect("压缩炸弹应单项失败");
+    assert_eq!(failure.error_stage.as_deref(), Some("validate"));
+    assert!(
+        failure
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("单条目上限"),
+        "失败原因应说明单条目上限：{:?}",
+        failure.error_message
+    );
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_dir(library_dir.join("documents")).unwrap().count(),
+        1
+    );
+    assert_eq!(fs::read(&bomb_path).unwrap().len(), compressed as usize);
+}
+
+/// 压缩比异常（真实解压量远大于压缩量）的条目在解压之前就被拒绝。
+#[test]
+fn high_compression_ratio_entries_are_rejected_before_decompression() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let bomb_path = root.path().join("ratio.docx");
+    let healthy_path = root.path().join("healthy.txt");
+    // 声明的解压量低于单条目上限，但压缩比远超上限：只有压缩比检查能拦下它。
+    fs::write(
+        &bomb_path,
+        zip_with_declarations(&[ZipEntrySpec {
+            name: "word/document.xml",
+            method: 8,
+            data: deflate_bytes(b"tiny"),
+            declared_uncompressed: 16 * 1024 * 1024,
+        }]),
+    )
+    .unwrap();
+    fs::write(&healthy_path, "健康正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let bomb = service.import_document(&bomb_path).unwrap();
+    let healthy = service.import_document(&healthy_path).unwrap();
+    service.index_pending_documents().unwrap();
+
+    let failed = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == bomb.id)
+        .unwrap();
+    assert_eq!(failed.processing_status, DocumentProcessingStatus::Failed);
+    assert!(
+        failed
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("压缩比"),
+        "失败原因应说明压缩比超限：{:?}",
+        failed.error_message
+    );
+
+    let usable = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == healthy.id)
+        .unwrap();
+    assert_eq!(usable.index_status, IndexStatus::Searchable);
+    assert_eq!(
+        search(&service, "健康正文", DocumentSearchFilters::default()).len(),
+        1
+    );
+}
+
+/// 条目谎报解压大小时按实际展开量截断，进程不受影响，其他文档继续可用。
+#[test]
+fn entries_lying_about_their_expanded_size_are_rejected_while_other_documents_stay_usable() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let liar_path = root.path().join("liar.docx");
+    let healthy_path = root.path().join("healthy.txt");
+    // 声明 4096 字节，实际解压超过单条目上限；读取必须在超过上限时立刻停下。
+    let payload = vec![0_u8; MAX_ENTRY_DECLARED_BYTES as usize + 1024];
+    fs::write(
+        &liar_path,
+        zip_with_declarations(&[ZipEntrySpec {
+            name: "word/document.xml",
+            method: 8,
+            data: deflate_bytes(&payload),
+            declared_uncompressed: 4096,
+        }]),
+    )
+    .unwrap();
+    drop(payload);
+    fs::write(&healthy_path, "健康正文").unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let liar = service.import_document(&liar_path).unwrap();
+    let healthy = service.import_document(&healthy_path).unwrap();
+    service.index_pending_documents().unwrap();
+
+    let failed = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == liar.id)
+        .unwrap();
+    assert_eq!(failed.processing_status, DocumentProcessingStatus::Failed);
+    assert_eq!(failed.index_status, IndexStatus::Failed);
+    assert!(
+        failed
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("实际解压量"),
+        "失败原因应说明实际解压量超过上限：{:?}",
+        failed.error_message
+    );
+    // 失败文档仍然可见，其他文档不受影响。
+    assert_eq!(service.list_documents().unwrap().len(), 2);
+    let usable = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == healthy.id)
+        .unwrap();
+    assert_eq!(usable.processing_status, DocumentProcessingStatus::Ready);
+    assert_eq!(usable.index_status, IndexStatus::Searchable);
+    assert_eq!(
+        search(&service, "健康正文", DocumentSearchFilters::default()).len(),
+        1
+    );
+    assert!(liar_path.is_file());
+}
+
+/// 明显偏大但仍在各上限之内的正常文档照常导入、索引、搜索与预览。
+#[test]
+fn valid_documents_below_the_limits_still_import_index_search_and_preview() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let docx_path = root.path().join("long.docx");
+    let paragraphs = (0..2000)
+        .map(|index| {
+            format!("<w:p><w:r><w:t>第{index}段 可搜索的长文档正文</w:t></w:r></w:p>")
+        })
+        .collect::<String>();
+    let docx_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>{paragraphs}</w:body>
+</w:document>"#
+    );
+    let archive = stored_zip(&[("word/document.xml", docx_xml.as_bytes())]);
+    assert!(
+        archive.len() as u64 > 100 * 1024,
+        "正常边界样本应当明显大于小样例，实际 {} 字节",
+        archive.len()
+    );
+    fs::write(&docx_path, &archive).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let docx = service.import_document(&docx_path).unwrap();
+    service.index_pending_documents().unwrap();
+
+    let document = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|document| document.id == docx.id)
+        .unwrap();
+    assert_eq!(document.processing_status, DocumentProcessingStatus::Ready);
+    assert_eq!(document.index_status, IndexStatus::Searchable);
+    assert_eq!(
+        search(&service, "第1999段", DocumentSearchFilters::default()).len(),
+        1
+    );
+
+    let DocumentPreview::Docx {
+        text,
+        degraded_features,
+        ..
+    } = service.get_document_preview(&docx.id, None).unwrap()
+    else {
+        panic!("DOCX 预览应当可用");
+    };
+    assert!(text.contains("第1999段"));
+    assert!(
+        degraded_features.is_empty(),
+        "正常文档不应报告降级：{degraded_features:?}"
+    );
+    assert_eq!(fs::read(&docx_path).unwrap(), archive, "源文件保持不变");
+}
+
+/// 预览返回的正文有明确上限：超限时截断并给出可理解的降级说明，
+/// 超过读取上限的尾部内容不会被读入，更不会传给界面。
+#[test]
+fn preview_text_is_bounded_and_reports_truncation() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let text_path = root.path().join("huge.txt");
+    let mut long_text = "起始正文\n".to_string();
+    long_text.push_str(&"长".repeat(MAX_EXTRACTED_TEXT_CHARS * 4));
+    long_text.push_str("尾部标记不应出现");
+    fs::write(&text_path, &long_text).unwrap();
+    assert!(
+        fs::metadata(&text_path).unwrap().len() > MAX_EXTRACTED_TEXT_CHARS as u64 * 4,
+        "样本应当超过读取字节上限"
+    );
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let document = service.import_document(&text_path).unwrap();
+
+    let DocumentPreview::Text { text } = service.get_document_preview(&document.id, None).unwrap()
+    else {
+        panic!("文本预览应当可用");
+    };
+    assert!(text.contains("已截断"), "超限预览应给出降级说明");
+    let bounded = text.split("\n\n……").next().unwrap();
+    assert_eq!(bounded.chars().count(), MAX_EXTRACTED_TEXT_CHARS);
+    assert!(text.starts_with("起始正文"));
+    assert!(!text.contains("尾部标记不应出现"), "上限之外的尾部不应被读入");
+    assert!(text.chars().count() < long_text.chars().count());
+}
+
+/// DOCX 预览返回的正文同样按上限截断，并在降级特征里说明。
+#[test]
+fn docx_preview_bounds_extracted_text_and_reports_the_degradation() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let docx_path = root.path().join("huge.docx");
+    let long_text = "长".repeat(MAX_EXTRACTED_TEXT_CHARS + 5_000);
+    let docx_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>{long_text}</w:t></w:r></w:p></w:body>
+</w:document>"#
+    );
+    fs::write(
+        &docx_path,
+        stored_zip(&[("word/document.xml", docx_xml.as_bytes())]),
+    )
+    .unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let document = service.import_document(&docx_path).unwrap();
+
+    let DocumentPreview::Docx {
+        text,
+        notice,
+        degraded_features,
+        ..
+    } = service.get_document_preview(&document.id, None).unwrap()
+    else {
+        panic!("DOCX 预览应当可用");
+    };
+    assert_eq!(text.chars().count(), MAX_EXTRACTED_TEXT_CHARS);
+    assert!(
+        degraded_features.iter().any(|feature| feature.contains("正文超过")),
+        "超限正文应在降级特征里说明：{degraded_features:?}"
+    );
+    assert!(notice.contains("降级"));
+}
+
+/// 带宏、ActiveX、嵌入对象与外部链接的 Office 文档照常导入与预览，
+/// 但预览包里不再包含这些内容，源文件与资料库副本都不被改动。
+#[test]
+fn macro_bearing_office_documents_preview_without_running_or_exposing_their_scripts() {
+    let root = tempdir().unwrap();
+    let state_dir = root.path().join("app-state");
+    let library_dir = root.path().join("Library");
+    let docx_path = root.path().join("macro.docx");
+    let docx_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:t>带宏文档的可搜索正文</w:t></w:r></w:p>
+    <w:p><w:hyperlink r:id="rIdLink"><w:r><w:t>外部链接</w:t></w:r></w:hyperlink></w:p>
+  </w:body>
+</w:document>"#;
+    let relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://evil.example/beacon" TargetMode="External"/>
+  <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://evil.example/tracker.png" TargetMode="External"/>
+  <Relationship Id="rIdMacro" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/>
+</Relationships>"#;
+    let archive = stored_zip(&[
+        ("word/document.xml", docx_xml.as_bytes()),
+        ("word/_rels/document.xml.rels", relationships.as_bytes()),
+        ("word/vbaProject.bin", b"MACRO-PAYLOAD-SHOULD-NOT-LEAK"),
+        ("word/activeX/activeX1.xml", b"<ax:ocx/>"),
+        (
+            "word/embeddings/oleObject1.bin",
+            b"OLE-PAYLOAD-SHOULD-NOT-LEAK",
+        ),
+    ]);
+    fs::write(&docx_path, &archive).unwrap();
+
+    let mut service = LibraryService::new(&state_dir).unwrap();
+    service.create_library(&library_dir).unwrap();
+    let document = service.import_document(&docx_path).unwrap();
+    let library_copy = library_dir
+        .join("documents")
+        .join(&document.id)
+        .join(&document.file_name);
+    let copy_before = fs::read(&library_copy).unwrap();
+
+    let DocumentPreview::Docx {
+        data_url,
+        text,
+        degraded_features,
+        ..
+    } = service.get_document_preview(&document.id, None).unwrap()
+    else {
+        panic!("DOCX 预览应当可用");
+    };
+    assert!(text.contains("带宏文档的可搜索正文"));
+    let preview_package = bytes_from_data_url(&data_url);
+    for forbidden in [
+        b"MACRO-PAYLOAD-SHOULD-NOT-LEAK".as_slice(),
+        b"OLE-PAYLOAD-SHOULD-NOT-LEAK".as_slice(),
+        b"vbaProject".as_slice(),
+        b"activeX1".as_slice(),
+        b"https://evil.example/beacon".as_slice(),
+        b"https://evil.example/tracker.png".as_slice(),
+        b"TargetMode=\"External\"".as_slice(),
+    ] {
+        assert!(
+            !bytes_contain(&preview_package, forbidden),
+            "预览包不应包含 {:?}",
+            String::from_utf8_lossy(forbidden)
+        );
+    }
+    assert!(
+        degraded_features
+            .iter()
+            .any(|feature| feature.contains("宏或 ActiveX")),
+        "应提示宏或 ActiveX 被降级：{degraded_features:?}"
+    );
+    assert!(
+        degraded_features
+            .iter()
+            .any(|feature| feature.contains("嵌入对象")),
+        "应提示嵌入对象被降级：{degraded_features:?}"
+    );
+    assert!(
+        degraded_features
+            .iter()
+            .any(|feature| feature.contains("远程资源")),
+        "应提示远程资源被降级：{degraded_features:?}"
+    );
+
+    assert_eq!(fs::read(&docx_path).unwrap(), archive, "源文件保持不变");
+    assert_eq!(fs::read(&library_copy).unwrap(), copy_before, "副本不被预览改动");
+
+    service.index_pending_documents().unwrap();
+    assert_eq!(
+        search(&service, "可搜索正文", DocumentSearchFilters::default()).len(),
+        1,
+        "宏内容被丢弃不影响正文索引"
+    );
+}
+
+/// 受控声明的 ZIP 条目：数据、压缩方式由测试决定，中央目录里的声明解压量单独给出。
+struct ZipEntrySpec<'a> {
+    name: &'a str,
+    method: u16,
+    data: Vec<u8>,
+    declared_uncompressed: u32,
+}
+
+fn stored_spec<'a>(name: &'a str, contents: &'a [u8]) -> ZipEntrySpec<'a> {
+    ZipEntrySpec {
+        name,
+        method: 0,
+        data: contents.to_vec(),
+        declared_uncompressed: contents.len() as u32,
+    }
+}
+
+fn deflate_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// 组装 ZIP：压缩数据写真实值，中央目录里的解压大小写测试给出的声明值。
+fn zip_with_declarations(entries: &[ZipEntrySpec<'_>]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    let mut central_entries = Vec::new();
+
+    for entry in entries {
+        let local_offset = archive.len() as u32;
+        push_u32(&mut archive, 0x0403_4b50);
+        push_u16(&mut archive, 20);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, entry.method);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u32(&mut archive, 0);
+        push_u32(&mut archive, entry.data.len() as u32);
+        push_u32(&mut archive, entry.data.len() as u32);
+        push_u16(&mut archive, entry.name.len() as u16);
+        push_u16(&mut archive, 0);
+        archive.extend_from_slice(entry.name.as_bytes());
+        archive.extend_from_slice(&entry.data);
+
+        let mut central = Vec::new();
+        push_u32(&mut central, 0x0201_4b50);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, entry.method);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, 0);
+        push_u32(&mut central, entry.data.len() as u32);
+        push_u32(&mut central, entry.declared_uncompressed);
+        push_u16(&mut central, entry.name.len() as u16);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, 0);
+        push_u32(&mut central, local_offset);
+        central.extend_from_slice(entry.name.as_bytes());
+        central_entries.push(central);
+    }
+
+    let central_offset = archive.len() as u32;
+    for entry in &central_entries {
+        archive.extend_from_slice(entry);
+    }
+    let central_size = archive.len() as u32 - central_offset;
+
+    push_u32(&mut archive, 0x0605_4b50);
+    push_u16(&mut archive, 0);
+    push_u16(&mut archive, 0);
+    push_u16(&mut archive, entries.len() as u16);
+    push_u16(&mut archive, entries.len() as u16);
+    push_u32(&mut archive, central_size);
+    push_u32(&mut archive, central_offset);
+    push_u16(&mut archive, 0);
+    archive
+}
+
+/// 生成一个只有 ZIP 文件头、长度为 `size` 的文件；用于表达“输入超过上限”，
+/// 不写入真实数据，避免测试自己制造大文件。
+fn write_sparse_archive(path: &Path, size: u64) {
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(b"PK\x03\x04").unwrap();
+    file.set_len(size).unwrap();
+    file.sync_all().unwrap();
+}
+
 fn search(
     service: &LibraryService,
     query: &str,
     filters: DocumentSearchFilters,
-) -> Vec<personal_document_manager_lib::library::DocumentSearchResult> {
-    let DocumentSearchResponse { results } = service
+) -> Vec<personal_document_manager_lib::library::DocumentSearchResult> {    let DocumentSearchResponse { results } = service
         .search_documents(DocumentSearchQuery {
             query: query.to_string(),
             filters,

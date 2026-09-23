@@ -25,6 +25,10 @@ use super::formats::{
     require_capability_for_file_type, unsupported_message, PreviewStrategy, TextExtractionStrategy,
     ThumbnailStrategy, ValidationStrategy,
 };
+use super::limits::{
+    bound_extracted_text, read_stream_limited, ArchiveLimits, ExpansionBudget,
+    MAX_EXTRACTED_TEXT_CHARS,
+};
 use super::models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
     BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,
@@ -51,6 +55,10 @@ const RECENT_FILE: &str = "recent_libraries.json";
 const MAX_RECENT_LIBRARIES: usize = 10;
 const DELETE_TOMBSTONE_PREFIX: &str = ".pdm-delete-";
 const DELETE_TOMBSTONE_SUFFIX: &str = ".tombstone";
+const REPLACEMENT_BACKUP_SUFFIX: &str = ".previous";
+const IMPORT_TEMPORARY_SUFFIX: &str = ".importing";
+/// 纯文本读取的字节上限：UTF-8 每字符最多 4 字节，另加 4 字节用于识别截断。
+const MAX_TEXT_READ_BYTES: u64 = MAX_EXTRACTED_TEXT_CHARS as u64 * 4 + 4;
 
 pub struct LibraryService {
     state_dir: PathBuf,
@@ -477,7 +485,7 @@ impl LibraryService {
 
         let connection = open_database(&path)?;
         initialize_schema(&connection)?;
-        cleanup_delete_tombstones(&path, &connection)?;
+        let recovery_failures = reconcile_interrupted_copy_operations(&path, &connection)?;
 
         let summary = summary_from_metadata(&path, &metadata);
         let mut candidate = OpenLibrary {
@@ -485,6 +493,15 @@ impl LibraryService {
             connection,
         };
         Self::scan_external_changes_for(&mut candidate, true)?;
+        // 无法自动恢复的结论必须在启动扫描之后写入：扫描会把内容不一致的副本改写成
+        // “待索引”，随后重新索引就会丢掉恢复失败的原因，让用户看不到可诊断状态。
+        for failure in &recovery_failures {
+            report_recovery_failure(
+                &candidate.connection,
+                &failure.document_id,
+                &failure.message,
+            )?;
+        }
         self.record_recent(&summary)?;
         self.current = Some(candidate);
         Ok(summary)
@@ -534,7 +551,7 @@ impl LibraryService {
         fs::create_dir_all(&destination_directory)?;
 
         let destination_path = destination_directory.join(&file_name);
-        let temporary_path = destination_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        let temporary_path = import_temporary_path(&destination_directory);
         if let Err(error) = fs::copy(&source_path, &temporary_path) {
             let _ = fs::remove_file(&temporary_path);
             return Err(LibraryError::Io(error));
@@ -1207,7 +1224,7 @@ impl LibraryService {
         }
 
         let destination_path = destination_directory.join(&pending.file_name);
-        let temporary_path = destination_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        let temporary_path = import_temporary_path(&destination_directory);
         if let Err(error) = fs::copy(&pending.path, &temporary_path) {
             let _ = fs::remove_file(&temporary_path);
             let _ = fs::remove_dir_all(&destination_directory);
@@ -1511,7 +1528,7 @@ impl LibraryService {
             ));
         }
         let destination_path = document_directory.join(&pending.file_name);
-        let temporary_path = document_directory.join(format!(".{}.importing", Uuid::new_v4()));
+        let temporary_path = import_temporary_path(&document_directory);
         if let Err(error) = fs::copy(&source_path, &temporary_path) {
             let _ = fs::remove_file(&temporary_path);
             return Ok(self.failure_item(
@@ -1555,7 +1572,7 @@ impl LibraryService {
         let old_copy = PathBuf::from(&library_root).join(old_library_path);
         let mut previous_copies = Vec::new();
         if old_copy != destination_path && old_copy.exists() {
-            let backup_path = document_directory.join(format!(".{}.previous", Uuid::new_v4()));
+            let backup_path = replacement_backup_path(&document_directory);
             if let Err(error) = fs::rename(&old_copy, &backup_path) {
                 let _ = fs::remove_file(&temporary_path);
                 return Ok(self.failure_item(
@@ -1571,7 +1588,7 @@ impl LibraryService {
             previous_copies.push((backup_path, old_copy));
         }
         if destination_path.exists() {
-            let backup_path = document_directory.join(format!(".{}.previous", Uuid::new_v4()));
+            let backup_path = replacement_backup_path(&document_directory);
             if let Err(error) = fs::rename(&destination_path, &backup_path) {
                 let _ = fs::remove_file(&temporary_path);
                 restore_previous_copies(&previous_copies);
@@ -3188,21 +3205,28 @@ impl LibraryService {
                 })
             }
             PreviewStrategy::PlainText => Ok(DocumentPreview::Text {
-                text: read_utf8_text(&path)?,
+                text: bounded_preview_text(read_utf8_text(&path)?),
             }),
             PreviewStrategy::SafeMarkdown => Ok(DocumentPreview::Markdown {
-                text: read_utf8_text(&path)?,
+                text: bounded_preview_text(read_utf8_text(&path)?),
             }),
             PreviewStrategy::DocxLayout => {
-                let bytes = fs::read(&path)?;
-                let degraded_features = inspect_docx_degradations(&bytes);
+                let bytes = read_archive_within_limits(&path, ArchiveLimits::for_preview())?;
+                let mut degraded_features = inspect_docx_degradations(&bytes);
                 let sanitized = ooxml::sanitize_docx_package(&bytes)?;
+                let text = bound_extracted_text(extract_docx_text_from_bytes(&bytes)?);
+                if text.truncated {
+                    push_unique_feature(
+                        &mut degraded_features,
+                        format!("正文超过 {MAX_EXTRACTED_TEXT_CHARS} 个字符，预览只显示前半部分"),
+                    );
+                }
                 Ok(DocumentPreview::Docx {
                     data_url: data_url(
                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         &sanitized,
                     ),
-                    text: extract_docx_text_from_bytes(&bytes)?,
+                    text: text.text,
                     notice: if degraded_features.is_empty() {
                         "DOCX 版式预览为本地只读近似呈现。".to_string()
                     } else {
@@ -3212,17 +3236,24 @@ impl LibraryService {
                 })
             }
             PreviewStrategy::PptxPages => {
-                let bytes = fs::read(&path)?;
+                let bytes = read_archive_within_limits(&path, ArchiveLimits::for_preview())?;
                 let extraction = extract_pptx_text_from_bytes(&bytes)?;
                 let mut degraded_features = inspect_pptx_degradations(&bytes);
                 merge_features(&mut degraded_features, extraction.degraded_features);
                 let sanitized = ooxml::sanitize_pptx_package(&bytes)?;
+                let text = bound_extracted_text(extraction.text);
+                if text.truncated {
+                    push_unique_feature(
+                        &mut degraded_features,
+                        format!("正文超过 {MAX_EXTRACTED_TEXT_CHARS} 个字符，预览只显示前半部分"),
+                    );
+                }
                 Ok(DocumentPreview::Pptx {
                     data_url: data_url(
                         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                         &sanitized,
                     ),
-                    text: extraction.text,
+                    text: text.text,
                     notice: if degraded_features.is_empty() {
                         "PPTX 版式预览为本地只读近似呈现。".to_string()
                     } else {
@@ -4023,13 +4054,65 @@ fn is_delete_tombstone_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
     name.starts_with(prefix) && name.ends_with(DELETE_TOMBSTONE_SUFFIX)
 }
 
-fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> LibraryResult<()> {
+fn replacement_backup_path(directory: &Path) -> PathBuf {
+    directory.join(format!(".{}{REPLACEMENT_BACKUP_SUFFIX}", Uuid::new_v4()))
+}
+
+fn import_temporary_path(directory: &Path) -> PathBuf {
+    directory.join(format!(".{}{IMPORT_TEMPORARY_SUFFIX}", Uuid::new_v4()))
+}
+
+fn is_replacement_backup_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.ends_with(REPLACEMENT_BACKUP_SUFFIX)
+}
+
+fn is_import_temporary_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.ends_with(IMPORT_TEMPORARY_SUFFIX)
+}
+
+fn is_replacement_artifact_name(name: &std::ffi::OsStr) -> bool {
+    is_replacement_backup_name(name) || is_import_temporary_name(name)
+}
+
+/// 在读入整份压缩文档之前校验输入大小：超限时直接失败，不为超限文件分配整块内存。
+fn read_archive_within_limits(path: &Path, limits: ArchiveLimits) -> LibraryResult<Vec<u8>> {
+    let budget = ExpansionBudget::new(limits);
+    let metadata = fs::metadata(path)?;
+    budget.check_input_size(metadata.len())?;
+    let bytes = fs::read(path)?;
+    budget.check_input_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
+/// 预览返回的纯文本按上限截断；截断时在末尾给出可理解的降级说明。
+fn bounded_preview_text(text: String) -> String {
+    let bounded = bound_extracted_text(text);
+    if !bounded.truncated {
+        return bounded.text;
+    }
+    format!(
+        "{}\n\n……（正文超过 {MAX_EXTRACTED_TEXT_CHARS} 个字符的预览上限，已截断）",
+        bounded.text
+    )
+}
+
+/// 打开资料库时对账中断遗留的文件操作。数据库记录是权威：墓碑和替换备份都要么让
+/// 记录的副本重新可读，要么在记录已经指向其他内容时被清理。返回无法自动恢复的文档，
+/// 由调用方在启动扫描之后写入失败状态，避免结论被扫描覆盖。
+fn reconcile_interrupted_copy_operations(
+    library_root: &Path,
+    connection: &Connection,
+) -> LibraryResult<Vec<RecoveryFailure>> {
     let documents_directory = library_root.join(DOCUMENTS_DIR);
     let document_directories = match fs::read_dir(&documents_directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(LibraryError::Io(error)),
     };
+    let known_copies = library_copy_paths(library_root, connection)?;
+    let mut failures = Vec::new();
 
     for document_directory in document_directories {
         let document_directory = document_directory?;
@@ -4041,17 +4124,24 @@ fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> Li
             .file_name()
             .to_string_lossy()
             .into_owned();
-        let library_path = connection
+        let recorded = connection
             .query_row(
-                "SELECT library_path FROM documents WHERE id = ?1",
+                "SELECT library_path, content_hash, deleted_at FROM documents WHERE id = ?1",
                 params![&document_id],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
         let directory_path = document_directory.path();
-        let mut tombstones = fs::read_dir(&directory_path)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
+        let entries = fs::read_dir(&directory_path)?.collect::<Result<Vec<_>, _>>()?;
+
+        let mut tombstones = entries
+            .iter()
             .filter(|entry| is_delete_tombstone_name(&entry.file_name(), DELETE_TOMBSTONE_PREFIX))
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
@@ -4059,7 +4149,7 @@ fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> Li
         let had_tombstones = !tombstones.is_empty();
 
         for tombstone_path in tombstones {
-            match library_path.as_deref() {
+            match recorded.as_ref().map(|(library_path, _, _)| library_path) {
                 Some(library_path) => {
                     let original_path = document_path(library_root, library_path)?;
                     restore_library_copy_tombstone(&tombstone_path, &original_path)?;
@@ -4081,7 +4171,150 @@ fn cleanup_delete_tombstones(library_root: &Path, connection: &Connection) -> Li
                 Err(error) => return Err(LibraryError::Io(error)),
             }
         }
+
+        let mut backups = Vec::new();
+        let mut temporaries = Vec::new();
+        for entry in entries {
+            let name = entry.file_name();
+            if !is_replacement_artifact_name(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if known_copies.contains(&path) {
+                continue;
+            }
+            if is_replacement_backup_name(&name) {
+                backups.push(path);
+            } else {
+                temporaries.push(path);
+            }
+        }
+        if backups.is_empty() && temporaries.is_empty() {
+            continue;
+        }
+        backups.sort();
+        temporaries.sort();
+        // 备份一定是文档的原内容，临时副本只有在内容核对通过时才会被采用。
+        let leftovers = backups.into_iter().chain(temporaries).collect::<Vec<_>>();
+
+        match recorded.as_ref() {
+            Some((library_path, content_hash, None)) => {
+                if let Some(failure) = recover_interrupted_replacement(
+                    library_root,
+                    &document_id,
+                    library_path,
+                    content_hash.as_deref(),
+                    &leftovers,
+                )? {
+                    failures.push(failure);
+                }
+            }
+            _ => remove_leftover_files(&leftovers)?,
+        }
     }
+    Ok(failures)
+}
+
+/// 无法自动恢复的替换：打开资料库时保留文件现场，并把原因写进文档记录。
+struct RecoveryFailure {
+    document_id: String,
+    message: String,
+}
+
+/// 让记录的副本重新可读，或在不一致时报告可诊断的失败。返回后目录里不再有中断残留。
+fn recover_interrupted_replacement(
+    library_root: &Path,
+    document_id: &str,
+    library_path: &str,
+    content_hash: Option<&str>,
+    leftovers: &[PathBuf],
+) -> LibraryResult<Option<RecoveryFailure>> {
+    let destination = document_path(library_root, library_path)?;
+    if copy_matches_recorded_content(&destination, content_hash) {
+        remove_leftover_files(leftovers)?;
+        return Ok(None);
+    }
+
+    for candidate in leftovers {
+        if !copy_matches_recorded_content(candidate, content_hash) {
+            continue;
+        }
+        let remaining = leftovers
+            .iter()
+            .filter(|path| *path != candidate)
+            .cloned()
+            .collect::<Vec<_>>();
+        remove_library_copy(&destination)?;
+        fs::rename(candidate, &destination)?;
+        remove_leftover_files(&remaining)?;
+        return Ok(None);
+    }
+
+    Ok(Some(RecoveryFailure {
+        document_id: document_id.to_string(),
+        message: format!(
+            "上次替换副本未完成，且无法自动恢复：资料库副本与记录不一致（{}）。请从源文件重新导入。",
+            destination.display()
+        ),
+    }))
+}
+
+fn copy_matches_recorded_content(path: &Path, content_hash: Option<&str>) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(expected) = content_hash else {
+        // 没有记录哈希时无法核对内容，副本存在即视为一致。
+        return true;
+    };
+    sha256_file(path).is_ok_and(|hash| hash == expected)
+}
+
+fn library_copy_paths(
+    library_root: &Path,
+    connection: &Connection,
+) -> LibraryResult<HashSet<PathBuf>> {
+    let mut statement = connection.prepare("SELECT library_path FROM documents")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut paths = HashSet::new();
+    for row in rows {
+        if let Ok(path) = document_path(library_root, &row?) {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn remove_leftover_files(paths: &[PathBuf]) -> LibraryResult<()> {
+    for path in paths {
+        remove_library_copy(path)?;
+    }
+    Ok(())
+}
+
+fn report_recovery_failure(
+    connection: &Connection,
+    document_id: &str,
+    message: &str,
+) -> LibraryResult<()> {
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "
+        UPDATE documents
+        SET processing_status = 'failed',
+            index_status = 'failed',
+            error_stage = 'recovery',
+            error_message = ?1,
+            updated_at = ?2
+        WHERE id = ?3 AND deleted_at IS NULL
+        ",
+        params![message, now(), document_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM document_search WHERE document_id = ?1",
+        params![document_id],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -4703,6 +4936,20 @@ fn validate_file_content(
     path: &Path,
     capability: &super::formats::DocumentFormatCapability,
 ) -> Result<(), String> {
+    // 压缩文档在导入时就按输入上限拦下，避免把超限文件整份复制进资料库。
+    if matches!(
+        capability.validation,
+        ValidationStrategy::DocxPackage
+            | ValidationStrategy::PptxPackage
+            | ValidationStrategy::XlsxPackage
+    ) {
+        let input_bytes = fs::metadata(path)
+            .map_err(|error| format!("无法读取文件内容：{error}"))?
+            .len();
+        ExpansionBudget::new(ArchiveLimits::for_index())
+            .check_input_size(input_bytes)
+            .map_err(|error| error.to_string())?;
+    }
     match capability.validation {
         ValidationStrategy::PdfSignature => {
             let prefix = read_prefix(path, 1024)?;
@@ -4730,7 +4977,8 @@ fn validate_file_content(
 }
 
 fn validate_pptx_package(path: &Path) -> Result<(), String> {
-    let archive = fs::read(path).map_err(|error| format!("无法读取文件内容：{error}"))?;
+    let archive = read_archive_within_limits(path, ArchiveLimits::for_index())
+        .map_err(|error| error.to_string())?;
     validate_pptx_bytes(&archive).map_err(|error| error.to_string())
 }
 
@@ -5005,8 +5253,12 @@ fn data_url(media_type: &str, bytes: &[u8]) -> String {
 }
 
 fn read_utf8_text(path: &Path) -> LibraryResult<String> {
-    let bytes = fs::read(path)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    // 文本按字节流读取并设上限：UTF-8 每个字符最多 4 字节，再多读一点用于识别截断。
+    // 这样超大文本不会在被截断之前先整份读进内存（字符级上限见 bound_extracted_text）。
+    let file = File::open(path)?;
+    let mut buffer = Vec::new();
+    file.take(MAX_TEXT_READ_BYTES).read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 fn ensure_document_copy_exists(path: &Path) -> LibraryResult<()> {
@@ -5065,7 +5317,7 @@ fn memchr_indices(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 }
 
 fn extract_docx_text(path: &Path) -> LibraryResult<String> {
-    let archive = fs::read(path)?;
+    let archive = read_archive_within_limits(path, ArchiveLimits::for_index())?;
     extract_docx_text_from_bytes(&archive)
 }
 
@@ -5083,6 +5335,8 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
     let Ok(entry_names) = zip_entry_names(archive) else {
         return Vec::new();
     };
+    // 降级检查属于预览工作：所有部件共用一份预览预算，累计超限后剩余部件按读取失败跳过。
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_preview());
     let mut features = Vec::new();
     let mut push_feature = |feature: &str| {
         if !features.iter().any(|candidate| candidate == feature) {
@@ -5105,7 +5359,7 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
         if !(lowercase_name.ends_with(".xml") || lowercase_name.ends_with(".rels")) {
             continue;
         }
-        let Ok(xml) = read_zip_entry(archive, &entry_name) else {
+        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "DOCX", &mut budget) else {
             continue;
         };
         let xml_text = String::from_utf8_lossy(&xml);
@@ -5150,7 +5404,7 @@ fn inspect_docx_degradations(archive: &[u8]) -> Vec<String> {
 }
 
 fn extract_pptx_text(path: &Path) -> LibraryResult<String> {
-    let archive = fs::read(path)?;
+    let archive = read_archive_within_limits(path, ArchiveLimits::for_index())?;
     extract_pptx_text_from_bytes(&archive).map(|extraction| extraction.text)
 }
 
@@ -5165,9 +5419,11 @@ fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction>
         ));
     }
 
+    // 所有幻灯片与图表共用一份索引预算，累计解压量超限后剩余页按降级处理。
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_index());
     let mut slide_text = Vec::new();
     for (index, entry_name) in slide_names.iter().enumerate() {
-        match read_zip_entry_for(archive, entry_name, "PPTX")
+        match read_zip_entry_for(archive, entry_name, "PPTX", &mut budget)
             .and_then(|xml| extract_powerpoint_text(&xml, false))
         {
             Ok(text) if !text.trim().is_empty() => slide_text.push(text),
@@ -5180,7 +5436,7 @@ fn extract_pptx_text_from_bytes(archive: &[u8]) -> LibraryResult<PptxExtraction>
     }
 
     for entry_name in graph.chart_parts {
-        match read_zip_entry_for(archive, &entry_name, "PPTX")
+        match read_zip_entry_for(archive, &entry_name, "PPTX", &mut budget)
             .and_then(|xml| extract_powerpoint_text(&xml, true))
         {
             Ok(text) if !text.trim().is_empty() => slide_text.push(text),
@@ -5259,9 +5515,11 @@ fn extract_powerpoint_text(xml: &[u8], chart_values: bool) -> LibraryResult<Stri
 }
 
 fn inspect_pptx_degradations(archive: &[u8]) -> Vec<String> {
-    let Ok(entry_names) = zip_entry_names_for(archive, "PPTX") else {
+    let Ok(entry_names) = zip_entry_names_for(archive, "PPTX", ArchiveLimits::for_preview()) else {
         return Vec::new();
     };
+    // 降级检查属于预览工作：所有部件共用一份预览预算，超限后剩余部件按读取失败跳过。
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_preview());
     let mut features = Vec::new();
 
     for entry_name in entry_names {
@@ -5282,7 +5540,7 @@ fn inspect_pptx_degradations(archive: &[u8]) -> Vec<String> {
         if !lowercase_name.ends_with(".rels") {
             continue;
         }
-        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "PPTX") else {
+        let Ok(xml) = read_zip_entry_for(archive, &entry_name, "PPTX", &mut budget) else {
             continue;
         };
         let xml_text = String::from_utf8_lossy(&xml);
@@ -5312,16 +5570,22 @@ fn push_unique_feature(features: &mut Vec<String>, feature: String) {
 }
 
 fn zip_entry_names(archive: &[u8]) -> LibraryResult<Vec<String>> {
-    zip_entry_names_for(archive, "DOCX")
+    zip_entry_names_for(archive, "DOCX", ArchiveLimits::for_preview())
 }
 
-fn zip_entry_names_for(archive: &[u8], format: &str) -> LibraryResult<Vec<String>> {
+fn zip_entry_names_for(
+    archive: &[u8],
+    format: &str,
+    limits: ArchiveLimits,
+) -> LibraryResult<Vec<String>> {
+    ExpansionBudget::new(limits).check_input_size(archive.len() as u64)?;
     let eocd = find_zip_eocd(archive).ok_or_else(|| {
         LibraryError::Preview(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
     })?;
     let entry_count = read_u16(archive, eocd + 10)? as usize;
     let mut cursor = read_u32(archive, eocd + 16)? as usize;
-    let mut names = Vec::with_capacity(entry_count);
+    // 每个中央目录项至少 46 字节，按文件长度收敛预分配。
+    let mut names = Vec::with_capacity(entry_count.min(archive.len() / 46 + 1));
 
     for _ in 0..entry_count {
         if read_u32(archive, cursor)? != 0x0201_4b50 {
@@ -5352,10 +5616,18 @@ fn zip_entry_names_for(archive: &[u8], format: &str) -> LibraryResult<Vec<String
 }
 
 fn read_zip_entry(archive: &[u8], target_name: &str) -> LibraryResult<Vec<u8>> {
-    read_zip_entry_for(archive, target_name, "DOCX")
+    let mut budget = ExpansionBudget::new(ArchiveLimits::for_index());
+    read_zip_entry_for(archive, target_name, "DOCX", &mut budget)
 }
 
-fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> LibraryResult<Vec<u8>> {
+/// 在既有预算内读取单个条目：先按声明大小与压缩比筛选，再限流解压并计入累计量。
+fn read_zip_entry_for(
+    archive: &[u8],
+    target_name: &str,
+    format: &str,
+    budget: &mut ExpansionBudget,
+) -> LibraryResult<Vec<u8>> {
+    budget.check_input_size(archive.len() as u64)?;
     let eocd = find_zip_eocd(archive).ok_or_else(|| {
         LibraryError::Preview(format!("{format} 文件结构无效：找不到 ZIP 中央目录。"))
     })?;
@@ -5395,6 +5667,12 @@ fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> Librar
                     "暂不支持 ZIP64 格式的 {format} 文件。"
                 )));
             }
+            budget.check_entry_size(target_name, uncompressed_size as u64)?;
+            budget.check_compression_ratio(
+                target_name,
+                compressed_size as u64,
+                uncompressed_size as u64,
+            )?;
 
             let data_start = zip_local_data_start(archive, local_header_offset, format)?;
             let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
@@ -5404,13 +5682,17 @@ fn read_zip_entry_for(archive: &[u8], target_name: &str, format: &str) -> Librar
                 LibraryError::Preview(format!("{format} 文件结构无效：正文超出文件范围。"))
             })?;
             return match compression {
-                0 => Ok(compressed.to_vec()),
-                8 => {
-                    let mut decoder = DeflateDecoder::new(Cursor::new(compressed));
-                    let mut output = Vec::with_capacity(uncompressed_size);
-                    decoder.read_to_end(&mut output)?;
-                    Ok(output)
+                0 => {
+                    let contents = compressed.to_vec();
+                    budget.charge(target_name, contents.len())?;
+                    Ok(contents)
                 }
+                8 => read_stream_limited(
+                    DeflateDecoder::new(Cursor::new(compressed)),
+                    target_name,
+                    uncompressed_size as u64,
+                    budget,
+                ),
                 method => Err(LibraryError::Preview(format!(
                     "{format} 使用了不支持的压缩方式：{method}。"
                 ))),
@@ -5661,7 +5943,7 @@ fn fts_phrase(query: &str) -> String {
 
 fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
     let capability = require_capability_for_file_type(file_type)?;
-    match capability.text_extraction {
+    let text = match capability.text_extraction {
         TextExtractionStrategy::PdfText => extract_pdf_text(path),
         TextExtractionStrategy::DocxText => extract_docx_text(path),
         TextExtractionStrategy::PlainText => read_utf8_text(path),
@@ -5671,7 +5953,10 @@ fn extract_search_text(path: &Path, file_type: &str) -> LibraryResult<String> {
         TextExtractionStrategy::TableText => Err(LibraryError::Preview(
             "表格正文提取尚未实现。".to_string(),
         )),
-    }
+    }?;
+    // 索引正文有明确上限：只把前 MAX_EXTRACTED_TEXT_CHARS 个字符写进 FTS，
+    // 避免单份大文档把索引撑到无界（上限同时用于预览截断提示）。
+    Ok(bound_extracted_text(text).text)
 }
 
 fn extract_pdf_text(path: &Path) -> LibraryResult<String> {

@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 use flate2::read::DeflateDecoder;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use super::error::{LibraryError, LibraryResult};
+use super::limits::{read_stream_limited, ArchiveLimits, ExpansionBudget};
 
 const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
 const PRESENTATION_PART: &str = "ppt/presentation.xml";
@@ -54,8 +55,9 @@ impl ContentTypes {
     }
 }
 
+/// 校验 PPTX 包结构。导入校验与建立幻灯片图都按索引预算读取。
 pub(super) fn validate_pptx_package(archive: &[u8]) -> LibraryResult<PptxGraph> {
-    let entries = read_package_entries(archive, "PPTX")?;
+    let entries = read_package_entries(archive, "PPTX", ArchiveLimits::for_index())?;
     validate_pptx_entries(&entries)
 }
 
@@ -63,13 +65,14 @@ pub(super) fn pptx_presentation_graph(archive: &[u8]) -> LibraryResult<PptxGraph
     validate_pptx_package(archive)
 }
 
+/// 生成只读预览用的 DOCX 包；预览预算低于索引预算，超限时明确失败而不是继续展开。
 pub(super) fn sanitize_docx_package(archive: &[u8]) -> LibraryResult<Vec<u8>> {
-    let entries = read_package_entries(archive, "DOCX")?;
+    let entries = read_package_entries(archive, "DOCX", ArchiveLimits::for_preview())?;
     sanitize_entries(entries, OfficeFormat::Docx).map(|entries| write_package_entries(&entries))
 }
 
 pub(super) fn sanitize_pptx_package(archive: &[u8]) -> LibraryResult<Vec<u8>> {
-    let entries = read_package_entries(archive, "PPTX")?;
+    let entries = read_package_entries(archive, "PPTX", ArchiveLimits::for_preview())?;
     let graph = validate_pptx_entries(&entries)?;
     sanitize_entries_with_pptx_graph(entries, &graph).map(|entries| write_package_entries(&entries))
 }
@@ -1014,7 +1017,17 @@ fn find_tag_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-fn read_package_entries(archive: &[u8], format: &str) -> LibraryResult<Vec<PackageEntry>> {
+/// 读取压缩包内所有条目。
+///
+/// 中央目录里的声明大小完全由文件控制，因此在解压前先按 `limits` 校验输入大小、
+/// 单条目声明大小与压缩比，解压时再按累计解压量记账；畸形声明不会带来巨量分配。
+fn read_package_entries(
+    archive: &[u8],
+    format: &str,
+    limits: ArchiveLimits,
+) -> LibraryResult<Vec<PackageEntry>> {
+    let mut budget = ExpansionBudget::new(limits);
+    budget.check_input_size(archive.len() as u64)?;
     if !archive.starts_with(b"PK\x03\x04") {
         return Err(LibraryError::ImportFile(format!(
             "文件内容不是有效的 {format}：缺少 OOXML 压缩包结构。"
@@ -1025,7 +1038,8 @@ fn read_package_entries(archive: &[u8], format: &str) -> LibraryResult<Vec<Packa
     })?;
     let entry_count = read_u16(archive, eocd + 10)? as usize;
     let mut cursor = read_u32(archive, eocd + 16)? as usize;
-    let mut entries = Vec::with_capacity(entry_count);
+    // 每个中央目录项至少 46 字节，按文件长度收敛预分配，避免畸形声明带来的空分配。
+    let mut entries = Vec::with_capacity(entry_count.min(archive.len() / 46 + 1));
     let mut names = HashSet::new();
 
     for _ in 0..entry_count {
@@ -1069,6 +1083,13 @@ fn read_package_entries(archive: &[u8], format: &str) -> LibraryResult<Vec<Packa
                 "{format} 文件结构无效：部件名称重复：{normalized_name}。"
             )));
         }
+        // 解压之前先按声明值筛选，压缩炸弹与畸形的 0 压缩声明都在这里被拒绝。
+        budget.check_entry_size(&normalized_name, uncompressed_size as u64)?;
+        budget.check_compression_ratio(
+            &normalized_name,
+            compressed_size as u64,
+            uncompressed_size as u64,
+        )?;
         let data_start = zip_local_data_start(archive, local_header_offset, format)?;
         let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
             LibraryError::ImportFile(format!("{format} 文件结构无效：正文长度溢出。"))
@@ -1077,13 +1098,17 @@ fn read_package_entries(archive: &[u8], format: &str) -> LibraryResult<Vec<Packa
             LibraryError::ImportFile(format!("{format} 文件结构无效：正文超出文件范围。"))
         })?;
         let contents = match compression {
-            0 => compressed.to_vec(),
-            8 => {
-                let mut decoder = DeflateDecoder::new(Cursor::new(compressed));
-                let mut output = Vec::with_capacity(uncompressed_size);
-                decoder.read_to_end(&mut output)?;
-                output
+            0 => {
+                let contents = compressed.to_vec();
+                budget.charge(&normalized_name, contents.len())?;
+                contents
             }
+            8 => read_stream_limited(
+                DeflateDecoder::new(Cursor::new(compressed)),
+                &normalized_name,
+                uncompressed_size as u64,
+                &mut budget,
+            )?,
             method => {
                 return Err(LibraryError::ImportFile(format!(
                     "{format} 使用了不支持的压缩方式：{method}。"
