@@ -3734,6 +3734,16 @@ p {
   line-height: 1.5;
 }
 
+.classification-preview-stale {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .classification-preview-scroll {
   min-height: 0;
   max-height: 320px;
@@ -3915,6 +3925,58 @@ p {
   margin: 0;
   color: var(--text-muted);
   font-size: 12px;
+  line-height: 1.5;
+}
+
+.receive-log {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.receive-log h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.receive-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.receive-log-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.receive-log-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.receive-log-status {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.receive-log-error {
+  margin: 0;
+  color: var(--danger);
   line-height: 1.5;
 }
 

@@ -165,12 +165,17 @@ describe("PPTX 导入与版式预览", () => {
         ".empty-library .button.primary"
       ) ?? screen.getByRole("button", { name: "导入文档" })
     );
+    // 导入前先询问是否应用分类规则；选「不应用」保持原有导入路径。
+    await user.click(
+      await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+    );
 
     expect(await screen.findByText("季度汇报")).toBeInTheDocument();
     expect(screen.getByText("PPTX")).toBeInTheDocument();
     expect(client.calls).toContain(
       `startImport:${documentSummary.sourcePath}`
     );
+    expect(client.startImportCalls.at(-1)?.applyClassification).toBe(false);
   });
 
   it("renders slides, supports page and thumbnail navigation, fit width and zoom", async () => {

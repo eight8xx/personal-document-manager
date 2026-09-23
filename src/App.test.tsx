@@ -50,6 +50,17 @@ afterEach(() => {
   cleanup();
 });
 
+/**
+ * 人工批量导入现在会先询问是否应用分类规则；这里选「不应用」，
+ * 走的就是接入分类规则之前的导入路径（`applyClassification === false`）。
+ */
+async function importKeepingExistingFlow() {
+  const user = userEvent.setup();
+  await user.click(
+    await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+  );
+}
+
 function bootstrapWithLibrary(
   recentLibraries: BootstrapState["recentLibraries"] = []
 ): BootstrapState {
@@ -377,7 +388,7 @@ describe("App", () => {
     expect(client.calls).toContain(`openDirectory:${secondPath}`);
   });
 
-  it("uses the old library identity when its file picker finishes after switching libraries", async () => {
+  it("drops a stale picker result after switching libraries without importing anything", async () => {
     const user = userEvent.setup();
     const secondPath = "D:\\Archive";
     const sourcePath = "C:\\Documents\\late.md";
@@ -431,8 +442,17 @@ describe("App", () => {
     await act(async () => {
       finishPicker?.([sourcePath]);
     });
-    await waitFor(() => expect(requestedLibrary).toEqual(currentLibrary));
-    expect(rejectedByCurrentLibrary).toBe(true);
+    // 切库后旧工作区已卸载：这次过期的导入请求不再发起任何导入，
+    // 既不会用旧资料库身份调用 startImport，也不会写进新资料库，
+    // 更不会给已经离开的资料库弹出分类询问。
+    expect(
+      screen.queryByRole("dialog", { name: "是否应用分类规则？" })
+    ).not.toBeInTheDocument();
+    expect(requestedLibrary).toBeNull();
+    expect(rejectedByCurrentLibrary).toBe(false);
+    expect(
+      client.calls.some((call) => call.startsWith("startImport:"))
+    ).toBe(false);
     expect(await client.listDocuments()).toEqual([]);
   });
 
@@ -451,6 +471,7 @@ describe("App", () => {
     await user.click(
       within(emptyLibrary).getByRole("button", { name: "导入文档" })
     );
+    await importKeepingExistingFlow();
 
     expect(await screen.findByText("项目说明")).toBeInTheDocument();
     expect(await screen.findByText("可搜索")).toBeInTheDocument();
@@ -459,6 +480,8 @@ describe("App", () => {
     expect(client.calls).toContain(
       `import:${importedDocument.sourcePath}`
     );
+    // 选「不应用」时显式传 false：与接入分类规则之前完全一致。
+    expect(client.startImportCalls.at(-1)?.applyClassification).toBe(false);
   });
 
   it("imports a file dropped onto the workspace", async () => {
@@ -470,6 +493,7 @@ describe("App", () => {
     render(<App client={client} />);
     await screen.findByRole("heading", { name: "空资料库" });
     client.emitFileDrop([importedDocument.sourcePath]);
+    await importKeepingExistingFlow();
 
     expect(await screen.findByText("项目说明")).toBeInTheDocument();
     expect(client.calls).toContain(
@@ -495,6 +519,7 @@ describe("App", () => {
       expect(client.calls).toContain("subscribeToFileDrops");
     });
     client.emitFileDrop([importedDocument.sourcePath]);
+    await importKeepingExistingFlow();
     await waitFor(() => {
       expect(client.calls).toContain(
         `import:${importedDocument.sourcePath}`
@@ -524,6 +549,7 @@ describe("App", () => {
     await user.click(
       within(emptyLibrary).getByRole("button", { name: "导入文档" })
     );
+    await importKeepingExistingFlow();
 
     expect(await screen.findByText("导入失败")).toBeInTheDocument();
     expect(
@@ -567,6 +593,7 @@ describe("App", () => {
       importedDocument.sourcePath,
       "C:\\Documents\\第二份.md"
     ]);
+    await importKeepingExistingFlow();
 
     expect(
       (await screen.findAllByText("项目说明.md")).length

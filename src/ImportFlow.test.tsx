@@ -91,6 +91,18 @@ function batch(batchId: string, items: ImportItemResult[]): ImportBatch {
   };
 }
 
+/**
+ * 人工批量导入现在先询问是否应用分类规则。这里选「不应用」，
+ * 走的就是接入分类规则之前的那条路径（`applyClassification === false`）。
+ */
+async function importKeepingExistingFlow(
+  user: ReturnType<typeof userEvent.setup>
+) {
+  await user.click(
+    await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+  );
+}
+
 describe("批量导入流程", () => {
   it("merges import progress events with the command result", async () => {
     const user = userEvent.setup();
@@ -120,11 +132,19 @@ describe("批量导入流程", () => {
       expect(client.calls).toContain("subscribeToImportProgress");
     });
     await user.click(screen.getByRole("button", { name: "导入文档" }));
+    await importKeepingExistingFlow(user);
     await waitFor(() => {
       expect(client.calls.some((call) => call.startsWith("startImport:"))).toBe(
         true
       );
     });
+    // 选「不应用」时必须显式传 false，行为与接入前一致。
+    expect(client.startImportCalls.at(-1)?.applyClassification).toBe(false);
+    expect(client.startImportCalls.at(-1)?.paths).toEqual([
+      progressItem.sourcePath,
+      duplicateItem.sourcePath,
+      ignoredItem.sourcePath
+    ]);
 
     act(() => {
       client.emitImportProgress({
@@ -193,6 +213,7 @@ describe("批量导入流程", () => {
     await user.click(
       screen.getAllByRole("button", { name: "导入文档" })[0]
     );
+    await importKeepingExistingFlow(user);
 
     await waitFor(() => {
       expect(client.calls).toContain("pendingIndexCount");
@@ -218,6 +239,7 @@ describe("批量导入流程", () => {
     render(<App client={client} />);
     await screen.findByText("项目说明");
     await user.click(screen.getByRole("button", { name: "导入文档" }));
+    await importKeepingExistingFlow(user);
 
     const dialog = await screen.findByRole("dialog", {
       name: "发现重复文档"
@@ -277,14 +299,27 @@ describe("批量导入流程", () => {
     };
     let requestedLibrary: LibrarySummary | null = null;
     const startImport = client.startImport.bind(client);
-    client.startImport = async (owner, paths, targetCollectionId, source) => {
+    client.startImport = async (
+      owner,
+      paths,
+      targetCollectionId,
+      source,
+      applyClassification
+    ) => {
       requestedLibrary = owner;
-      return startImport(owner, paths, targetCollectionId, source);
+      return startImport(
+        owner,
+        paths,
+        targetCollectionId,
+        source,
+        applyClassification
+      );
     };
 
     render(<App client={client} />);
     await screen.findByText("项目说明");
     await user.click(screen.getAllByRole("button", { name: "导入文档" })[0]);
+    await importKeepingExistingFlow(user);
     expect(
       await screen.findByRole("dialog", { name: "发现重复文档" })
     ).toBeInTheDocument();
@@ -362,6 +397,7 @@ describe("批量导入流程", () => {
     render(<App client={client} />);
     await screen.findByText("项目说明");
     await user.click(screen.getByRole("button", { name: "导入文档" }));
+    await importKeepingExistingFlow(user);
     const decision = await screen.findByRole("dialog", {
       name: "发现重复文档"
     });
@@ -423,6 +459,7 @@ describe("批量导入流程", () => {
     await user.click(within(settings).getByRole("button", { name: "切换" }));
     await waitFor(() => expect(client.calls).toContain(`open:${secondPath}`));
     await user.click(screen.getAllByRole("button", { name: "导入文档" })[0]);
+    await importKeepingExistingFlow(user);
     await waitFor(() => expect(newLibrary?.path).toBe(secondPath));
 
     act(() => {
@@ -481,6 +518,7 @@ describe("批量导入流程", () => {
     render(<App client={client} />);
     await screen.findByText("项目说明");
     await user.click(screen.getByRole("button", { name: "导入文档" }));
+    await importKeepingExistingFlow(user);
     const dialog = await screen.findByRole("dialog", {
       name: "发现重复文档"
     });
@@ -514,6 +552,7 @@ describe("批量导入流程", () => {
     render(<App client={client} />);
     await screen.findByText("项目说明");
     await user.click(screen.getByRole("button", { name: "导入文档" }));
+    await importKeepingExistingFlow(user);
 
     const decisionDialog = await screen.findByRole("dialog", {
       name: "源文件已发生变化"
@@ -563,6 +602,7 @@ describe("批量导入流程", () => {
     await user.click(
       within(emptyLibrary).getByRole("button", { name: "导入文档" })
     );
+    await importKeepingExistingFlow(user);
 
     const failedRow = (
       await screen.findByText("损坏.pdf")
@@ -603,8 +643,141 @@ describe("批量导入流程", () => {
     render(<App client={client} />);
     await screen.findByRole("heading", { name: "空资料库" });
     await user.click(screen.getByRole("button", { name: "导入文件夹" }));
+    await importKeepingExistingFlow(user);
 
     expect(await screen.findByText("资料.pdf")).toBeInTheDocument();
     expect(client.calls).toContain("startImport:C:\\Documents\\待导入");
+  });
+
+  it("asks whether to apply classification rules and applies them when confirmed", async () => {
+    const user = userEvent.setup();
+    const invoice = result("invoice-item", "发票2026.pdf", "imported");
+    const client = new FakeBackendClient({
+      bootstrap,
+      collections: [
+        { id: "inbox", name: "收件箱", parentId: null, isInbox: true, documentCount: 0 },
+        { id: "finance", name: "财务", parentId: null, isInbox: false, documentCount: 0 }
+      ],
+      tags: [{ id: "tag-reimburse", name: "报销", documentCount: 0 }],
+      classificationRules: {
+        [`${library.id}:${library.path}`]: [
+          {
+            id: "rule-invoice",
+            name: "发票归档",
+            enabled: true,
+            position: 1,
+            fileNamePattern: "发票",
+            fileType: "PDF",
+            sourceDirectory: null,
+            collectionId: "finance",
+            tagIds: ["tag-reimburse"]
+          }
+        ]
+      },
+      selectedDocuments: [invoice.sourcePath],
+      startImport: async () => batch("batch-classified", [invoice])
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    await user.click(
+      within(
+        await screen.findByRole("main", { name: "空资料库" })
+      ).getByRole("button", { name: "导入文档" })
+    );
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "是否应用分类规则？"
+    });
+    const row = within(dialog).getByRole("row", { name: /发票2026\.pdf/ });
+    expect(within(row).getByRole("cell", { name: "财务" })).toBeInTheDocument();
+    expect(within(row).getByRole("cell", { name: "报销" })).toBeInTheDocument();
+    expect(
+      within(row).getByRole("cell", { name: "rule-invoice" })
+    ).toBeInTheDocument();
+    expect(client.startImportCalls).toEqual([]);
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "应用分类规则并导入" })
+    );
+
+    await waitFor(() => {
+      expect(client.startImportCalls).toHaveLength(1);
+    });
+    expect(client.startImportCalls[0].applyClassification).toBe(true);
+    expect(client.startImportCalls[0].paths).toEqual([invoice.sourcePath]);
+    expect(await screen.findByText("导入批次已完成")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "是否应用分类规则？" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("imports nothing when the classification prompt is cancelled", async () => {
+    const user = userEvent.setup();
+    const item = result("cancelled-item", "发票.pdf", "imported");
+    const client = new FakeBackendClient({
+      bootstrap,
+      selectedDocuments: [item.sourcePath],
+      startImport: async () => batch("batch-cancelled", [item])
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    await user.click(
+      within(
+        await screen.findByRole("main", { name: "空资料库" })
+      ).getByRole("button", { name: "导入文档" })
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "是否应用分类规则？"
+    });
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "关闭分类预览" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "是否应用分类规则？" })
+      ).not.toBeInTheDocument();
+    });
+    expect(client.startImportCalls).toEqual([]);
+    expect(
+      client.calls.some((call) => call.startsWith("startImport:"))
+    ).toBe(false);
+    expect(screen.queryByLabelText("批量导入进度")).not.toBeInTheDocument();
+  });
+
+  it("pages a large batch in one dialog instead of asking per file", async () => {
+    const user = userEvent.setup();
+    const items = Array.from({ length: 12 }, (_, index) =>
+      result(`bulk-${index + 1}`, `资料-${index + 1}.pdf`, "imported")
+    );
+    const client = new FakeBackendClient({
+      bootstrap,
+      selectedDocuments: items.map((item) => item.sourcePath),
+      startImport: async () => batch("batch-bulk", items)
+    });
+
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "空资料库" });
+    await user.click(
+      within(
+        await screen.findByRole("main", { name: "空资料库" })
+      ).getByRole("button", { name: "导入文档" })
+    );
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "是否应用分类规则？"
+    });
+    expect(within(dialog).getAllByRole("row")).toHaveLength(11);
+    expect(within(dialog).getByText("第 1 / 2 页")).toBeInTheDocument();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "分类预览下一页" })
+    );
+    expect(within(dialog).getAllByRole("row")).toHaveLength(3);
+    expect(within(dialog).getByText("第 2 / 2 页")).toBeInTheDocument();
   });
 });

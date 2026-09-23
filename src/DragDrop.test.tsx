@@ -5,6 +5,7 @@ import {
   screen,
   waitFor
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -52,6 +53,17 @@ const collections: CollectionSummary[] = [
     documentCount: 0
   }
 ];
+
+/**
+ * 拖入文件后先出现「是否应用分类规则」询问；这里选「不应用」，
+ * 走的仍是接入分类规则之前的导入路径（`applyClassification === false`）。
+ */
+async function importKeepingExistingFlow() {
+  const user = userEvent.setup();
+  await user.click(
+    await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+  );
+}
 
 function documentFor(
   id: string,
@@ -329,11 +341,19 @@ describe("资料库拖放", () => {
       expect(projects).toHaveClass("drop-target");
     });
     client.emitFileDrop(paths, { x: 160, y: 90 });
+    await importKeepingExistingFlow();
 
     await waitFor(() => {
       expect(client.calls).toContain(
         "startImport:C:\\Sources\\新增文件.md|C:\\Sources\\待导入文件夹:projects:collectionDrop"
       );
+    });
+    // 拖入的目标集合与「不应用分类规则」的选择都要传给后端。
+    expect(client.startImportCalls.at(-1)).toMatchObject({
+      paths,
+      targetCollectionId: "projects",
+      source: "collectionDrop",
+      applyClassification: false
     });
     Object.defineProperty(document, "elementFromPoint", {
       configurable: true,
@@ -359,6 +379,7 @@ describe("资料库拖放", () => {
     });
 
     client.emitFileDrop(["C:\\Sources\\第一批.pdf"], null);
+    await importKeepingExistingFlow();
     await waitFor(() => {
       expect(
         screen.getByLabelText("批量导入进度")

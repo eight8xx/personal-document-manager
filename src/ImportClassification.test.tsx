@@ -252,6 +252,66 @@ describe("批量导入的分类预览", () => {
     ).toEqual([]);
   });
 
+  it("re-previews before applying and asks for review when the result changed", async () => {
+    const user = userEvent.setup();
+    const client = createClient();
+    const preview = client.previewClassification.bind(client);
+    let previewCalls = 0;
+    client.previewClassification = async (owner, request) => {
+      previewCalls += 1;
+      const response = await preview(owner, request);
+      if (previewCalls === 1) {
+        return response;
+      }
+      // 用户确认前规则发生变化：预计集合与命中规则都变了。
+      return {
+        items: response.items.map((item) => ({
+          ...item,
+          collectionId: "contracts",
+          matchedRuleIds: [...item.matchedRuleIds, "rule-new"]
+        }))
+      };
+    };
+
+    const { onDecide } = renderPreview(client, {
+      paths: ["C:\\QQ\\发票2026.pdf"]
+    });
+    const table = await screen.findByRole("table", { name: "分类预览" });
+    expect(
+      within(within(table).getByRole("row", { name: /发票2026\.pdf/ })).getByRole(
+        "cell",
+        { name: "财务" }
+      )
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "应用分类规则并导入" })
+    );
+
+    // 结果已变化：不静默导入，改为展示最新结果并要求复核。
+    expect(
+      await screen.findByText(
+        "分类规则或文件在预览后发生了变化，已重新计算上面的结果，请复核后再次确认。"
+      )
+    ).toBeInTheDocument();
+    expect(onDecide).not.toHaveBeenCalled();
+    expect(
+      within(within(table).getByRole("row", { name: /发票2026\.pdf/ })).getByRole(
+        "cell",
+        { name: "合同" }
+      )
+    ).toBeInTheDocument();
+
+    // 复核后再次确认：两次预览一致，才真正进入导入。
+    await user.click(
+      screen.getByRole("button", { name: "应用分类规则并导入" })
+    );
+    await waitFor(() => {
+      expect(onDecide).toHaveBeenCalledWith("applyRules");
+    });
+    expect(previewCalls).toBe(3);
+  });
+
   it("shows a retryable error when the preview cannot be computed", async () => {
     const user = userEvent.setup();
     const client = createClient();

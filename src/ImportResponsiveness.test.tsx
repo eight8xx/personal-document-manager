@@ -150,11 +150,16 @@ async function startControlledImport(
   });
 
   await user.click(screen.getAllByRole("button", { name: "导入文档" })[0]);
+  // 导入前先询问是否应用分类规则；这里选「不应用」，保持原有导入路径。
+  await user.click(
+    await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+  );
   await waitFor(() => {
     expect(client.calls.some((call) => call.startsWith("startImport:"))).toBe(
       true
     );
   });
+  expect(client.startImportCalls.at(-1)?.applyClassification).toBe(false);
 }
 
 function progressPanel() {
@@ -323,11 +328,15 @@ describe("批量导入期间的查询响应性", () => {
     ).toBeInTheDocument();
 
     await user.click(screen.getAllByRole("button", { name: "导入文档" })[0]);
+    await user.click(
+      await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+    );
     await waitFor(() => {
       expect(client.calls.some((call) => call.startsWith("startImport:"))).toBe(
         true
       );
     });
+    expect(client.startImportCalls.at(-1)?.applyClassification).toBe(false);
 
     act(() => {
       client.emitImportProgress({

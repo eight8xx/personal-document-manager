@@ -6,13 +6,16 @@ import {
   ShieldAlert,
   Upload
 } from "lucide-react";
-import { useContext, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
 
 import { toBackendError } from "../backend/error";
 import { LibraryContext } from "../backend/libraryContext";
+import { sameLibraryIdentity } from "../backend/libraryIdentity";
 import type {
   BackendClient,
+  ImportItemStatus,
   ReceiveDirectoryListingItem,
+  ReceiveImportLogEntry,
   ReceiveSource,
   ReceiveSourceCandidate,
   ReceiveSourceKind,
@@ -57,6 +60,18 @@ interface ReceiveDirectoryPanelProps {
   client: BackendClient;
 }
 
+/** 接收导入日志一次展示的条数。 */
+export const RECEIVE_IMPORT_LOG_LIMIT = 20;
+
+const IMPORT_STATUS_LABELS: Record<ImportItemStatus, string> = {
+  imported: "已导入",
+  duplicate: "重复跳过",
+  sourceChanged: "来源已变化",
+  failed: "导入失败",
+  ignored: "已忽略",
+  skipped: "已跳过"
+};
+
 function formatTimestamp(value: string | null) {
   if (!value) {
     return "尚未扫描";
@@ -91,6 +106,13 @@ export function ReceiveDirectoryPanel({ client }: ReceiveDirectoryPanelProps) {
     Partial<Record<ReceiveSourceKind, ReceiveSourceScanResult>>
   >({});
   const [reloadToken, setReloadToken] = useState(0);
+  const [importLog, setImportLog] = useState<ReceiveImportLogEntry[]>([]);
+  /** 事件回调里需要按 sourceId 找到来源种类，用 ref 避免因 sources 变化反复重新订阅。 */
+  const sourcesRef = useRef<ReceiveSource[]>([]);
+
+  useEffect(() => {
+    sourcesRef.current = sources;
+  }, [sources]);
 
   useEffect(() => {
     let active = true;
@@ -124,6 +146,94 @@ export function ReceiveDirectoryPanel({ client }: ReceiveDirectoryPanelProps) {
       active = false;
     };
   }, [client, library, reloadToken]);
+
+  /** 来源列表与导入日志都按当前资料库读取。 */
+  const refreshFromBackend = useCallback(async () => {
+    if (!library) {
+      return;
+    }
+    const [nextSources, nextLog] = await Promise.all([
+      client.listReceiveSources(library),
+      client.listReceiveImportLog(library, RECEIVE_IMPORT_LOG_LIMIT)
+    ]);
+    setSources(nextSources);
+    setImportLog(nextLog);
+  }, [client, library]);
+
+  useEffect(() => {
+    let active = true;
+    if (!library) {
+      setImportLog([]);
+      return () => {
+        active = false;
+      };
+    }
+    void client
+      .listReceiveImportLog(library, RECEIVE_IMPORT_LOG_LIMIT)
+      .then((entries) => {
+        if (active) {
+          setImportLog(entries);
+        }
+      })
+      .catch((caught) => {
+        if (active) {
+          setError(toBackendError(caught).message);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [client, library, reloadToken]);
+
+  // 后端补扫完成后推送事件；只接受当前资料库的结果，切换资料库后旧事件一律忽略。
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    if (!library) {
+      return () => {
+        active = false;
+      };
+    }
+    void client
+      .subscribeToReceiveImportCompleted((event) => {
+        if (!active || !sameLibraryIdentity(event.library, library)) {
+          return;
+        }
+        setScanResults((current) => {
+          const next = { ...current };
+          for (const result of event.results) {
+            const source = sourcesRef.current.find(
+              (candidate) => candidate.id === result.sourceId
+            );
+            if (source) {
+              next[source.kind] = result;
+            }
+          }
+          return next;
+        });
+        void refreshFromBackend().catch((caught) => {
+          if (active) {
+            setError(toBackendError(caught).message);
+          }
+        });
+      })
+      .then((stopListening) => {
+        if (active) {
+          unlisten = stopListening;
+        } else {
+          stopListening();
+        }
+      })
+      .catch((caught) => {
+        if (active) {
+          setError(toBackendError(caught).message);
+        }
+      });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [client, library, refreshFromBackend]);
 
   function sourceFor(kind: ReceiveSourceKind) {
     return sources.find((source) => source.kind === kind) ?? null;
@@ -663,6 +773,34 @@ export function ReceiveDirectoryPanel({ client }: ReceiveDirectoryPanelProps) {
           </div>
         );
       })}
+
+      <section className="receive-log" aria-labelledby="receive-log-title">
+        <h4 id="receive-log-title">最近接收导入</h4>
+        {importLog.length === 0 ? (
+          <p className="muted-copy">还没有接收导入记录。</p>
+        ) : (
+          <ul className="receive-log-list" aria-label="接收导入日志">
+            {importLog.map((entry) => (
+              <li key={`${entry.sourcePath}:${entry.createdAt}`}>
+                <div className="receive-log-main">
+                  <strong>{entry.fileName}</strong>
+                  <span className="receive-log-status">
+                    {IMPORT_STATUS_LABELS[entry.status]}
+                  </span>
+                  {entry.collectionId ? (
+                    <span className="muted-copy">{entry.collectionId}</span>
+                  ) : null}
+                </div>
+                {entry.errorMessage ? (
+                  <p className="receive-log-error" role="alert">
+                    {entry.errorMessage}
+                  </p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </section>
   );
 }
