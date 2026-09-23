@@ -6311,12 +6311,15 @@ fn validate_file_content(
     path: &Path,
     capability: &super::formats::DocumentFormatCapability,
 ) -> Result<(), String> {
-    // 压缩文档在导入时就按输入上限拦下，避免把超限文件整份复制进资料库。
+    // 压缩文档与表格文档在导入时就按输入上限拦下，避免把超限文件整份复制进资料库
+    // （也避免 validate_table_file 先把整份超大文件读进内存）。CSV 与 XLSX 用同一个上限，
+    // 与索引、表格分页预览路径的 `ArchiveLimits` 完全一致。
     if matches!(
         capability.validation,
         ValidationStrategy::DocxPackage
             | ValidationStrategy::PptxPackage
             | ValidationStrategy::XlsxPackage
+            | ValidationStrategy::CsvText
     ) {
         let input_bytes = fs::metadata(path)
             .map_err(|error| format!("无法读取文件内容：{error}"))?

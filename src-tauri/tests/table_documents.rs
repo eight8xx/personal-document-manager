@@ -13,7 +13,7 @@ use flate2::Compression;
 use personal_document_manager_lib::library::{
     DocumentPreview, DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResult,
     ImportDecision, ImportItemStatus, LibraryService, LocationStatus, SearchMatchKind,
-    TablePreviewRequest, MAX_TABLE_PREVIEW_COLUMNS, MAX_TABLE_PREVIEW_ROWS,
+    TablePreviewRequest, MAX_ARCHIVE_INPUT_BYTES, MAX_TABLE_PREVIEW_COLUMNS, MAX_TABLE_PREVIEW_ROWS,
 };
 use tempfile::tempdir;
 
@@ -1035,4 +1035,137 @@ fn rejects_legacy_encrypted_and_macro_workbooks_without_blocking_the_batch() {
     for path in rejected {
         assert!(path.is_file(), "源文件保持不变：{}", path.display());
     }
+}
+
+/// 写一个只有 CSV 头、长度恰好为 `size` 的样本：用于表达「超过上限」，
+/// 不真正写入几十 MB 数据（NTFS 上 `set_len` 不会分配实际数据）。
+/// 只能用于**预期在读取内容之前就被拒绝**的样本。
+fn write_sparse_csv(path: &Path, size: u64) {
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(b"name,value\nrow,1\n").unwrap();
+    file.set_len(size).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// 写一份**真实**的、长度正好等于 `MAX_ARCHIVE_INPUT_BYTES` 的合法 CSV。
+/// `"a,b\n"` 正好 4 字节，而上限是 4 的整数倍，因此可以精确对齐边界。
+fn write_valid_csv_at_limit(path: &Path) -> u64 {
+    const LINE: &[u8] = b"a,b\n";
+    let limit = MAX_ARCHIVE_INPUT_BYTES;
+    assert_eq!(limit % LINE.len() as u64, 0, "上限应当是该行长度的整数倍");
+    let mut contents = Vec::with_capacity(limit as usize);
+    while (contents.len() as u64) < limit {
+        contents.extend_from_slice(LINE);
+    }
+    fs::write(path, &contents).unwrap();
+    assert_eq!(fs::metadata(path).unwrap().len(), limit);
+    limit
+}
+
+/// 超限 CSV 必须在**导入校验阶段**就被拒绝：单项失败、可重试、不产生资料库副本。
+#[test]
+fn oversized_csv_is_rejected_at_validation_without_a_library_copy() {
+    let root = tempdir().unwrap();
+    let mut service = open_service(root.path());
+    let oversized = root.path().join("超限.csv");
+    write_sparse_csv(&oversized, MAX_ARCHIVE_INPUT_BYTES + 1);
+
+    let batch = service
+        .start_import(vec![oversized.to_string_lossy().into_owned()])
+        .unwrap();
+    assert_eq!(batch.failed_count, 1, "超限 CSV 应当单项失败：{batch:?}");
+    let item = batch.items.first().unwrap();
+    assert_eq!(item.status, ImportItemStatus::Failed);
+    assert_eq!(
+        item.error_stage.as_deref(),
+        Some("validate"),
+        "应当在导入校验阶段拒绝，而不是等到索引或预览：{item:?}"
+    );
+    let message = item.error_message.clone().unwrap_or_default();
+    assert!(
+        message.contains("超过上限") && message.contains(&MAX_ARCHIVE_INPUT_BYTES.to_string()),
+        "失败原因要说明超限与上限值：{message}"
+    );
+    assert!(item.retryable);
+
+    // 没有任何文档记录，也没有为它创建副本目录。
+    assert!(service.list_documents().unwrap().is_empty());
+    assert_eq!(
+        fs::read_dir(root.path().join("Library").join("documents"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(fs::metadata(&oversized).unwrap().len(), MAX_ARCHIVE_INPUT_BYTES + 1);
+}
+
+/// 超限 CSV 与正常文件同批导入：超限项失败，其他文件照常导入、可搜索。
+#[test]
+fn oversized_csv_does_not_block_the_rest_of_the_batch() {
+    let root = tempdir().unwrap();
+    let mut service = open_service(root.path());
+    let oversized = root.path().join("超限.csv");
+    write_sparse_csv(&oversized, MAX_ARCHIVE_INPUT_BYTES + 1);
+    let healthy_csv = root.path().join("正常.csv");
+    fs::write(&healthy_csv, "名称,数量\n红苹果,3\n").unwrap();
+    let notes = root.path().join("说明.txt");
+    fs::write(&notes, "同批的普通文本正文").unwrap();
+
+    let batch = service
+        .start_import(vec![
+            oversized.to_string_lossy().into_owned(),
+            healthy_csv.to_string_lossy().into_owned(),
+            notes.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+    assert_eq!(batch.imported_count, 2, "同批其他文件应继续导入：{batch:?}");
+    assert_eq!(batch.failed_count, 1);
+
+    service.index_pending_documents().unwrap();
+    assert_eq!(search(&service, "红苹果"), 1);
+    assert_eq!(search(&service, "普通文本正文"), 1);
+    let documents = service.list_documents().unwrap();
+    assert_eq!(documents.len(), 2);
+    assert!(documents.iter().all(|document| document.file_name != "超限.csv"));
+    // 两个成功项各有一个副本目录，失败项没有。
+    assert_eq!(
+        fs::read_dir(root.path().join("Library").join("documents"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(fs::read(&healthy_csv).unwrap(), "名称,数量\n红苹果,3\n".as_bytes());
+    assert_eq!(fs::read(&notes).unwrap(), "同批的普通文本正文".as_bytes());
+}
+
+/// 边界样本：正好等于输入上限的合法 CSV **不会**被误拒（判断是 `>` 而不是 `>=`），
+/// 上限 +1 字节则被拒。
+#[test]
+fn csv_exactly_at_the_input_limit_is_not_rejected() {
+    let root = tempdir().unwrap();
+    let mut service = open_service(root.path());
+    let boundary = root.path().join("边界.csv");
+    let limit = write_valid_csv_at_limit(&boundary);
+
+    // 边界之内：真实导入成功（校验、复制、哈希都按同一上限放行）。
+    let document = service.import_document(&boundary).unwrap();
+    assert_eq!(document.file_size, limit as i64);
+    assert_eq!(document.file_name, "边界.csv");
+
+    // 上限 +1 字节：同一个上限必须在导入校验阶段拒绝。
+    let over = root.path().join("超一点点.csv");
+    write_sparse_csv(&over, limit + 1);
+    let error = service.import_document(&over).unwrap_err();
+    assert!(
+        error.to_string().contains("超过上限"),
+        "上限 +1 字节必须被拒绝：{error}"
+    );
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_dir(root.path().join("Library").join("documents"))
+            .unwrap()
+            .count(),
+        1,
+        "被拒样本不应留下副本目录"
+    );
 }
