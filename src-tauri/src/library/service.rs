@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+﻿use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -5599,6 +5599,21 @@ fn reconcile_document_directory(
         }
     }
 
+    // 孤儿副本目录：副本已经落盘，数据库里却没有任何记录（崩在 rename 与写库之间）。
+    // 必须保守：只搬不删，而且只搬「足够陈旧」的，见 quarantine_orphan_copy。
+    if !had_tombstones && recorded.is_none() {
+        let has_real_copy = entries.iter().any(|entry| {
+            !is_replacement_artifact_name(&entry.file_name())
+                && entry
+                    .file_type()
+                    .map(|file_type| file_type.is_file())
+                    .unwrap_or(false)
+        });
+        if has_real_copy {
+            return quarantine_orphan_copy(library_root, directory_path, document_id);
+        }
+    }
+
     let mut backups = Vec::new();
     let mut temporaries = Vec::new();
     for entry in entries {
@@ -5717,8 +5732,89 @@ fn library_copy_paths(
     Ok(paths)
 }
 
-/// 尽力删除残留，返回**删不掉**的路径（被其它进程占用、只读属性、同步盘持锁等）。
+/// 孤儿副本的隔离区：`documents/<id>/` 里的副本已经落盘、数据库却没有任何记录时，
+/// 把整个目录搬到资料库内的这个目录下，**不删除任何字节**。
+const RECOVERED_ORPHANS_DIR: &str = ".recovered-orphans";
+/// 隔离区里每个孤儿目录附带的说明文件名（便于人工排查后决定是否还原）。
+const ORPHAN_COPY_REPORT_NAME: &str = "orphan-copy-report.txt";
+/// 只有目录内最新的一次修改已经过去这么久，才判定为「崩溃留下的孤儿副本」。
 ///
+/// 保守取舍：新鲜目录可能是**另一个应用实例**正在导入（副本已 rename、事务还没提交），
+/// 搬走它会破坏别人的导入。宁可这次放过、下次打开再判定，也不动可能是活数据的路径。
+const ORPHAN_COPY_STALE_AFTER: Duration = Duration::from_secs(600);
+
+/// 把陈旧的无记录副本目录移进隔离区（只搬不删），并写一份可诊断的说明。
+///
+/// 返回 `Ok(None)`：孤儿目录没有对应的文档记录，不改任何文档状态；
+/// 现场与内容都留在隔离区里由人工处置。
+fn quarantine_orphan_copy(
+    library_root: &Path,
+    directory_path: &Path,
+    document_id: &str,
+) -> LibraryResult<Option<RecoveryFailure>> {
+    let Some(newest) = newest_entry_modified_at(directory_path)? else {
+        return Ok(None);
+    };
+    let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let stale_after = i64::try_from(ORPHAN_COPY_STALE_AFTER.as_nanos()).unwrap_or(i64::MAX);
+    if newest > now_nanos.saturating_sub(stale_after) {
+        // 太新：可能是别的实例正在导入，保留现场不动它。
+        return Ok(None);
+    }
+
+    let quarantine_root = library_root.join(RECOVERED_ORPHANS_DIR);
+    fs::create_dir_all(&quarantine_root)?;
+    let target = free_quarantine_path(&quarantine_root, document_id);
+    fs::rename(directory_path, &target)?;
+
+    // 说明文件是尽力而为：写不进去也不影响「内容已经保住」这个结论。
+    let report = format!(
+        "这个目录是一次中断导入留下的孤儿副本：副本已经写入资料库，但数据库里没有对应记录。\n\
+         为避免误删用户数据，资料库把它原样搬到这里，没有删除任何文件。\n\n\
+         原目录：{}\n\
+         文档 id：{}\n\
+         搬移时间：{}\n\n\
+         确认这里的内容不再需要后，可以手动删除本目录；如果需要，也可以把里面的副本文件\
+         复制出来重新导入。\n",
+        directory_path.display(),
+        document_id,
+        now(),
+    );
+    let _ = fs::write(target.join(ORPHAN_COPY_REPORT_NAME), report);
+    Ok(None)
+}
+
+/// 隔离区内的目标路径；同名时顺延编号，绝不覆盖已有内容。
+fn free_quarantine_path(quarantine_root: &Path, document_id: &str) -> PathBuf {
+    let first = quarantine_root.join(document_id);
+    if !first.exists() {
+        return first;
+    }
+    for index in 2..1000 {
+        let candidate = quarantine_root.join(format!("{document_id}-{index}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    quarantine_root.join(format!("{document_id}-{}", Utc::now().timestamp()))
+}
+
+/// 目录内所有条目里最新的一次修改时间（Unix 纳秒）；空目录返回 `None`。
+fn newest_entry_modified_at(directory: &Path) -> LibraryResult<Option<i64>> {
+    let mut newest: Option<i64> = None;
+    for entry in fs::read_dir(directory)?.filter_map(Result::ok) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Some(modified) = modified_at(&metadata) else {
+            continue;
+        };
+        newest = Some(newest.map_or(modified, |current: i64| current.max(modified)));
+    }
+    Ok(newest)
+}
+
+/// 尽力删除残留，返回**删不掉**的路径（被其它进程占用、只读属性、同步盘持锁等）。///
 /// 清理失败不升级为错误：走到这里时记录的副本已经与 `content_hash` 一致，残留只是冗余备份或
 /// 半成品，删不掉不影响文档可用性。留下现场并在下次打开资料库时重试，好过让整个资料库打不开。
 fn remove_leftover_files(paths: &[PathBuf]) -> Vec<PathBuf> {
