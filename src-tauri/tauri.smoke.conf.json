@@ -1,0 +1,17 @@
+{
+  "productName": "Personal Document Manager Smoke",
+  "identifier": "com.local.personal-document-manager.smoke",
+  "app": {
+    "windows": [
+      {
+        "title": "Personal Document Manager Smoke",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 860,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}
