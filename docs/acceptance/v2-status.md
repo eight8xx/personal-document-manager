@@ -29,18 +29,18 @@
 
 | 套件 | 结果 | 命令 |
 | --- | --- | --- |
-| Rust 全部 | **198 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
+| Rust 全部 | **202 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
 | ├ 单元（含 limits/store/formats/commands 契约与监视退出） | 46 passed | 同上 |
 | ├ `library_service.rs` 集成 | 75 passed | 同上 |
 | ├ `receive_locked_files.rs`（11 文件占用） | 2 passed | 同上 |
-| ├ `receive_sources.rs`（11/12/13 接收目录） | 19 passed | 同上 |
+| ├ `receive_sources.rs`（11/12/13 接收目录 + M3） | 23 passed | 同上 |
 | ├ `reconcile_isolation.rs`（M4 恢复隔离） | 3 passed | 同上 |
 | ├ `recovery_orphans.rs`（L2 孤儿副本） | 2 passed | 同上 |
 | ├ `replacement_recovery.rs`（03） | 10 passed | 同上 |
 | ├ `sparse_column_amplification.rs`（H1 独立复现） | 2 passed | 同上 |
 | ├ `table_documents.rs`（08/09 端到端） | 13 passed | 同上 |
 | └ `table_formats.rs`（08/09 解析层 + H1/L3） | 26 passed | 同上 |
-| 前端全部 | **169 passed（21 文件）** | `npm test` |
+| 前端全部 | **172 passed（21 文件）** | `npm test` |
 | 类型检查 | 通过 | `npm run typecheck` |
 | 前端生产构建 | 通过 | `npm run build` |
 
@@ -91,7 +91,20 @@
 
 当前可复现的部分：`npm run test:native-smoke` 仍能在真实 Windows 窗口中跑通 9/9 步（含 TXT 导入后的集合整理、搜索、预览、回收站与恢复），覆盖标志 `nativeFilePickerCovered`、`libraryWizardCovered`、`importButtonCovered` 均为 `false`，不得据此签收。剩余部分需要：① 人工按文档执行并记录；② 在独立测试机/虚拟机执行；或 ③ 明确接受该条长期未覆盖。
 
-## 五、已知边界（有意保留，未假装解决）
+## 五、人工验收（用户，2026-09-23）
+
+用户在 release 产物上用自己的**真实文档**（含 PDF/DOCX/PPTX/XLSX/CSV）执行了两项验收，**两项均通过、未发现问题**：
+
+| 验收项 | 结果 | 覆盖的内容 |
+| --- | --- | --- |
+| release 程序日常闭环 | 通过 | 安装/启动后完成导入、整理、搜索、预览、回收站等操作 |
+| 表格文档 | 通过 | 导入真实 CSV/XLSX、切换工作表、按行列翻页预览、按单元格文字搜索命中 |
+
+本轮**未覆盖**（保持开放）：接收目录（QQ/微信）配置与自动导入、「关闭期间新增文件重开补导入」、导入前的分类规则询问、资料库切换、替换副本中断重开、release 构建的 10k 性能与长时间滚动内存观察。
+
+**被测二进制与当前源码的关系**：用户测的是 19:57 构建的产物。此后主分支又合入了 M4（中断恢复隔离）、L1（监视线程退出）、L2（孤儿副本隔离）、L3（稀疏表跳行）、M3（待决项界面出口）等修复，`release/` 下的产物已在 20:28 用最终源码重建。也就是说：上面两条通过的结论对「同源功能」成立，但没有覆盖那五项后加的修复；如需对最终二进制复测，建议至少再走一遍表格文档与日常闭环。
+
+## 六、已知边界（有意保留，未假装解决）
 
 - **单文件粒度**：让步粒度是「每项」，单个超大文件处理期间读取仍会等这一项，不会等整批。
 - **PDF 侧解压上限**：04 只覆盖 DOCX/PPTX/XLSX 的压缩包读取；`extract_pdf_text` 与 `pdf_security.rs` 的流解码仍无统一上限，需要时另开工作单。
@@ -108,8 +121,9 @@
 - **孤儿副本的隔离区**：崩溃后「副本已落盘、数据库未写入」留下的孤儿目录，打开资料库时会被整体移到 `<资料库>/.recovered-orphans/<id>/`（**只搬不删**，附 `orphan-copy-report.txt` 说明如何还原）；只搬目录内最新 mtime 超过 10 分钟的，避免打断另一实例正在进行的导入。诊断同样只在磁盘说明文件上，界面无提示。
 - **代码审查待办**：`docs/acceptance/v2-review.md` 列出的问题中，H1/H2/M4 已修复并验证，L1/L2/L3 中 L1/L2 已修复、L3 后端已交付（前端在 task-20），M3 已扩展契约（后端 task-18、前端已交付）。
 
-## 六、未完成项
+## 七、未完成项
 
 - [ ] 工作单 07 的原生交互验收（见第四节）。
-- [ ] 工作单 14：release 构建的**真实安装与运行验收**、用户真实 PDF/DOCX/PPTX/XLSX/CSV 样本、QQ/微信实际配置与长期使用观察。自动化部分（175 项 Rust、159 项前端、debug 下 10k 规模闭环、release 产物构建）已在本报告第二节与上方「一万份资料库」给出。
+- [ ] 工作单 14 剩余部分：接收目录（QQ/微信）配置与自动导入、关闭期间新增文件补导入、导入前分类询问、资料库切换、替换副本中断重开、release 构建的 10k 性能与长时间滚动内存观察、对最终二进制的复测。
+- [ ] 工作单 14 已完成的部分：release 程序日常闭环与真实 CSV/XLSX 表格文档（见第五节）。
 - [ ] 发布产物：`release/` 下的安装包与便携版需重新生成（`npm run package:windows`），当前工作副本内不存在。
