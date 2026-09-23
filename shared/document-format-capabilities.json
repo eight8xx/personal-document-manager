@@ -152,5 +152,49 @@
       "sourceMutation": "blocked",
       "externalNavigation": "userInitiated"
     }
+  },
+  {
+    "id": "csv",
+    "displayType": "CSV",
+    "extensions": ["csv"],
+    "importEnabled": true,
+    "validation": "csvText",
+    "preview": "tablePaged",
+    "thumbnail": "typeIcon",
+    "textExtraction": "tableText",
+    "searchable": true,
+    "mediaType": "text/csv",
+    "renderer": "localTableReader",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
+  },
+  {
+    "id": "xlsx",
+    "displayType": "XLSX",
+    "extensions": ["xlsx"],
+    "importEnabled": true,
+    "validation": "xlsxPackage",
+    "preview": "tablePaged",
+    "thumbnail": "typeIcon",
+    "textExtraction": "tableText",
+    "searchable": true,
+    "mediaType": null,
+    "renderer": "localTableReader",
+    "security": {
+      "macros": "blocked",
+      "scripts": "blocked",
+      "embeddedObjects": "blocked",
+      "remoteResources": "blocked",
+      "mediaAutoplay": "blocked",
+      "sourceMutation": "blocked",
+      "externalNavigation": "userInitiated"
+    }
   }
 ]
