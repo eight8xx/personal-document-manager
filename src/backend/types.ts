@@ -431,6 +431,13 @@ export interface ReceiveImportLogEntry {
   matchedRuleIds: string[];
   errorMessage: string | null;
   createdAt: string;
+  /**
+   * 来源内容变化产生的待决项标识；只有 `status === "sourceChanged"` 且未处理时有值。
+   * 界面用它调用 `resolveImportItem` 决定「新建文档」还是「替换已有文档」。
+   */
+  itemId?: string | null;
+  /** 待决项被处理的时间；有值表示这条待决已经结束，不再计入「待处理」。 */
+  resolvedAt?: string | null;
 }
 
 export interface DocumentSearchFilters {
