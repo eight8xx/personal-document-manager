@@ -69,6 +69,11 @@ const MAX_TEXT_READ_BYTES: u64 = MAX_EXTRACTED_TEXT_CHARS as u64 * 4 + 4;
 const DEFAULT_TABLE_PREVIEW_COLUMNS: usize = 16;
 /// 首次启用接收目录时一次列出的文件数上限，避免超大目录拖慢界面。
 const MAX_RECEIVE_LISTING_ITEMS: usize = 500;
+/// 用户在清单里完成选择时，最多为多少个「未勾选的既有文件」写入跳过记录。
+///
+/// 这是一次性的安全操作（清单只展示前 500 条，剩下的必须显式记为跳过，否则会被静默导入），
+/// 上限取得比清单高得多，避免同一类漏洞在更大目录上重演。
+const MAX_RECEIVE_SKIP_ENUMERATION: usize = 50_000;
 /// 接收目录扫描的递归深度上限（QQ 的 FileRecv 常有按日期分层的子目录）。
 const MAX_RECEIVE_SCAN_DEPTH: usize = 4;
 /// 失败项在周期补扫里自动重试前的冷却时间（秒），避免刷日志。
@@ -4128,10 +4133,7 @@ impl LibraryService {
         if let Some(source) = target {
             if path_changed {
                 // 重新定位后必须重新走一次「首次清单」，未确认前不自动导入既有文件。
-                connection.execute(
-                    "UPDATE receive_sources SET last_scanned_at = NULL, updated_at = ?2 WHERE id = ?1",
-                    params![&source.id, now()],
-                )?;
+                store::clear_receive_source_scan_state(connection, &source.id)?;
             }
         }
         self.list_receive_sources()
@@ -4223,10 +4225,13 @@ impl LibraryService {
         if !source.enabled {
             return Ok(Vec::new());
         }
-        // 首次启用或刚重新定位的来源要等用户在清单里做完选择，补扫不自动导入既有文件。
-        if source.last_scanned_at.is_none() {
+        // 用户还没做完首次选择（或刚重新定位）时不自动导入任何既有文件。
+        // 做完选择后，目录内没被勾选的既有文件都已记为「明确跳过」，
+        // 因此补扫只会看到首次确认之后新到的文件（清单 500 条上限不再造成静默导入）。
+        let Some(_watermark) = store::receive_source_first_scan_watermark(connection, source_id)?
+        else {
             return Ok(Vec::new());
-        }
+        };
         let Some(path) = source.path.clone() else {
             return Ok(Vec::new());
         };
@@ -4241,21 +4246,27 @@ impl LibraryService {
             if store::is_source_skipped(connection, source_id, &file_path)? {
                 continue;
             }
-            if let Some((status, created_at)) = history.get(&file_path) {
-                let retry = match status {
-                    // 已导入过的文件只在源文件确实变化时再尝试（内容变化 → 待决项）。
-                    ImportItemStatus::Imported | ImportItemStatus::Duplicate => {
-                        source_file_changed(connection, &file_path, &file)?
+            match history.get(&file_path) {
+                Some((status, created_at)) => {
+                    let retry = match status {
+                        // 已导入过的文件只在源文件确实变化时再尝试（内容变化 → 待决项）。
+                        ImportItemStatus::Imported | ImportItemStatus::Duplicate => {
+                            source_file_changed(connection, &file_path, &file)?
+                        }
+                        // 失败项：周期补扫等冷却，用户主动重试立即放行。
+                        ImportItemStatus::Failed => {
+                            retry_failed || created_at.as_str() <= receive_retry_cutoff().as_str()
+                        }
+                        // 待决项等用户决定，已跳过/忽略的不再自动导入。
+                        _ => false,
+                    };
+                    if !retry {
+                        continue;
                     }
-                    // 失败项：周期补扫等冷却，用户主动重试立即放行。
-                    ImportItemStatus::Failed => {
-                        retry_failed || created_at.as_str() <= receive_retry_cutoff().as_str()
-                    }
-                    // 待决项等用户决定，已跳过/忽略的不再自动导入。
-                    _ => false,
-                };
-                if !retry {
-                    continue;
+                }
+                None => {
+                    // 既有但没被展示/勾选的文件已经在选择时记为跳过；能走到这里的都是
+                    // 首次确认之后新到（或改名出现）的文件，按既有语义导入。
                 }
             }
             pending.push(file_path);
@@ -4270,6 +4281,34 @@ impl LibraryService {
     ) -> LibraryResult<Vec<ReceiveImportLogEntry>> {
         let connection = self.library_connection()?;
         store::list_import_log(connection, limit.clamp(1, 500))
+    }
+
+    /// 开始一批**用户在首次清单里选择**的接收导入。
+    ///
+    /// 选择即声明：此时目录内所有受支持的、用户没勾选的文件都会被记为「明确跳过」——
+    /// 清单有 500 条上限，不这样做的话第 501 个之后的既有文件既没展示也没记录，
+    /// 会被周期补扫静默导入。补扫/监视自己的批量导入走
+    /// [`Self::begin_receive_import_batch`]，不会写入跳过记录。
+    pub fn begin_receive_selection_batch(
+        &mut self,
+        source_id: &str,
+        selected: Vec<String>,
+    ) -> LibraryResult<ImportProgress> {
+        let connection = self.library_connection()?;
+        let source = load_receive_source(connection, source_id)?;
+        if let Some(root) = source.path.clone().map(PathBuf::from).filter(|p| p.is_dir()) {
+            let selected_set = selected.iter().cloned().collect::<HashSet<_>>();
+            let unselected = collect_receive_files(&root, MAX_RECEIVE_SCAN_DEPTH)
+                .into_iter()
+                .take(MAX_RECEIVE_SKIP_ENUMERATION)
+                .map(|path| path.to_string_lossy().into_owned())
+                .filter(|path| !selected_set.contains(path))
+                .collect::<Vec<_>>();
+            let transaction = connection.unchecked_transaction()?;
+            store::record_skipped_sources(connection, source_id, &unselected, &now())?;
+            transaction.commit()?;
+        }
+        self.begin_receive_import_batch(source_id, selected)
     }
 
     /// 结束一批接收导入：汇总计数、更新来源状态并写回扫描时间。
@@ -4543,11 +4582,13 @@ fn receive_status_to_str(status: ReceiveSourceStatus) -> &'static str {
 }
 
 fn mark_receive_source_scanned(connection: &Connection, source_id: &str) -> LibraryResult<()> {
-    connection.execute(
-        "UPDATE receive_sources SET last_scanned_at = ?2, updated_at = ?2 WHERE id = ?1",
-        params![source_id, now()],
-    )?;
-    Ok(())
+    // 水位与 `modified_at` 同单位（Unix 纳秒），否则「文件比水位新」的判断会失真。
+    store::confirm_receive_source_first_scan(
+        connection,
+        source_id,
+        &now(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+    )
 }
 
 /// 校验确认的接收目录：必须是可访问的文件夹，且与资料库互不包含。

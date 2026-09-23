@@ -990,3 +990,90 @@ fn rules_can_match_by_source_directory() {
     assert_eq!(preview.items[0].collection_id, inbox_id(&service));
 }
 
+/// H2 回归：首次清单被截断（500 条）时，**没在清单里出现过的既有文件**不得被补扫自动导入。
+///
+/// 这条用例刻意按界面的真实顺序走：先读清单（拿到被截断的那一份），只对它里面的文件做
+/// 「跳过未选 / 导入所选」，再补扫。旧 helper 把目录全量当成清单传进去，正是它掩盖了这个洞。
+#[test]
+fn truncated_first_listing_never_leaks_files_into_automatic_import() {
+    let root = tempdir().unwrap();
+    let (mut service, _library_dir) = setup(root.path());
+    let dir = receive_dir(root.path(), "qq-many");
+    // 520 个受支持文件 > 清单上限 500：后 20 个永远不会出现在首次清单里。
+    let total: usize = 520;
+    for index in 0..total {
+        fs::write(dir.join(format!("消息-{index:03}.txt")), format!("正文 {index}")).unwrap();
+    }
+
+    let sources = service
+        .upsert_receive_source(
+            None,
+            ReceiveSourceInput {
+                kind: ReceiveSourceKind::Qq,
+                display_name: "QQ".to_string(),
+                path: dir.to_string_lossy().into_owned(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+    let source_id = sources[0].id.clone();
+
+    // 界面读到的就是这份被截断的清单。
+    let listing = service.list_receive_directory_files(&source_id).unwrap();
+    assert_eq!(
+        listing.items.len(),
+        500,
+        "清单应当仍是 500 条上限（不是把上限调大）"
+    );
+    let listed = listing
+        .items
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let selected = listed[0].clone();
+    let skipped = listed[1..].to_vec();
+    assert!(!skipped.is_empty());
+
+    // 界面顺序：先把未勾选的记为已跳过，再导入勾选的文件（命令层走
+    // `begin_receive_selection_batch`，会把清单没展示到的既有文件一并记为跳过）。
+    service
+        .skip_receive_directory_files(personal_document_manager_lib::library::ReceiveDirectoryOperation {
+            source_id: source_id.clone(),
+            paths: skipped,
+        })
+        .unwrap();
+    let first = service
+        .begin_receive_selection_batch(&source_id, vec![selected.clone()])
+        .unwrap();
+    let batch_id = first.batch_id.clone();
+    while service.peek_import_progress(&batch_id).unwrap().is_some() {
+        service.import_batch_step(&batch_id).unwrap();
+    }
+    service.finish_receive_import_batch(&batch_id).unwrap();
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+
+    // 关键断言：补扫不会导入任何没出现在清单里的既有文件。
+    let results = scan_and_import(&mut service);
+    assert!(
+        results.is_empty(),
+        "被截断没展示的既有文件不应被自动导入：{results:?}"
+    );
+    let documents = service.list_documents().unwrap();
+    assert_eq!(documents.len(), 1, "只应有用户勾选的那一份：{documents:?}");
+    assert_eq!(documents[0].file_name, "消息-000.txt");
+
+    // 运行期间新增的文件仍然照常自动导入（水位之后的文件）。
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let fresh = dir.join("新到的消息.txt");
+    fs::write(&fresh, "新到的正文").unwrap();
+    let results = scan_and_import(&mut service);
+    assert_eq!(results.len(), 1, "水位之后的新文件应当自动导入：{results:?}");
+    assert_eq!(results[0].imported_count, 1);
+    assert_eq!(service.list_documents().unwrap().len(), 2);
+
+    // 再次补扫仍然不会把被截断的既有文件带进来。
+    assert!(scan_and_import(&mut service).is_empty());
+    assert_eq!(service.list_documents().unwrap().len(), 2);
+}
+
+

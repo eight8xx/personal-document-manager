@@ -51,6 +51,7 @@ pub(super) fn initialize_store_schema(connection: &Connection) -> LibraryResult<
             status TEXT NOT NULL,
             status_message TEXT,
             last_scanned_at TEXT,
+            first_scan_confirmed_at INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -85,7 +86,87 @@ pub(super) fn initialize_store_schema(connection: &Connection) -> LibraryResult<
             ON receive_import_log(created_at DESC, id DESC);
         ",
     )?;
+    // 旧资料库的 receive_sources 建表时还没有「首次确认水位」列，这里补一次迁移。
+    ensure_column(
+        connection,
+        "receive_sources",
+        "first_scan_confirmed_at",
+        "INTEGER",
+    )?;
     Ok(())
+}
+
+/// 幂等补列：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列。
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    kind: &str,
+) -> LibraryResult<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if names.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+    Ok(())
+}
+
+/// 记录「首次确认水位」与最近扫描时间。
+///
+/// 水位只写一次（`COALESCE`）：它标记用户在首次清单里做完选择的那一刻，单位是 Unix 纳秒
+/// （与 `modified_at` 相同）。之后的补扫只自动导入**水位之后**新增或修改过的文件；
+/// 清单被截断没展示到的既有文件因此不会被静默导入。
+pub(super) fn confirm_receive_source_first_scan(
+    connection: &Connection,
+    source_id: &str,
+    timestamp: &str,
+    watermark: i64,
+) -> LibraryResult<()> {
+    connection.execute(
+        "UPDATE receive_sources
+            SET last_scanned_at = ?2,
+                first_scan_confirmed_at = COALESCE(first_scan_confirmed_at, ?3),
+                updated_at = ?2
+          WHERE id = ?1",
+        params![source_id, timestamp, watermark],
+    )?;
+    Ok(())
+}
+
+/// 读取首次确认水位（Unix 纳秒，与 `modified_at` 同单位）；`None` 表示用户还没做完首次选择。
+pub(super) fn receive_source_first_scan_watermark(
+    connection: &Connection,
+    source_id: &str,
+) -> LibraryResult<Option<i64>> {
+    let watermark: Option<Option<i64>> = connection
+        .query_row(
+            "SELECT first_scan_confirmed_at FROM receive_sources WHERE id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(watermark.flatten())
+}
+
+/// 来源重新定位后清空扫描状态：新目录必须重新走一次「首次清单」。
+pub(super) fn clear_receive_source_scan_state(
+    connection: &Connection,
+    source_id: &str,
+) -> LibraryResult<()> {
+    connection.execute(
+        "UPDATE receive_sources
+            SET last_scanned_at = NULL, first_scan_confirmed_at = NULL, updated_at = ?2
+          WHERE id = ?1",
+        params![source_id, now_timestamp()],
+    )?;
+    Ok(())
+}
+
+fn now_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// 读取当前资料库的分类规则，按用户顺序返回。

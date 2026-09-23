@@ -28,6 +28,32 @@ use super::limits::{
 /// CSV 逻辑上只有一张工作表，名称固定。
 pub const CSV_SHEET_NAME: &str = "CSV";
 
+/// Excel 允许的最大列索引（`XFD`，0 基）：16384 列。
+///
+/// 单元格引用超过它就是畸形文件；不设这个上界时，`<c r="ZZZZZ1">` 这类引用会按列号
+/// 补空单元格，几百字节的 XML 就能放大出 GB 级内存。
+pub const MAX_XLSX_COLUMN_INDEX: usize = 16_383;
+
+/// CSV 索引期最多读取的列数。
+///
+/// CSV 行是稠密的：按列号保留会让「单个超宽行」（一行几百万个逗号）按列数放大内存，
+/// 所以索引期把 CSV 的列收在 256 以内（覆盖现实中几乎全部数据表宽度，正文另有字符上限）。
+/// XLSX 是稀疏的，不用这个上限：靠 Excel 的 XFD 上界与单元格预算约束，
+/// 见 [`MAX_XLSX_COLUMN_INDEX`] 与 [`MAX_TABLE_INDEX_CELLS`]。
+pub const MAX_TABLE_INDEX_COLUMNS: usize = 256;
+
+/// 索引期最多保留的单元格数（所有工作表累计到单次提取）。
+///
+/// 稀疏保留（只留有值单元格、不按列号补空）已经消除了「按列号放大工作量」，
+/// 但一个合法工作簿仍可能有上百万个有值单元格；再用这个预算把总量限住
+/// （约 200k 个单元格 × 每格几十字节 ≈ 数 MB）。正文最终还会按
+/// `MAX_EXTRACTED_TEXT_CHARS` 截断，两者口径一致：超预算的单元格只统计、不保留。
+pub const MAX_TABLE_INDEX_CELLS: usize = 200_000;
+
+/// 预览路径的单元格预算：预览行列本来就被 clamp 过（上限 500×64），
+/// 这里留一点余量，保证预览永远不会因为预算而被截断。
+pub const MAX_TABLE_PREVIEW_CELLS: usize = 40_000;
+
 /// 公式缺少缓存值时的可理解表示。该文本只用于显示，不进入文本索引。
 pub const UNCACHED_FORMULA_TEXT: &str = "未缓存";
 
@@ -90,7 +116,12 @@ pub fn read_csv_table(
 
     let (start_row, rows_requested, columns) =
         clamp_table_range(start_row, row_count, column_count);
-    let parsed = parse_csv_rows(&text, Some((start_row, rows_requested)), columns);
+    let parsed = parse_csv_rows(
+        &text,
+        Some((start_row, rows_requested)),
+        columns,
+        MAX_TABLE_PREVIEW_CELLS,
+    );
     let degraded = csv_degradations(&parsed);
     let total_rows = parsed.total_rows;
     let max_columns = parsed.max_columns;
@@ -146,6 +177,7 @@ pub fn read_xlsx_table(
         &shared,
         (start_row, rows_requested),
         columns,
+        MAX_TABLE_PREVIEW_CELLS,
         "XLSX",
     )?;
 
@@ -198,7 +230,7 @@ pub fn extract_table_text(bytes: &[u8], file_type: &str) -> LibraryResult<String
             budget.check_input_size(bytes.len() as u64)?;
             let (text, _) = decode_csv_text(bytes)?;
             budget.charge(CSV_SHEET_NAME, text.len())?;
-            let parsed = parse_csv_rows(&text, None, usize::MAX);
+            let parsed = parse_csv_rows(&text, None, MAX_TABLE_INDEX_COLUMNS, MAX_TABLE_INDEX_CELLS);
             let mut joined = String::new();
             for row in &parsed.rows {
                 append_row_text(&mut joined, row);
@@ -223,7 +255,8 @@ pub fn extract_table_text(bytes: &[u8], file_type: &str) -> LibraryResult<String
                     &sheet_xml,
                     &shared,
                     (0, usize::MAX),
-                    usize::MAX,
+                    0,
+                    MAX_TABLE_INDEX_CELLS,
                     "XLSX",
                 )?;
                 for row in &parsed.rows {
@@ -369,8 +402,9 @@ fn parse_csv_rows(
     text: &str,
     window: Option<(usize, usize)>,
     column_limit: usize,
+    cell_budget: usize,
 ) -> CsvParseOutcome {
-    let mut builder = CsvBuilder::new(window, column_limit);
+    let mut builder = CsvBuilder::new(window, column_limit, cell_budget);
     let mut characters = text.chars().peekable();
 
     while let Some(character) = characters.next() {
@@ -432,13 +466,16 @@ struct CsvBuilder {
     row_has_content: bool,
     in_quotes: bool,
     store_all: bool,
+    /// 保留单元格的总预算与已用量；超预算后只统计不保留。
+    cell_budget: usize,
+    retained_cells: usize,
     window_start: usize,
     window_rows: usize,
     column_limit: usize,
 }
 
 impl CsvBuilder {
-    fn new(window: Option<(usize, usize)>, column_limit: usize) -> Self {
+    fn new(window: Option<(usize, usize)>, column_limit: usize, cell_budget: usize) -> Self {
         let (store_all, window_start, window_rows) = match window {
             Some((start, rows)) => (false, start, rows),
             None => (true, 0, usize::MAX),
@@ -459,6 +496,8 @@ impl CsvBuilder {
             window_start,
             window_rows,
             column_limit,
+            cell_budget,
+            retained_cells: 0,
         }
     }
 
@@ -522,10 +561,14 @@ impl CsvBuilder {
         self.end_field();
         let index = self.total_rows;
         self.total_rows += 1;
+        // 累计保留的单元格进预算：超预算后只统计行号，不再保留内容（索引文本已有字符上限）。
+        let within_budget = self.retained_cells < self.cell_budget;
         if (self.store_all
             || (index >= self.window_start && index - self.window_start < self.window_rows))
             && !self.row.is_empty()
+            && within_budget
         {
+            self.retained_cells += self.row.len();
             self.row_numbers.push(index);
             self.rows.push(std::mem::take(&mut self.row));
         } else {
@@ -1242,7 +1285,12 @@ struct SheetParser<'a> {
     columns: usize,
     current_row: Option<usize>,
     last_column: Option<usize>,
-    row_cells: Vec<String>,
+    /// 当前行里**有值**的单元格：`(列索引, 文本)`，按列顺序。
+    ///
+    /// 故意不按列号补空字符串：稀疏表把值写在很靠右的列（Excel 合法列到 XFD）时，
+    /// 补空会按列号放大工作量（旧实现里 `r="ZZZZZ1"` 的 1.6 KB 样本要跑 3.6 秒）。
+    /// 需要稠密行的调用方在 [`Self::finish_row`] 里按请求范围补齐。
+    row_cells: Vec<(usize, String)>,
     cell: Option<OpenCell>,
     max_row_index: Option<usize>,
     max_column_index: Option<usize>,
@@ -1250,6 +1298,9 @@ struct SheetParser<'a> {
     row_numbers: Vec<usize>,
     uncached_formulas: usize,
     truncated_cells: usize,
+    /// 保留单元格的总预算与已用量；超预算后只统计不保留。
+    cell_budget: usize,
+    retained_cells: usize,
 }
 
 impl SheetParser<'_> {
@@ -1350,21 +1401,16 @@ impl SheetParser<'_> {
                 self.max_column_index
                     .map_or(cell.column, |current| current.max(cell.column)),
             );
-            if self.in_window(row_index) {
-                if self.columns > 0 && self.row_cells.len() < self.columns {
-                    while self.row_cells.len() < cell.column && self.row_cells.len() < self.columns {
-                        self.row_cells.push(String::new());
-                    }
-                    if cell.column < self.columns {
-                        let value = self.truncate_cell(value);
-                        self.row_cells.push(value);
-                    }
-                }
+            // 预览路径只保留请求列范围内（≤ 64 列）的单元格，索引路径（`columns == 0`）
+            // 保留全部有值单元格；两者都计入单元格预算。
+            let within_columns = self.columns == 0 || cell.column < self.columns;
+            if self.in_window(row_index) && within_columns && self.retained_cells < self.cell_budget {
+                let value = self.truncate_cell(value);
+                self.row_cells.push((cell.column, value));
             }
         }
         Ok(())
     }
-
     fn truncate_cell(&mut self, value: String) -> String {
         if value.len() > MAX_TABLE_CELL_CHARS && value.chars().count() > MAX_TABLE_CELL_CHARS {
             self.truncated_cells += 1;
@@ -1379,13 +1425,40 @@ impl SheetParser<'_> {
             .is_some_and(|row_index| self.in_window(row_index))
             && !self.row_cells.is_empty()
         {
-            self.row_numbers
-                .push(self.current_row.unwrap_or_default());
-            self.rows.push(std::mem::take(&mut self.row_cells));
+            self.retained_cells += self.row_cells.len();
+            let dense = self.materialize_row();
+            if !dense.is_empty() {
+                self.row_numbers
+                    .push(self.current_row.unwrap_or_default());
+                self.rows.push(dense);
+            }
         }
         self.row_cells.clear();
         self.cell = None;
         self.last_column = None;
+    }
+
+    /// 把稀疏的有值单元格变成一行稠密单元格。
+    ///
+    /// `columns == 0` 表示「只取值、不补空」：索引路径只关心文字，位置无关，
+    /// 这样远列的值照样进索引，而且不会按列号补空。预览路径给出请求的列上限，
+    /// 补齐只发生在这个上限之内（`clamp_table_range` 已把它收在 64 以内）。
+    fn materialize_row(&self) -> Vec<String> {
+        let mut dense = Vec::new();
+        for (column, value) in &self.row_cells {
+            if self.columns == 0 {
+                dense.push(value.clone());
+                continue;
+            }
+            if *column >= self.columns || dense.len() >= self.columns {
+                continue;
+            }
+            while dense.len() < *column {
+                dense.push(String::new());
+            }
+            dense.push(value.clone());
+        }
+        dense
     }
 
     fn finish(self) -> SheetParse {
@@ -1406,6 +1479,7 @@ fn parse_sheet_xml(
     shared: &SharedStrings,
     window: (usize, usize),
     columns: usize,
+    cell_budget: usize,
     format: &str,
 ) -> LibraryResult<SheetParse> {
     let mut parser = SheetParser {
@@ -1423,6 +1497,8 @@ fn parse_sheet_xml(
         row_numbers: Vec::new(),
         uncached_formulas: 0,
         truncated_cells: 0,
+        cell_budget,
+        retained_cells: 0,
     };
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -1609,6 +1685,14 @@ fn cell_reference_column(reference: &str) -> LibraryResult<Option<usize>> {
     if !saw_letter {
         return Err(LibraryError::ImportFile(format!(
             "XLSX 结构无效：单元格引用 {reference} 缺少列字母。"
+        )));
+    }
+    // Excel 的列只到 XFD（第 16384 列）。超过它就是畸形引用：旧实现会按列号补空单元格，
+    // 几百字节的 XML 就能放大出 GB 级内存（例如 r="ZZZZZ1"）。
+    if column - 1 > MAX_XLSX_COLUMN_INDEX {
+        return Err(LibraryError::ImportFile(format!(
+            "XLSX 结构无效：单元格引用 {reference} 的列号超过 Excel 上限 XFD（{} 列）。",
+            MAX_XLSX_COLUMN_INDEX + 1
         )));
     }
     Ok(Some(column - 1))

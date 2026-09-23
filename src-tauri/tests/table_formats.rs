@@ -10,7 +10,7 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use personal_document_manager_lib::library::table::{
     extract_table_text, read_csv_table, read_xlsx_table, validate_table_document,
-    UNCACHED_FORMULA_TEXT,
+    MAX_TABLE_INDEX_CELLS, MAX_XLSX_COLUMN_INDEX, UNCACHED_FORMULA_TEXT,
 };
 use personal_document_manager_lib::library::{
     ArchiveLimits, MAX_EXTRACTED_TEXT_CHARS, MAX_TABLE_PREVIEW_COLUMNS, MAX_TABLE_PREVIEW_ROWS,
@@ -526,6 +526,60 @@ fn xlsx_pages_ranges_and_reports_has_more_rows() {
     assert_eq!(last.start_row, 100);
     assert_eq!(last.cells[0][0], "数据101列1");
     assert_eq!(last.cells[19][0], "数据120列1");
+}
+
+/// 超过 Excel 上限（XFD，第 16384 列）的引用是畸形文件：必须报错，而不是按列号补空单元格。
+/// 合法上限 XFD 本身仍然接受。
+#[test]
+fn xlsx_rejects_column_references_beyond_the_excel_limit() {
+    let beyond = worksheet_xml(r#"<row r="1"><c r="ZZZZZ1" t="str"><v>x</v></c></row>"#);
+    let package = xlsx_fixture(&["越界"], &[beyond], None, &[]);
+    let error = read_xlsx_table(&package, 0, 0, 10, 8, preview_limits()).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("XFD") || message.contains("列号"),
+        "畸形列引用要给出可理解原因：{message}"
+    );
+
+    let legal = worksheet_xml(r#"<row r="1"><c r="XFD1" t="str"><v>x</v></c></row>"#);
+    let package = xlsx_fixture(&["上限列"], &[legal], None, &[]);
+    let range = read_xlsx_table(&package, 0, 0, 10, 8, preview_limits()).unwrap();
+    assert_eq!(range.sheets[0].column_count, Some(MAX_XLSX_COLUMN_INDEX + 1));
+}
+
+/// 索引路径：稀疏远列不放大工作量（由独立复现用例覆盖），这里补「单元格预算」的有界性——
+/// 有值单元格超过预算后只统计不保留，索引文本不会随单元格总数线性膨胀。
+#[test]
+fn xlsx_index_path_bounds_retained_cells() {
+    // 3000 行 × 80 列 = 240,000 个有值单元格，超过 MAX_TABLE_INDEX_CELLS（200,000）。
+    let mut sheet_data = String::new();
+    for row in 1..=3000 {
+        sheet_data.push_str(&format!("<row r=\"{row}\">"));
+        for _ in 0..80 {
+            sheet_data.push_str("<c><v>m</v></c>");
+        }
+        sheet_data.push_str("</row>");
+    }
+    let total_cells = 3000 * 80;
+    let package = xlsx_fixture(&["大表"], &[worksheet_xml(&sheet_data)], None, &[]);
+
+    let started = std::time::Instant::now();
+    let text = extract_table_text(&package, "XLSX").unwrap();
+    let elapsed = started.elapsed();
+    let retained = text.matches('m').count();
+    assert!(retained > 0, "预算内的单元格必须照常进索引");
+    assert!(
+        retained < total_cells,
+        "超过预算后应停止保留：保留 {retained} / 共 {total_cells}"
+    );
+    assert!(
+        retained <= MAX_TABLE_INDEX_CELLS + 256,
+        "保留量应受预算约束，实际 {retained}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "有界样本不应慢到异常：{elapsed:?}"
+    );
 }
 
 #[test]

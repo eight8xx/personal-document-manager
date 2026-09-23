@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, MutexGuard,
@@ -176,16 +176,24 @@ impl Drop for ReceiveDirectoryMonitor {
 }
 
 /// 按文件分步导入一批接收文件：每一步单独加锁，出错时丢弃批次状态。
+///
+/// `selection` 为真表示这是用户在清单里的选择（未勾选的既有文件会被记为跳过），
+/// 补扫/监视自己的批量导入传假。
 pub(crate) fn drive_receive_import(
     service: &Arc<Mutex<LibraryService>>,
     library: &LibrarySummary,
     source_id: &str,
     paths: Vec<String>,
+    selection: bool,
 ) -> LibraryResult<ReceiveSourceScanResult> {
     let first = {
         let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
         service.ensure_current_library(library)?;
-        service.begin_receive_import_batch(source_id, paths)?
+        if selection {
+            service.begin_receive_selection_batch(source_id, paths)?
+        } else {
+            service.begin_receive_import_batch(source_id, paths)?
+        }
     };
     let batch_id = first.batch_id.clone();
 
@@ -249,7 +257,7 @@ fn run_receive_scan(
         if pending.is_empty() {
             continue;
         }
-        results.push(drive_receive_import(service, library, &source.id, pending)?);
+        results.push(drive_receive_import(service, library, &source.id, pending, false)?);
     }
     Ok(results)
 }
@@ -1392,6 +1400,7 @@ pub async fn apply_receive_directory_selection(
             &library,
             &operation.source_id,
             operation.paths,
+            true,
         )
         .map_err(CommandError::from)
     })
@@ -2787,6 +2796,7 @@ mod tests {
             &library,
             &source_id,
             vec![kept.to_string_lossy().into_owned()],
+            true,
         )
         .unwrap();
         let value = serde_json::to_value(&result).unwrap();
