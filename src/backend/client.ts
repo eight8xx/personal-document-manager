@@ -9,6 +9,10 @@ import type {
   BatchDocumentOperationRequest,
   BatchDocumentOperationResult,
   BootstrapState,
+  ClassificationPreviewRequest,
+  ClassificationPreviewResponse,
+  ClassificationRule,
+  ClassificationRuleOperation,
   CollectionDeleteResult,
   CollectionSummary,
   DocumentIndexChangedEvent,
@@ -28,6 +32,14 @@ import type {
   IndexRunResult,
   LibraryLocationInspection,
   LibrarySummary,
+  ReceiveDirectoryListing,
+  ReceiveDirectoryOperation,
+  ReceiveImportLogEntry,
+  ReceiveSource,
+  ReceiveSourceCandidates,
+  ReceiveSourceInput,
+  ReceiveSourceKind,
+  ReceiveSourceScanResult,
   RecentLibrary,
   TableSheet,
   TagSummary,
@@ -219,6 +231,55 @@ export const tauriBackendClient: BackendClient = {
     }),
   cancelBatchDocumentOperation: (jobId) =>
     invoke<boolean>("cancel_batch_document_operation", { jobId }),
+  listClassificationRules: (library) =>
+    invoke<ClassificationRule[]>("list_classification_rules", { library }),
+  classificationRuleOperation: (library, operation) =>
+    invoke<ClassificationRule[]>("apply_classification_rule_operation", {
+      library,
+      operation
+    }),
+  previewClassification: (library, request) =>
+    invoke<ClassificationPreviewResponse>("preview_classification", {
+      library,
+      request
+    }),
+  listReceiveSources: (library) =>
+    invoke<ReceiveSource[]>("list_receive_sources", { library }),
+  listReceiveSourceCandidates: (library, kind) =>
+    invoke<ReceiveSourceCandidates>("list_receive_source_candidates", {
+      library,
+      kind
+    }),
+  upsertReceiveSource: (library, sourceId, input) =>
+    invoke<ReceiveSource[]>("upsert_receive_source", {
+      library,
+      sourceId,
+      input
+    }),
+  removeReceiveSource: (library, sourceId) =>
+    invoke<ReceiveSource[]>("remove_receive_source", { library, sourceId }),
+  listReceiveDirectoryFiles: (library, sourceId) =>
+    invoke<ReceiveDirectoryListing>("list_receive_directory_files", {
+      library,
+      sourceId
+    }),
+  applyReceiveDirectorySelection: (library, operation) =>
+    invoke<ReceiveSourceScanResult>("apply_receive_directory_selection", {
+      library,
+      operation
+    }),
+  skipReceiveDirectoryFiles: (library, operation) =>
+    invoke<ReceiveSource[]>("skip_receive_directory_files", {
+      library,
+      operation
+    }),
+  scanReceiveSources: (library) =>
+    invoke<ReceiveSourceScanResult[]>("scan_receive_sources", { library }),
+  listReceiveImportLog: (library, limit = 100) =>
+    invoke<ReceiveImportLogEntry[]>("list_receive_import_log", {
+      library,
+      limit
+    }),
   searchDocuments: (request: DocumentSearchQuery) =>
     invoke<DocumentSearchResponse>("search_documents", { request }),
   pendingIndexCount: () => invoke<number>("pending_index_count"),

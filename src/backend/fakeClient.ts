@@ -13,6 +13,10 @@ import type {
   BatchDocumentOperationRequest,
   BatchDocumentOperationResult,
   BootstrapState,
+  ClassificationPreviewRequest,
+  ClassificationPreviewResponse,
+  ClassificationRule,
+  ClassificationRuleOperation,
   CollectionDeleteResult,
   CollectionSummary,
   DocumentIndexChangedEvent,
@@ -37,6 +41,16 @@ import type {
   LibraryLocationInspection,
   LibrarySummary,
   RecentLibrary,
+  ReceiveDirectoryListing,
+  ReceiveDirectoryListingItem,
+  ReceiveDirectoryOperation,
+  ReceiveImportLogEntry,
+  ReceiveSource,
+  ReceiveSourceCandidate,
+  ReceiveSourceCandidates,
+  ReceiveSourceInput,
+  ReceiveSourceKind,
+  ReceiveSourceScanResult,
   TablePreviewRequest,
   TableSheet,
   TagSummary,
@@ -92,6 +106,17 @@ export interface FakeBackendOptions {
     request: BatchDocumentOperationRequest
   ) => Promise<BatchDocumentOperationResult>;
   cancelBatchDocumentOperation?: (jobId: string) => Promise<boolean>;
+  /** 按 `${library.id}:${library.path}` 预置分类规则。 */
+  classificationRules?: Record<string, ClassificationRule[]>;
+  /** 按 `${library.id}:${library.path}` 预置接收来源。 */
+  receiveSources?: Record<string, ReceiveSource[]>;
+  /** 按 `${library.id}:${library.path}` 预置首次启用后的候选文件清单。 */
+  receiveDirectoryFiles?: Record<string, ReceiveDirectoryListingItem[]>;
+  /** 可注入的候选接收目录；未提供时微信给一个候选、QQ 给空列表。 */
+  receiveSourceCandidates?: Partial<
+    Record<ReceiveSourceKind, ReceiveSourceCandidate[]>
+  >;
+  receiveImportLog?: ReceiveImportLogEntry[];
 }
 
 const emptyBootstrap: BootstrapState = {
@@ -254,10 +279,43 @@ export class FakeBackendClient implements BackendClient {
   private cancelledBatchJobs = new Set<string>();
   private nextCollectionId = 1;
   private nextTagId = 1;
+  private classificationRules = new Map<string, ClassificationRule[]>();
+  private nextClassificationRuleId = 1;
+  private receiveSources = new Map<string, ReceiveSource[]>();
+  private receiveDirectoryFiles = new Map<
+    string,
+    ReceiveDirectoryListingItem[]
+  >();
+  private receiveScanResults: ReceiveSourceScanResult[] = [];
+  private receiveImportLog: ReceiveImportLogEntry[] = [];
+  private nextReceiveSourceId = 1;
+  /** 测试可注入的候选目录；默认只给微信一个候选，QQ 留空以覆盖「无候选」路径。 */
+  private readonly receiveSourceCandidates: Partial<
+    Record<ReceiveSourceKind, ReceiveSourceCandidate[]>
+  > = {};
 
   constructor(options: FakeBackendOptions = {}) {
     this.state = structuredClone(options.bootstrap ?? emptyBootstrap);
     this.strictLibraryIdentity = options.strictLibraryIdentity ?? false;
+    this.classificationRules = new Map(
+      Object.entries(options.classificationRules ?? {}).map(
+        ([key, rules]) => [key, structuredClone(rules)] as const
+      )
+    );
+    this.receiveSources = new Map(
+      Object.entries(options.receiveSources ?? {}).map(
+        ([key, sources]) => [key, structuredClone(sources)] as const
+      )
+    );
+    this.receiveDirectoryFiles = new Map(
+      Object.entries(options.receiveDirectoryFiles ?? {}).map(
+        ([key, items]) => [key, structuredClone(items)] as const
+      )
+    );
+    this.receiveSourceCandidates = structuredClone(
+      options.receiveSourceCandidates ?? {}
+    );
+    this.receiveImportLog = structuredClone(options.receiveImportLog ?? []);
     this.documents = structuredClone(options.documents ?? []);
     this.trashDocuments = structuredClone(options.trashDocuments ?? []);
     this.collections = structuredClone(options.collections ?? [inbox]);
@@ -1645,6 +1703,313 @@ export class FakeBackendClient implements BackendClient {
     }
     this.cancelledBatchJobs.add(jobId);
     return true;
+  }
+
+  /** 规则与来源按资料库隔离保存，与真实后端一致。 */
+  private libraryKey(library: LibrarySummary) {
+    return `${library.id}:${library.path}`;
+  }
+
+  async listClassificationRules(
+    library: LibrarySummary
+  ): Promise<ClassificationRule[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push("listClassificationRules");
+    return structuredClone(
+      this.classificationRules.get(this.libraryKey(library)) ?? []
+    );
+  }
+
+  async classificationRuleOperation(
+    library: LibrarySummary,
+    operation: ClassificationRuleOperation
+  ): Promise<ClassificationRule[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`classificationRuleOperation:${operation.kind}`);
+    const key = this.libraryKey(library);
+    const current = this.classificationRules.get(key) ?? [];
+    let next = [...current];
+
+    if (operation.kind === "create") {
+      const rule: ClassificationRule = {
+        id: `rule-${this.nextClassificationRuleId++}`,
+        name: operation.rule.name,
+        enabled: operation.rule.enabled,
+        position: next.length + 1,
+        fileNamePattern: operation.rule.fileNamePattern,
+        fileType: operation.rule.fileType,
+        sourceDirectory: operation.rule.sourceDirectory,
+        collectionId: operation.rule.collectionId,
+        tagIds: [...operation.rule.tagIds]
+      };
+      next.push(rule);
+    } else if (operation.kind === "update") {
+      next = next.map((rule) =>
+        rule.id === operation.rule.id
+          ? {
+              ...rule,
+              name: operation.rule.name,
+              enabled: operation.rule.enabled,
+              fileNamePattern: operation.rule.fileNamePattern,
+              fileType: operation.rule.fileType,
+              sourceDirectory: operation.rule.sourceDirectory,
+              collectionId: operation.rule.collectionId,
+              tagIds: [...operation.rule.tagIds]
+            }
+          : rule
+      );
+    } else if (operation.kind === "delete") {
+      next = next.filter((rule) => rule.id !== operation.ruleId);
+    } else if (operation.kind === "setEnabled") {
+      next = next.map((rule) =>
+        rule.id === operation.ruleId
+          ? { ...rule, enabled: operation.enabled }
+          : rule
+      );
+    } else {
+      const byId = new Map(next.map((rule) => [rule.id, rule]));
+      const ordered = operation.orderedRuleIds
+        .map((ruleId) => byId.get(ruleId))
+        .filter((rule): rule is ClassificationRule => Boolean(rule));
+      const rest = next.filter(
+        (rule) => !operation.orderedRuleIds.includes(rule.id)
+      );
+      next = [...ordered, ...rest];
+    }
+
+    next = next.map((rule, index) => ({ ...rule, position: index + 1 }));
+    this.classificationRules.set(key, next);
+    return structuredClone(next);
+  }
+
+  async previewClassification(
+    library: LibrarySummary,
+    request: ClassificationPreviewRequest
+  ): Promise<ClassificationPreviewResponse> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`previewClassification:${request.paths.length}`);
+    const rules = (
+      this.classificationRules.get(this.libraryKey(library)) ?? []
+    ).filter((rule) => rule.enabled);
+    const inbox = this.collections.find((collection) => collection.isInbox);
+
+    const items = request.paths.map((sourcePath) => {
+      const fileName = sourcePath.split(/[\\/]/).at(-1) ?? sourcePath;
+      const fileType = fileTypeForPath(sourcePath);
+      const matched = rules.filter((rule) => {
+        const directoryMatches =
+          !rule.sourceDirectory ||
+          sourcePath.toLocaleLowerCase().startsWith(
+            rule.sourceDirectory.toLocaleLowerCase()
+          );
+        const typeMatches = !rule.fileType || rule.fileType === fileType;
+        const nameMatches =
+          !rule.fileNamePattern ||
+          fileName
+            .toLocaleLowerCase()
+            .includes(rule.fileNamePattern.toLocaleLowerCase());
+        return directoryMatches && typeMatches && nameMatches;
+      });
+      const collectionRule = matched.find((rule) => rule.collectionId);
+      const collectionId =
+        request.targetCollectionId ??
+        collectionRule?.collectionId ??
+        inbox?.id ??
+        "inbox";
+      const tagIds = [
+        ...new Set(matched.flatMap((rule) => rule.tagIds))
+      ];
+      return {
+        sourcePath,
+        fileName,
+        fileType,
+        collectionId,
+        tagIds,
+        matchedRuleIds: matched.map((rule) => rule.id)
+      };
+    });
+
+    return { items };
+  }
+
+  async listReceiveSources(library: LibrarySummary): Promise<ReceiveSource[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push("listReceiveSources");
+    return structuredClone(this.receiveSources.get(this.libraryKey(library)) ?? []);
+  }
+
+  async listReceiveSourceCandidates(
+    library: LibrarySummary,
+    kind: ReceiveSourceKind
+  ): Promise<ReceiveSourceCandidates> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`listReceiveSourceCandidates:${kind}`);
+    const candidates =
+      this.receiveSourceCandidates[kind] ??
+      (kind === "wechat"
+        ? [{ path: "C:\\Users\\User\\Documents\\WeChat Files", evidence: "微信默认文档目录" }]
+        : []);
+    return { kind, candidates: structuredClone(candidates) };
+  }
+
+  async upsertReceiveSource(
+    library: LibrarySummary,
+    sourceId: string | null,
+    input: ReceiveSourceInput
+  ): Promise<ReceiveSource[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`upsertReceiveSource:${sourceId ?? "new"}`);
+    const key = this.libraryKey(library);
+    const current = this.receiveSources.get(key) ?? [];
+    const existing = current.find((source) => source.id === sourceId);
+    const source: ReceiveSource = {
+      id: existing?.id ?? `source-${this.nextReceiveSourceId++}`,
+      kind: input.kind,
+      displayName: input.displayName,
+      path: input.path,
+      enabled: input.enabled,
+      status: existing?.status === "unreadable" ? "unreadable" : "ready",
+      statusMessage: null,
+      pendingCount: existing?.pendingCount ?? 0,
+      lastScannedAt: existing?.lastScannedAt ?? null
+    };
+    const next = existing
+      ? current.map((candidate) =>
+          candidate.id === source.id ? source : candidate
+        )
+      : [...current, source];
+    this.receiveSources.set(key, next);
+    return structuredClone(next);
+  }
+
+  async removeReceiveSource(
+    library: LibrarySummary,
+    sourceId: string
+  ): Promise<ReceiveSource[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`removeReceiveSource:${sourceId}`);
+    const key = this.libraryKey(library);
+    const next = (this.receiveSources.get(key) ?? []).filter(
+      (source) => source.id !== sourceId
+    );
+    this.receiveSources.set(key, next);
+    return structuredClone(next);
+  }
+
+  async listReceiveDirectoryFiles(
+    library: LibrarySummary,
+    sourceId: string
+  ): Promise<ReceiveDirectoryListing> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`listReceiveDirectoryFiles:${sourceId}`);
+    const source = (this.receiveSources.get(this.libraryKey(library)) ?? []).find(
+      (candidate) => candidate.id === sourceId
+    );
+    if (!source) {
+      throw new BackendError({
+        code: "receiveSourceNotFound",
+        message: "接收来源不存在。"
+      });
+    }
+    return {
+      sourceId,
+      path: source.path ?? "",
+      items: structuredClone(
+        this.receiveDirectoryFiles.get(this.libraryKey(library)) ?? []
+      )
+    };
+  }
+
+  async applyReceiveDirectorySelection(
+    library: LibrarySummary,
+    operation: ReceiveDirectoryOperation
+  ): Promise<ReceiveSourceScanResult> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(
+      `applyReceiveDirectorySelection:${operation.sourceId}:${operation.paths.length}`
+    );
+    const key = this.libraryKey(library);
+    const selected = new Set(operation.paths);
+    const listing = this.receiveDirectoryFiles.get(key) ?? [];
+    const remaining = listing.filter((item) => !selected.has(item.path));
+    this.receiveDirectoryFiles.set(key, remaining);
+    const sources = this.receiveSources.get(key) ?? [];
+    const source = sources.find((candidate) => candidate.id === operation.sourceId);
+    const pendingCount = Math.max(
+      0,
+      (source?.pendingCount ?? 0) + selected.size
+    );
+    this.receiveSources.set(
+      key,
+      sources.map((candidate) =>
+        candidate.id === operation.sourceId
+          ? {
+              ...candidate,
+              pendingCount,
+              lastScannedAt: new Date().toISOString()
+            }
+          : candidate
+      )
+    );
+    const result: ReceiveSourceScanResult = {
+      sourceId: operation.sourceId,
+      scannedCount: selected.size,
+      importedCount: 0,
+      skippedCount: 0,
+      pendingCount,
+      failedCount: 0
+    };
+    this.receiveScanResults.push(result);
+    return structuredClone(result);
+  }
+
+  async skipReceiveDirectoryFiles(
+    library: LibrarySummary,
+    operation: ReceiveDirectoryOperation
+  ): Promise<ReceiveSource[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(
+      `skipReceiveDirectoryFiles:${operation.sourceId}:${operation.paths.length}`
+    );
+    const key = this.libraryKey(library);
+    const skipped = new Set(operation.paths);
+    const listing = this.receiveDirectoryFiles.get(key) ?? [];
+    this.receiveDirectoryFiles.set(
+      key,
+      listing.map((item) =>
+        skipped.has(item.path) ? { ...item, previouslySkipped: true } : item
+      )
+    );
+    return structuredClone(this.receiveSources.get(key) ?? []);
+  }
+
+  async scanReceiveSources(
+    library: LibrarySummary
+  ): Promise<ReceiveSourceScanResult[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push("scanReceiveSources");
+    const key = this.libraryKey(library);
+    const results = (this.receiveSources.get(key) ?? [])
+      .filter((source) => source.enabled)
+      .map((source) => ({
+        sourceId: source.id,
+        scannedCount: 0,
+        importedCount: 0,
+        skippedCount: 0,
+        pendingCount: source.pendingCount,
+        failedCount: 0
+      }));
+    this.receiveScanResults.push(...results);
+    return structuredClone(results);
+  }
+
+  async listReceiveImportLog(
+    library: LibrarySummary,
+    limit = 100
+  ): Promise<ReceiveImportLogEntry[]> {
+    this.assertCurrentLibrary(library);
+    this.calls.push(`listReceiveImportLog:${limit}`);
+    return structuredClone(this.receiveImportLog.slice(0, limit));
   }
 
   private snapshot(): BootstrapState {

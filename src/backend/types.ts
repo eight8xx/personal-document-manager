@@ -274,6 +274,153 @@ export interface BatchDocumentOperationResult {
   cancelledCount: number;
 }
 
+// 分类规则（工作单 10）：按文件名、类型、来源目录为新建文档指定集合与标签。
+export interface ClassificationRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** 用户顺序；数字越小越先匹配，第一条指定集合的命中规则决定集合。 */
+  position: number;
+  /** 文件名子串匹配；空字符串表示不限。 */
+  fileNamePattern: string;
+  /** 文件类型（显示名，如 PDF、CSV）；空字符串表示不限。 */
+  fileType: string | null;
+  /** 来源目录前缀匹配；空字符串表示不限。 */
+  sourceDirectory: string | null;
+  /** 命中的新建文档归档到该集合；null 表示本规则只贡献标签。 */
+  collectionId: string | null;
+  tagIds: string[];
+}
+
+export interface ClassificationRuleInput {
+  name: string;
+  enabled: boolean;
+  fileNamePattern: string;
+  fileType: string | null;
+  sourceDirectory: string | null;
+  collectionId: string | null;
+  tagIds: string[];
+}
+
+export interface ClassificationRuleUpdate extends ClassificationRuleInput {
+  id: string;
+}
+
+export type ClassificationRuleOperation =
+  | { kind: "create"; rule: ClassificationRuleInput }
+  | { kind: "update"; rule: ClassificationRuleUpdate }
+  | { kind: "delete"; ruleId: string }
+  | { kind: "setEnabled"; ruleId: string; enabled: boolean }
+  | { kind: "reorder"; orderedRuleIds: string[] };
+
+/** 一条规则对单个来源文件的预计结果。 */
+export interface ClassificationPreviewItem {
+  sourcePath: string;
+  fileName: string;
+  fileType: string | null;
+  /** 预计归档集合；未命中任何规则时为收件箱。 */
+  collectionId: string;
+  tagIds: string[];
+  /** 命中的规则 ID，按用户顺序；集合来自第一个指定集合的命中规则。 */
+  matchedRuleIds: string[];
+}
+
+export interface ClassificationPreviewRequest {
+  paths: string[];
+  /** 用户显式指定的目标集合，优先于规则集合，但仍应用规则标签。 */
+  targetCollectionId: string | null;
+}
+
+export interface ClassificationPreviewResponse {
+  items: ClassificationPreviewItem[];
+}
+
+// 接收目录（工作单 11/12/13）：每个资料库分别配置 QQ、微信等来源。
+export type ReceiveSourceKind = "qq" | "wechat" | "other";
+
+export type ReceiveSourceStatus =
+  | "unconfigured"
+  | "ready"
+  | "missing"
+  | "unreadable";
+
+export interface ReceiveSourceCandidate {
+  path: string;
+  /** 识别依据，供用户确认时参考。 */
+  evidence: string;
+}
+
+export interface ReceiveSource {
+  id: string;
+  kind: ReceiveSourceKind;
+  displayName: string;
+  /** 用户确认的目录；未确认时为 null，此时不扫描不导入。 */
+  path: string | null;
+  enabled: boolean;
+  status: ReceiveSourceStatus;
+  /** 状态原因的补充说明，例如目录不存在或权限不足。 */
+  statusMessage: string | null;
+  /** 扫描到的待处理文件数（含待决项）。 */
+  pendingCount: number;
+  lastScannedAt: string | null;
+}
+
+export interface ReceiveSourceInput {
+  kind: ReceiveSourceKind;
+  displayName: string;
+  path: string;
+  enabled: boolean;
+}
+
+export interface ReceiveSourceCandidates {
+  kind: ReceiveSourceKind;
+  candidates: ReceiveSourceCandidate[];
+}
+
+/** 首次启用（或重新定位）后目录内已存在的受支持文件清单。 */
+export interface ReceiveDirectoryListingItem {
+  path: string;
+  fileName: string;
+  fileType: string | null;
+  fileSize: number;
+  /** 用户此前明确未选择的文件；补扫不会自动导入它们。 */
+  previouslySkipped: boolean;
+}
+
+export interface ReceiveDirectoryListing {
+  sourceId: string;
+  path: string;
+  items: ReceiveDirectoryListingItem[];
+}
+
+export interface ReceiveDirectoryOperation {
+  sourceId: string;
+  paths: string[];
+}
+
+export interface ReceiveSourceScanResult {
+  sourceId: string;
+  scannedCount: number;
+  importedCount: number;
+  skippedCount: number;
+  pendingCount: number;
+  failedCount: number;
+}
+
+export interface ReceiveImportLogEntry {
+  sourceId: string;
+  sourcePath: string;
+  fileName: string;
+  /** 结果状态沿用导入项状态，便于界面复用同一套展示。 */
+  status: ImportItemStatus;
+  documentId: string | null;
+  collectionId: string | null;
+  tagIds: string[];
+  matchedRuleIds: string[];
+  errorMessage: string | null;
+  createdAt: string;
+}
+
 export interface DocumentSearchFilters {
   collectionId: string | null;
   tagId: string | null;
@@ -516,6 +663,48 @@ export interface BackendClient {
     request: BatchDocumentOperationRequest
   ): Promise<BatchDocumentOperationResult>;
   cancelBatchDocumentOperation(jobId: string): Promise<boolean>;
+  listClassificationRules(
+    library: LibrarySummary
+  ): Promise<ClassificationRule[]>;
+  classificationRuleOperation(
+    library: LibrarySummary,
+    operation: ClassificationRuleOperation
+  ): Promise<ClassificationRule[]>;
+  previewClassification(
+    library: LibrarySummary,
+    request: ClassificationPreviewRequest
+  ): Promise<ClassificationPreviewResponse>;
+  listReceiveSources(library: LibrarySummary): Promise<ReceiveSource[]>;
+  listReceiveSourceCandidates(
+    library: LibrarySummary,
+    kind: ReceiveSourceKind
+  ): Promise<ReceiveSourceCandidates>;
+  upsertReceiveSource(
+    library: LibrarySummary,
+    sourceId: string | null,
+    input: ReceiveSourceInput
+  ): Promise<ReceiveSource[]>;
+  removeReceiveSource(
+    library: LibrarySummary,
+    sourceId: string
+  ): Promise<ReceiveSource[]>;
+  listReceiveDirectoryFiles(
+    library: LibrarySummary,
+    sourceId: string
+  ): Promise<ReceiveDirectoryListing>;
+  applyReceiveDirectorySelection(
+    library: LibrarySummary,
+    operation: ReceiveDirectoryOperation
+  ): Promise<ReceiveSourceScanResult>;
+  skipReceiveDirectoryFiles(
+    library: LibrarySummary,
+    operation: ReceiveDirectoryOperation
+  ): Promise<ReceiveSource[]>;
+  scanReceiveSources(library: LibrarySummary): Promise<ReceiveSourceScanResult[]>;
+  listReceiveImportLog(
+    library: LibrarySummary,
+    limit?: number
+  ): Promise<ReceiveImportLogEntry[]>;
   searchDocuments(
     request: DocumentSearchQuery
   ): Promise<DocumentSearchResponse>;
