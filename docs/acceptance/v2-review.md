@@ -2,34 +2,38 @@
 
 审查范围：`git diff dcc5cd8..e9415c3`（第二版全部改动），只读审查，发现的问题按严重度分组。
 审查者：独立代码审查子代理；H1 用仓库外最小 crate（真实 quick-xml 0.42）做了实测复现。
+**后续状态**：H1、H2 已由 `b8c5268` 修复并经 Lead 独立复现验证；M1 的主要部分已由 `861f7a2` 闭合；其余条目为待办。
 
-## 高（已派修，见 task-14）
+## 高（已修复）
 
-### H1 XLSX 稀疏列引用让索引阶段吃 GB 级内存并 abort（可复现崩溃循环）
+### H1 XLSX 稀疏列引用让索引路径按列号放大工作量
 
-- 位置：`src-tauri/src/library/table.rs` 的 `SheetParser::finish_cell`（按列号补空字符串）、`cell_reference_column`（缺 Excel XFD=16383 上界）、`extract_table_text`（把 `columns` 传成 `usize::MAX`）。
-- 实测放大倍率（真实 quick-xml，参数与生产一致）：
+- 位置：`src-tauri/src/library/table.rs` 的 `SheetParser::finish_cell`（`while row_cells.len() < cell.column` 逐列补空字符串）、`cell_reference_column`（缺 Excel XFD=16383 上界）、`extract_table_text`（把 `columns` 传成 `usize::MAX`，导致补空循环无界）。
+- **Lead 独立实测（修复前的 `codex/v2-development`）**：单工作表、行内只有一个远列单元格、XML 仅 1.5～7.5 KB 时，`extract_table_text` 的耗时随列索引放大：
 
-| 列引用 | 行数 | XML 大小 | 保留槽位 | `Vec<String>` 占用 |
-| --- | --- | --- | --- | --- |
-| `XFD`（Excel 真实最大列） | 400 | 21,134 B | 6,553,600 | 150.0 MB |
-| `ZZZZ` | 50 | 2,732 B | 23,762,700 | 600.0 MB |
-| `ZZZZZ` | 3 | 303 B | 37,069,890 | 1,152.0 MB |
+| 列引用（列索引） | 行数 | XML | 索引提取耗时 |
+| --- | --- | --- | --- |
+| `XFD`（16,383，Excel 真实最大列） | 400 | 7,534 B | 0.14 s |
+| `ZZZZ`（475,253） | 50 | 2,289 B | 0.82 s |
+| `ZZZZZ`（12,356,630） | 3 | 1,597 B | **3.59 s** |
 
-- 崩溃链：导入校验不解析单元格 → 文档导入成功 → 打开资料库自动索引 → 分配失败 abort → 文档仍 `pending` → 每次打开资料库都再崩一次。预览路径不受影响（列数被 `clamp_table_range` 收在 64 以内）。
+- **与最初审查结论的差异**：审查报告称会「按列号保留 GB 级内存」，Lead 复核**未观察到**该现象——预览路径的列数被 `clamp_table_range` 收住（3 行样本只保留 24 个槽位），索引路径的结果文本也一直很小。真实机制是**逐列补空字符串的无界工作量**（每个空 `String` 24 字节栈内数据 + 分配/回收开销），列号越远越慢，足以让一次索引长时间占住服务锁、放大小样本的破坏力。
+- 崩溃链（审查推断，未实测到 abort）：导入校验不解析单元格 → 导入成功 → 打开资料库自动索引 → 长时间/失败 → 文档仍 `pending` → 每次打开资料库重跑。
+- **修复（`b8c5268`）**：`row_cells` 改为稀疏的 `Vec<(usize, String)>`，删除补空循环；`cell_reference_column` 拒绝 >16383；索引路径改为「只取值不补位」并加 `MAX_TABLE_INDEX_CELLS = 200_000` 预算（CSV 索引另用 `MAX_TABLE_INDEX_COLUMNS = 256`）。修复后 Lead 的独立复现用例从 3.59 s → **0.01 s**。
 
 ### H2 首次接收清单截断 500 条，补扫按 4000 条自动导入 → 静默导入用户没看到的文件
 
 - 位置：`service.rs` 的 `MAX_RECEIVE_LISTING_ITEMS = 500` 与 `.take(500)`、扫描上限 `500*8`、`receive_pending_files` 只排除 skips 与有日志的文件；前端只在清单内记录跳过，且 `skipReceiveDirectoryFiles` 会置位 `last_scanned_at` 使「首次确认前不导入」闸门失效。
 - 影响：500+ 文件的接收目录里，第 501..4000 个文件既未展示也未记入 skips，周期补扫会把它们全部自动导入，违反 PRD 19/36 与冻结契约。
-- 覆盖缺口：既有 `receive_sources.rs` 的 helper 传的是目录全量而非截断清单，因此掩盖了这个问题。
+- **修复（`b8c5268`）**：新增 `receive_sources.first_scan_confirmed_at` 作为明确的「已确认」闸门（含旧库幂等补列），并新增 `begin_receive_selection_batch`——用户完成选择时把目录内**所有未勾选的受支持文件**在一个事务里记为明确跳过；补扫路径不写跳过记录。新增用例按界面真实顺序在 520 个文件上断言补扫零导入、只留勾选的一份、之后新到的文件照常自动导入。
+- 实现者还纠正了 Lead 建议的「纯 mtime 水位」方案：实测会让「确认前写入临时名、确认后改名」的合法新文件永远不被导入（改名不改 mtime），既有用例当场变红。
 
-## 中（已记录，未派单）
+## 中（待办）
 
-- **M1 CSV 导入校验无输入上限**：`validate_file_content` 的预检不覆盖 `CsvText`，`validate_table_file` 直接 `fs::read` 整份文件，`decode_csv_text` 再复制一份 String，峰值约为文件大小 2 倍。（注：`861f7a2` 已把 `CsvText` 纳入预检，此项的**主要部分已闭合**；剩余的「二次整体复制」仍存在。）
-- **M2 CSV/XLSX 索引期解析产物不在预算内**：字符级截断发生在解析之后，`Vec<Vec<String>>` 的单元格内存不记账；64 MiB 的 `a,a,a,…` CSV 可产出约 3200 万单元格。
-- **M3 接收来源变化待决项在界面上无路可走**：日志没有 `item_id`，前端无法调用 `resolveImportItem`，`pendingCount` 永不清零，用户无法按 PRD 25/34 选择「新建/替换」。
-- **M4 中断恢复对单个文件操作失败是致命的**：`documents/<id>/` 下一个被占用的残留就让 `open_library` 整体失败，而不是「那一份文档恢复失败、其余照常」；同文件已有 `RecoveryFailure` 机制但只有哈希不匹配会走到。
+- **M1 CSV 导入校验的内存峰值**：`validate_file_content` 的预检已由 `861f7a2` 纳入 `CsvText`（超限在导入阶段即拒绝），但 `validate_table_file` 仍对允许范围内的文件整份 `fs::read`，`decode_csv_text` 再复制一份 `String`，峰值约为文件大小的 2 倍。**部分闭合**。
+- **M2 CSV 索引期解析产物不在预算内**：`861f7a2`/`b8c5268` 已让 XLSX/CSV 索引路径共享单元格预算，但 `parse_csv_rows(&text, None, usize::MAX)` 的整表物化与 `bound_extracted_text` 的截断时机仍需复核。**部分闭合**。
+- **M3 接收来源变化待决项在界面上无路可走**：日志没有 `item_id`，前端无法调用 `resolveImportItem`，`pendingCount` 永不清零，用户无法按 PRD 25/34 选择「新建/替换」。**未修**。
+- **M4 中断恢复对单个文件操作失败是致命的**：`documents/<id>/` 下一个被占用的残留就让 `open_library` 整体失败，而不是「那一份文档恢复失败、其余照常」；同文件已有 `RecoveryFailure` 机制但只有哈希不匹配会走到。**未修**。
 
 ## 低（已记录）
 
