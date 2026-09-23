@@ -5487,6 +5487,10 @@ fn bounded_preview_text(text: String) -> String {
 /// 打开资料库时对账中断遗留的文件操作。数据库记录是权威：墓碑和替换备份都要么让
 /// 记录的副本重新可读，要么在记录已经指向其他内容时被清理。返回无法自动恢复的文档，
 /// 由调用方在启动扫描之后写入失败状态，避免结论被扫描覆盖。
+///
+/// **逐文档隔离**：单个文档目录的 IO 失败（残留被占用、只读、权限异常）只让那一份文档
+/// 进入恢复失败状态，其余文档与整个资料库照常打开——用户不该因为一个删不掉的残留打不开资料库。
+/// 只有「文档目录本身读不了」与数据库/JSON 错误才整体失败。
 fn reconcile_interrupted_copy_operations(
     library_root: &Path,
     connection: &Connection,
@@ -5495,110 +5499,144 @@ fn reconcile_interrupted_copy_operations(
     let document_directories = match fs::read_dir(&documents_directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // 文档区整个读不了说明资料库结构或权限坏了：这里必须整体失败，不能假装没事。
         Err(error) => return Err(LibraryError::Io(error)),
     };
     let known_copies = library_copy_paths(library_root, connection)?;
     let mut failures = Vec::new();
 
     for document_directory in document_directories {
-        let document_directory = document_directory?;
-        if !document_directory.file_type()?.is_dir() {
+        // 单个目录项读不出来（元数据损坏、目录被占用）只跳过它。
+        let Ok(document_directory) = document_directory else {
+            continue;
+        };
+        if !document_directory
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
-
         let document_id = document_directory
             .file_name()
             .to_string_lossy()
             .into_owned();
-        let recorded = connection
-            .query_row(
-                "SELECT library_path, content_hash, deleted_at FROM documents WHERE id = ?1",
-                params![&document_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let directory_path = document_directory.path();
-        let entries = fs::read_dir(&directory_path)?.collect::<Result<Vec<_>, _>>()?;
-
-        let mut tombstones = entries
-            .iter()
-            .filter(|entry| is_delete_tombstone_name(&entry.file_name(), DELETE_TOMBSTONE_PREFIX))
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        tombstones.sort();
-        let had_tombstones = !tombstones.is_empty();
-
-        for tombstone_path in tombstones {
-            match recorded.as_ref().map(|(library_path, _, _)| library_path) {
-                Some(library_path) => {
-                    let original_path = document_path(library_root, library_path)?;
-                    restore_library_copy_tombstone(&tombstone_path, &original_path)?;
-                }
-                None => {
-                    fs::remove_file(&tombstone_path)?;
-                }
-            }
-        }
-
-        if had_tombstones {
-            match fs::remove_dir(&directory_path) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-                    ) => {}
-                Err(error) => return Err(LibraryError::Io(error)),
-            }
-        }
-
-        let mut backups = Vec::new();
-        let mut temporaries = Vec::new();
-        for entry in entries {
-            let name = entry.file_name();
-            if !is_replacement_artifact_name(&name) {
-                continue;
-            }
-            let path = entry.path();
-            if known_copies.contains(&path) {
-                continue;
-            }
-            if is_replacement_backup_name(&name) {
-                backups.push(path);
-            } else {
-                temporaries.push(path);
-            }
-        }
-        if backups.is_empty() && temporaries.is_empty() {
-            continue;
-        }
-        backups.sort();
-        temporaries.sort();
-        // 备份一定是文档的原内容，临时副本只有在内容核对通过时才会被采用。
-        let leftovers = backups.into_iter().chain(temporaries).collect::<Vec<_>>();
-
-        match recorded.as_ref() {
-            Some((library_path, content_hash, None)) => {
-                if let Some(failure) = recover_interrupted_replacement(
-                    library_root,
-                    &document_id,
-                    library_path,
-                    content_hash.as_deref(),
-                    &leftovers,
-                )? {
-                    failures.push(failure);
-                }
-            }
-            _ => remove_leftover_files(&leftovers)?,
+        match reconcile_document_directory(
+            library_root,
+            connection,
+            &known_copies,
+            &document_directory.path(),
+            &document_id,
+        ) {
+            Ok(Some(failure)) => failures.push(failure),
+            Ok(None) => {}
+            // 数据库/JSON 错误是全局性的：继续整体失败。
+            Err(error @ (LibraryError::Database(_) | LibraryError::Json(_))) => return Err(error),
+            // 其它错误（IO、记录路径非法）按文档隔离，并给出可诊断原因。
+            Err(error) => failures.push(RecoveryFailure {
+                document_id,
+                message: format!(
+                    "上次中断的文件操作无法自动完成（{error}）。请关闭占用该文件的程序后重新打开资料库，或从源文件重新导入。"
+                ),
+            }),
         }
     }
     Ok(failures)
+}
+
+/// 对账单个文档目录；只有数据库/JSON 错误返回 `Err`，文件级问题转成 `RecoveryFailure`。
+fn reconcile_document_directory(
+    library_root: &Path,
+    connection: &Connection,
+    known_copies: &HashSet<PathBuf>,
+    directory_path: &Path,
+    document_id: &str,
+) -> LibraryResult<Option<RecoveryFailure>> {
+    let recorded = connection
+        .query_row(
+            "SELECT library_path, content_hash, deleted_at FROM documents WHERE id = ?1",
+            params![document_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let entries = fs::read_dir(directory_path)?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut tombstones = entries
+        .iter()
+        .filter(|entry| is_delete_tombstone_name(&entry.file_name(), DELETE_TOMBSTONE_PREFIX))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    tombstones.sort();
+    let had_tombstones = !tombstones.is_empty();
+
+    for tombstone_path in tombstones {
+        match recorded.as_ref().map(|(library_path, _, _)| library_path) {
+            Some(library_path) => {
+                let original_path = document_path(library_root, library_path)?;
+                restore_library_copy_tombstone(&tombstone_path, &original_path)?;
+            }
+            None => {
+                fs::remove_file(&tombstone_path)?;
+            }
+        }
+    }
+
+    if had_tombstones {
+        match fs::remove_dir(directory_path) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(LibraryError::Io(error)),
+        }
+    }
+
+    let mut backups = Vec::new();
+    let mut temporaries = Vec::new();
+    for entry in entries {
+        let name = entry.file_name();
+        if !is_replacement_artifact_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if known_copies.contains(&path) {
+            continue;
+        }
+        if is_replacement_backup_name(&name) {
+            backups.push(path);
+        } else {
+            temporaries.push(path);
+        }
+    }
+    if backups.is_empty() && temporaries.is_empty() {
+        return Ok(None);
+    }
+    backups.sort();
+    temporaries.sort();
+    // 备份一定是文档的原内容，临时副本只有在内容核对通过时才会被采用。
+    let leftovers = backups.into_iter().chain(temporaries).collect::<Vec<_>>();
+
+    match recorded.as_ref() {
+        Some((library_path, content_hash, None)) => recover_interrupted_replacement(
+            library_root,
+            document_id,
+            library_path,
+            content_hash.as_deref(),
+            &leftovers,
+        ),
+        _ => {
+            remove_leftover_files(&leftovers);
+            Ok(None)
+        }
+    }
 }
 
 /// 无法自动恢复的替换：打开资料库时保留文件现场，并把原因写进文档记录。
@@ -5608,6 +5646,12 @@ struct RecoveryFailure {
 }
 
 /// 让记录的副本重新可读，或在不一致时报告可诊断的失败。返回后目录里不再有中断残留。
+///
+/// 三种结果的取舍：
+/// - 记录路径的副本已与 `content_hash` 一致 → 只是残留删不掉也照样可用（清理是 best-effort）；
+/// - 副本缺失/不一致、候选采用失败 → 返回 `Err`，由调用方转成该文档的 `RecoveryFailure`
+///   并写进可见状态，**不吞**；
+/// - 核对不出任何记录版本 → 返回 `RecoveryFailure`（保持原有语义）。
 fn recover_interrupted_replacement(
     library_root: &Path,
     document_id: &str,
@@ -5617,7 +5661,8 @@ fn recover_interrupted_replacement(
 ) -> LibraryResult<Option<RecoveryFailure>> {
     let destination = document_path(library_root, library_path)?;
     if copy_matches_recorded_content(&destination, content_hash) {
-        remove_leftover_files(leftovers)?;
+        // 清理失败（占用/只读）不影响该文档可用：留下现场，下次打开再试。
+        remove_leftover_files(leftovers);
         return Ok(None);
     }
 
@@ -5630,9 +5675,10 @@ fn recover_interrupted_replacement(
             .filter(|path| *path != candidate)
             .cloned()
             .collect::<Vec<_>>();
+        // 让记录的副本就位属于「恢复」而不是「清理」：失败必须让用户看见。
         remove_library_copy(&destination)?;
         fs::rename(candidate, &destination)?;
-        remove_leftover_files(&remaining)?;
+        remove_leftover_files(&remaining);
         return Ok(None);
     }
 
@@ -5671,11 +5717,18 @@ fn library_copy_paths(
     Ok(paths)
 }
 
-fn remove_leftover_files(paths: &[PathBuf]) -> LibraryResult<()> {
+/// 尽力删除残留，返回**删不掉**的路径（被其它进程占用、只读属性、同步盘持锁等）。
+///
+/// 清理失败不升级为错误：走到这里时记录的副本已经与 `content_hash` 一致，残留只是冗余备份或
+/// 半成品，删不掉不影响文档可用性。留下现场并在下次打开资料库时重试，好过让整个资料库打不开。
+fn remove_leftover_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut remaining = Vec::new();
     for path in paths {
-        remove_library_copy(path)?;
+        if remove_library_copy(path).is_err() {
+            remaining.push(path.clone());
+        }
     }
-    Ok(())
+    remaining
 }
 
 fn report_recovery_failure(
