@@ -31,3 +31,12 @@ cargo install tauri-driver --version 2.0.6 --locked --root .scratch/.tmp/native-
 ## 当前运行结果
 
 2026-09-23 在 Windows、Edge/WebView2 `153.0.4234.48`、`tauri-driver 2.0.6`、debug 构建下运行。真实窗口与 IPC、集合移动、正文搜索、TXT 预览、回收站与恢复的测试步骤通过；结束后未发现残留的测试应用和驱动进程。`start_import` 使用当前资料库摘要的新契约通过验证。该结果只覆盖上述子集，**不代表议题 07 全部验收完成**。本次记录位于 `%TEMP%\pdm-native-smoke-3dbf618c\report.json`，最终窗口截图为同目录的 `success.png`。
+
+### 2026-09-23 第二版回归复查（同一子集）
+
+在第二版全部实现合并后（主分支 `c9…` 之后、含分步导入、分类参数、接收目录事件、表格文档与恢复隔离等改动）重新运行一次，用于确认**真实窗口与 IPC 这条路没有被改坏**：
+
+- 结果：`status = passed`，9 个步骤全部通过（检查驱动前置 → 构建隔离 debug 程序 → 启动真实窗口 → IPC 建库 → IPC 导入 TXT → 建集合并移动 → 搜索与预览 → 移入回收站并恢复 → 截图）。
+- 证据目录：`%TEMP%\pdm-native-smoke-25ce2fee\`（`report.json`、`success.png`）。
+- 覆盖标志仍为 `nativeFilePickerCovered=false`、`libraryWizardCovered=false`、`importButtonCovered=false`——**原生文件选择器、首次向导与导入按钮依旧未覆盖**，这一点没有变化。
+- 观察到一次**驱动启动阶段的偶发崩溃**：第一次运行时进程退出码 `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN，被 Windows 强制终止），`report.json` 停在「Start real Tauri window through tauri-driver」这一步，`tauri-driver.log` 为空；紧接着重跑即全部通过，两次之间未改动任何代码。因此这是驱动/WebDriver 启动的间歇性故障，不是应用回归；但它意味着**这个冒烟不能当稳定门槛用**，需要时重跑一次。

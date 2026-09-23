@@ -2923,7 +2923,7 @@ mod tests {
         .unwrap();
         let source_id = sources[0].id.clone();
         let pending = {
-            let mut service = state.service().unwrap();
+            let service = state.service().unwrap();
             service.ensure_current_library(&library).unwrap();
             service.receive_pending_files(&source_id, true).unwrap()
         };

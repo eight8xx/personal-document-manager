@@ -11,10 +11,13 @@ use uuid::Uuid;
 
 use super::error::LibraryResult;
 use super::models::{
-    ClassificationRule, ClassificationRuleInput, ClassificationRuleOperation,
-    ClassificationRuleUpdate, ImportItemStatus, ReceiveImportLogEntry, ReceiveSource,
-    ReceiveSourceInput, ReceiveSourceKind, ReceiveSourceStatus,
+    ClassificationRule, ClassificationRuleInput, ClassificationRuleOperation, ImportItemStatus,
+    ReceiveImportLogEntry, ReceiveSource, ReceiveSourceInput, ReceiveSourceKind,
+    ReceiveSourceStatus,
 };
+// 只在测试里构造「更新规则」的输入用到的类型。
+#[cfg(test)]
+use super::models::ClassificationRuleUpdate;
 
 /// 建立分类规则与接收目录相关的表；由 `initialize_schema` 调用。
 pub(super) fn initialize_store_schema(connection: &Connection) -> LibraryResult<()> {
