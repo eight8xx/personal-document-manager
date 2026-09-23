@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, MutexGuard,
@@ -151,7 +151,7 @@ impl ReceiveDirectoryMonitor {
                     let Some(library) = library else {
                         continue;
                     };
-                    match run_receive_scan(&service, &library, false) {
+                    match run_receive_scan(&service, &library, false, Some(&thread_stop)) {
                         Ok(results) if !results.is_empty() => on_scan(library, results),
                         Ok(_) => {}
                         Err(_) => continue,
@@ -175,17 +175,25 @@ impl Drop for ReceiveDirectoryMonitor {
     }
 }
 
+/// 后台任务的停止信号；用户主动触发的操作传 `None`。
+fn stop_requested(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+}
+
 /// 按文件分步导入一批接收文件：每一步单独加锁，出错时丢弃批次状态。
 ///
 /// `selection` 为真表示这是用户在清单里的选择（未勾选的既有文件会被记为跳过），
-/// 补扫/监视自己的批量导入传假。
+/// 补扫/监视自己的批量导入传假。`stop` 是后台任务的停止信号：**每一项之间**检查，
+/// 收到停止就 `abort_import_batch` 并返回 `Ok(None)`（已完成的项保留），
+/// 让关闭窗口时的 `Drop` 最多只需等一项处理完。
 pub(crate) fn drive_receive_import(
     service: &Arc<Mutex<LibraryService>>,
     library: &LibrarySummary,
     source_id: &str,
     paths: Vec<String>,
     selection: bool,
-) -> LibraryResult<ReceiveSourceScanResult> {
+    stop: Option<&AtomicBool>,
+) -> LibraryResult<Option<ReceiveSourceScanResult>> {
     let first = {
         let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
         service.ensure_current_library(library)?;
@@ -197,6 +205,7 @@ pub(crate) fn drive_receive_import(
     };
     let batch_id = first.batch_id.clone();
 
+    let mut stopped = false;
     let outcome = (|| -> LibraryResult<()> {
         loop {
             let before = {
@@ -205,6 +214,11 @@ pub(crate) fn drive_receive_import(
                 service.peek_import_progress(&batch_id)?
             };
             if before.is_none() {
+                break;
+            }
+            // 停止信号只在每一项之间检查：正在处理的那一项会正常结束（提交或失败）。
+            if stop_requested(stop) {
+                stopped = true;
                 break;
             }
             let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
@@ -220,19 +234,27 @@ pub(crate) fn drive_receive_import(
         }
         return Err(error);
     }
+    if stopped {
+        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(library)?;
+        service.abort_import_batch(&batch_id)?;
+        return Ok(None);
+    }
 
     let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
     service.ensure_current_library(library)?;
-    service.finish_receive_import_batch(&batch_id)
+    service.finish_receive_import_batch(&batch_id).map(Some)
 }
 
 /// 补扫当前资料库已启用的接收来源；每一步都重新核对资料库身份。
 ///
 /// `retry_failed` 为真（用户主动点「扫描」）时立即重试失败项；周期补扫传假，失败项走冷却时间。
+/// `stop` 是监视线程的停止信号，收到后立刻结束本轮（返回已完成的部分结果）。
 fn run_receive_scan(
     service: &Arc<Mutex<LibraryService>>,
     library: &LibrarySummary,
     retry_failed: bool,
+    stop: Option<&AtomicBool>,
 ) -> LibraryResult<Vec<ReceiveSourceScanResult>> {
     let sources = {
         let service = service.lock().map_err(|_| LibraryError::StateLock)?;
@@ -242,6 +264,9 @@ fn run_receive_scan(
 
     let mut results = Vec::new();
     for source in sources {
+        if stop_requested(stop) {
+            break;
+        }
         if !source.enabled || source.path.is_none() {
             continue;
         }
@@ -257,7 +282,11 @@ fn run_receive_scan(
         if pending.is_empty() {
             continue;
         }
-        results.push(drive_receive_import(service, library, &source.id, pending, false)?);
+        match drive_receive_import(service, library, &source.id, pending, false, stop)? {
+            Some(result) => results.push(result),
+            // 收到停止信号：这一批已中止，不再继续后面的来源。
+            None => break,
+        }
     }
     Ok(results)
 }
@@ -1395,14 +1424,20 @@ pub async fn apply_receive_directory_selection(
 ) -> Result<ReceiveSourceScanResult, CommandError> {
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
-        drive_receive_import(
+        // 用户主动选择：没有停止信号，因此不会走到「被中止」分支。
+        let result = drive_receive_import(
             &service,
             &library,
             &operation.source_id,
             operation.paths,
             true,
+            None,
         )
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?;
+        result.ok_or_else(|| CommandError {
+            code: "receiveImportTask".to_string(),
+            message: "接收目录导入在完成前被中止。".to_string(),
+        })
     })
     .await
     .map_err(|error| CommandError {
@@ -1420,7 +1455,7 @@ pub async fn scan_receive_sources(
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
         // 用户主动触发：可以立即重试此前失败的项。
-        run_receive_scan(&service, &library, true).map_err(CommandError::from)
+        run_receive_scan(&service, &library, true, None).map_err(CommandError::from)
     })
     .await
     .map_err(|error| CommandError {
@@ -1523,6 +1558,7 @@ mod tests {
         ReceiveSourceInput, ReceiveSourceKind,
     };
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -2797,8 +2833,10 @@ mod tests {
             &source_id,
             vec![kept.to_string_lossy().into_owned()],
             true,
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .expect("用户选择导入没有停止信号，不会中止");
         let value = serde_json::to_value(&result).unwrap();
         for key in [
             "sourceId",
@@ -2929,6 +2967,153 @@ mod tests {
             std::fs::read(receive_dir.join("新消息.txt")).unwrap(),
             "新消息正文".as_bytes(),
             "来源文件不应被修改"
+        );
+    }
+
+    /// 建一个已确认的接收来源，并在确认之后放进去 `count` 个新文件（等待补扫）。
+    fn confirmed_source_with_new_files(
+        state: &AppState,
+        root: &Path,
+        count: usize,
+    ) -> (String, std::path::PathBuf) {
+        let receive_dir = root.join("wechat");
+        std::fs::create_dir_all(&receive_dir).unwrap();
+        let library_path = root.join("Library");
+        let library = create_library_contract(state, library_path.to_string_lossy().into_owned())
+            .expect("library is created");
+        let sources = upsert_receive_source_contract(
+            state,
+            &library,
+            None,
+            ReceiveSourceInput {
+                kind: ReceiveSourceKind::Wechat,
+                display_name: "微信".to_string(),
+                path: receive_dir.to_string_lossy().into_owned(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let source_id = sources[0].id.clone();
+        // 空目录时完成首次确认，之后的文件才算「新到」，会被补扫自动导入。
+        {
+            let mut service = state.service().unwrap();
+            service.ensure_current_library(&library).unwrap();
+            let batch_id = service
+                .begin_receive_import_batch(&source_id, Vec::new())
+                .unwrap()
+                .batch_id;
+            service.finish_receive_import_batch(&batch_id).unwrap();
+        }
+        for index in 0..count {
+            std::fs::write(
+                receive_dir.join(format!("消息-{index:04}.txt")),
+                format!("正文 {index} 用于制造一轮较长的补扫"),
+            )
+            .unwrap();
+        }
+        (source_id, receive_dir)
+    }
+
+    /// L1：停止信号在**每一项之间**生效并中止批次，未开始的项一个都不导入。
+    ///
+    /// 这条是确定性的：批次一开始就带停止信号，所以「是否检查停止」不依赖时序。
+    #[test]
+    fn receive_import_stops_between_items_and_aborts_the_batch() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let (source_id, _receive_dir) = confirmed_source_with_new_files(&state, root.path(), 20);
+        let library = state.service().unwrap().current_library().cloned().unwrap();
+
+        let paths = {
+            let service = state.service().unwrap();
+            service.ensure_current_library(&library).unwrap();
+            service.receive_pending_files(&source_id, true).unwrap()
+        };
+        assert_eq!(paths.len(), 20);
+
+        let stop = Arc::new(AtomicBool::new(true));
+        let result = drive_receive_import(
+            &state.service_handle(),
+            &library,
+            &source_id,
+            paths.clone(),
+            false,
+            Some(&stop),
+        )
+        .unwrap();
+        assert!(result.is_none(), "收到停止信号应返回 None（批次已中止）");
+        assert!(
+            list_documents_contract(&state).unwrap().is_empty(),
+            "停止信号到达时不应再提交任何一项"
+        );
+
+        // 中止不留残局：同一批文件随后仍可正常导入。
+        std::thread::sleep(Duration::from_millis(5));
+        let result = drive_receive_import(
+            &state.service_handle(),
+            &library,
+            &source_id,
+            paths,
+            false,
+            None,
+        )
+        .unwrap()
+        .expect("没有停止信号时应正常完成");
+        assert_eq!(result.imported_count, 20);
+        assert_eq!(list_documents_contract(&state).unwrap().len(), 20);
+    }
+
+    /// L1：补扫进行到一半时关闭窗口（Drop 监视器）——`Drop` 应在一次文件处理内返回，
+    /// 整轮补扫被中止，且 `Drop` 之后不再有任何导入。
+    #[test]
+    fn receive_directory_monitor_stops_mid_round_when_dropped() {
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let total = 400;
+        let (source_id, receive_dir) = confirmed_source_with_new_files(&state, root.path(), total);
+        assert_eq!(
+            std::fs::read_dir(&receive_dir).unwrap().count(),
+            total,
+            "样本文件应当齐备"
+        );
+        let _ = source_id;
+
+        let monitor = ReceiveDirectoryMonitor::start(
+            state.service_handle(),
+            Duration::from_millis(30),
+            |_, _| {},
+        )
+        .unwrap();
+
+        // 等到这一轮真的开始导入（出现第一份文档）再触发 Drop。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && list_documents_contract(&state).unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !list_documents_contract(&state).unwrap().is_empty(),
+            "监视应已开始这一轮补扫"
+        );
+
+        let started = Instant::now();
+        drop(monitor);
+        let elapsed = started.elapsed();
+        let after_drop = list_documents_contract(&state).unwrap().len();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Drop 应在一次文件处理内返回，实际 {elapsed:?}"
+        );
+        assert!(
+            after_drop < total,
+            "Drop 应中止整轮补扫而不是跑完：{after_drop}/{total}"
+        );
+        // 线程真的退出了：Drop 之后不会再有新的导入落地。
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            list_documents_contract(&state).unwrap().len(),
+            after_drop,
+            "Drop 之后不应再有任何导入"
         );
     }
 }
