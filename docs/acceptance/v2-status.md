@@ -89,7 +89,9 @@
 
 07 剩余的唯一验收条目要求自动化驱动**真实原生文件选择器 / 首次向导 / 导入按钮**。在当前环境下这需要在用户日常使用的交互式桌面上注入鼠标与键盘输入（tauri-driver + WebDriver，或 Win32 消息驱动原生对话框）。本轮尝试时占用了用户桌面，已被用户要求停止，脚本未提交并已删除，过程记录在 `issues/07-native-smoke-test.md`。
 
-当前可复现的部分：`npm run test:native-smoke` 仍能在真实 Windows 窗口中跑通 9/9 步（含 TXT 导入后的集合整理、搜索、预览、回收站与恢复），覆盖标志 `nativeFilePickerCovered`、`libraryWizardCovered`、`importButtonCovered` 均为 `false`，不得据此签收。剩余部分需要：① 人工按文档执行并记录；② 在独立测试机/虚拟机执行；或 ③ 明确接受该条长期未覆盖。
+**已覆盖且可在需要时重跑的部分**：`npm run test:native-smoke` 在真实 Windows 窗口中跑通 9/9 步（检查驱动前置 → 构建隔离 debug 程序 → 启动真实窗口 → IPC 建库 → IPC 导入 TXT → 建集合并移动 → 搜索与预览 → 移入回收站并恢复 → 截图）。第二版全部实现合并后（2026-09-23）经用户同意重跑一次作为**回归复查**，9 步全过，说明真实窗口与 IPC 这条路没有被第二版的改动破坏；覆盖标志 `nativeFilePickerCovered`、`libraryWizardCovered`、`importButtonCovered` 仍为 `false`，不得据此签收。该次运行还暴露一次驱动启动阶段的偶发崩溃（退出码 `0xC0000409`，重跑即过、未改代码），已记录在 `docs/acceptance/native-smoke.md`。
+
+剩余部分需要：① 人工按文档执行并记录；② 在独立测试机/虚拟机执行；或 ③ 明确接受该条长期未覆盖。
 
 ## 五、人工验收（用户，2026-09-23）
 
