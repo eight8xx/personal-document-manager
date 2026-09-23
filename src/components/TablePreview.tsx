@@ -66,6 +66,8 @@ export function TablePreview({ client, document, preview }: TablePreviewProps) {
   const columnCount = range.columnCount;
   const startRow = range.startRow;
   const cells = range.cells;
+  // 后端给出与单元格一一对应的真实行号；稀疏表会跳号，缺失时退回连续序号。
+  const rowNumbers = range.rowNumbers ?? [];
   const sheet = range.sheets.find((candidate) => candidate.index === sheetIndex);
   const hasSheetTabs = range.sheets.length > 1;
   const hasPrevious = startRow > 0;
@@ -111,15 +113,18 @@ export function TablePreview({ client, document, preview }: TablePreviewProps) {
     }
   }
 
-  const lastRowNumber = startRow + cells.length;
+  const firstRowNumber = rowNumbers[0] ?? startRow;
+  const lastRowNumber = rowNumbers.at(-1) ?? startRow + cells.length - 1;
   const rangeLabel =
     cells.length === 0
       ? startRow > 0
         ? `第 ${startRow + 1} 行之后无数据`
         : "无数据行"
-      : `第 ${startRow + 1} - ${lastRowNumber} 行${
-          sheet?.rowCount ? ` / ${sheet.rowCount}` : ""
-        }`;
+      : firstRowNumber === lastRowNumber
+        ? `第 ${firstRowNumber + 1} 行${sheet?.rowCount ? ` / ${sheet.rowCount}` : ""}`
+        : `第 ${firstRowNumber + 1} - ${lastRowNumber + 1} 行${
+            sheet?.rowCount ? ` / ${sheet.rowCount}` : ""
+          }`;
 
   return (
     <div className="table-preview" data-preview-kind="table">
@@ -233,8 +238,10 @@ export function TablePreview({ client, document, preview }: TablePreviewProps) {
             </caption>
             <tbody>
               {cells.map((row, rowOffset) => (
-                <tr key={startRow + rowOffset}>
-                  <th scope="row">{startRow + rowOffset + 1}</th>
+                <tr key={rowNumbers[rowOffset] ?? startRow + rowOffset}>
+                  <th scope="row">
+                    {(rowNumbers[rowOffset] ?? startRow + rowOffset) + 1}
+                  </th>
                   {row.map((cell, columnIndex) => (
                     <td key={columnIndex}>
                       {cell === "" ? (

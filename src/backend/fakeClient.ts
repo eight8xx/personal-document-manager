@@ -1114,6 +1114,11 @@ export class FakeBackendClient implements BackendClient {
         `R${startRow + offset + 1}C${column + 1}`
       )
     );
+    // 与真实后端一致：行号与单元格一一对应，连续范围内即连续行号。
+    const rowNumbers = Array.from(
+      { length: visibleRows },
+      (_, offset) => startRow + offset
+    );
 
     return {
       kind: "table",
@@ -1121,6 +1126,7 @@ export class FakeBackendClient implements BackendClient {
       sheetIndex,
       startRow,
       cells,
+      rowNumbers,
       columnCount,
       hasMoreRows: startRow + visibleRows < totalRows,
       degradedFeatures: [],

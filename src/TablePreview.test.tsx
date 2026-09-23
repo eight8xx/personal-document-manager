@@ -172,6 +172,51 @@ describe("CSV/XLSX 表格预览", () => {
     ).toBeInTheDocument();
   });
 
+  it("uses the sparse row numbers from the backend instead of sequential numbering", () => {
+    const payload: TablePreviewPayload = {
+      kind: "table",
+      sheets: [{ index: 0, name: "明细", rowCount: 8, columnCount: 2 }],
+      sheetIndex: 0,
+      startRow: 0,
+      cells: [["备注"], ["", "42"]],
+      rowNumbers: [0, 6],
+      columnCount: 2,
+      hasMoreRows: false,
+      degradedFeatures: [],
+      notice: null
+    };
+    const { client } = staticTableClient(xlsxDocument, payload);
+
+    renderPreview(client, xlsxDocument, payload);
+
+    // 稀疏表把真实 Excel 行号（第 1 行、第 7 行）呈现给用户。
+    expect(screen.getByRole("rowheader", { name: "1" })).toBeInTheDocument();
+    expect(screen.getByRole("rowheader", { name: "7" })).toBeInTheDocument();
+    expect(screen.queryByRole("rowheader", { name: "2" })).not.toBeInTheDocument();
+    expect(screen.getByText("第 1 - 7 行 / 8")).toBeInTheDocument();
+  });
+
+  it("falls back to sequential numbering when the backend omits row numbers", () => {
+    const payload: TablePreviewPayload = {
+      kind: "table",
+      sheets: [{ index: 0, name: "CSV", rowCount: 3, columnCount: 1 }],
+      sheetIndex: 0,
+      startRow: 1,
+      cells: [["第二行"], ["第三行"]],
+      columnCount: 1,
+      hasMoreRows: false,
+      degradedFeatures: [],
+      notice: null
+    };
+    const { client } = staticTableClient(csvDocument, payload);
+
+    renderPreview(client, csvDocument, payload);
+
+    expect(screen.getByRole("rowheader", { name: "2" })).toBeInTheDocument();
+    expect(screen.getByRole("rowheader", { name: "3" })).toBeInTheDocument();
+    expect(screen.getByText("第 2 - 3 行 / 3")).toBeInTheDocument();
+  });
+
   it("disables both paging buttons on a range that is the first and last page", async () => {
     const recorder = recordingClient([xlsxDocument]);
     const preview = await initialPreview(recorder.client, xlsxDocument);

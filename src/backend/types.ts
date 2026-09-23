@@ -127,6 +127,8 @@ export type DocumentPreview =
       startRow: number;
       /** 本次返回的单元格，每行长度不超过 columnCount，不补齐缺失单元格。 */
       cells: string[][];
+      /** 与 cells 一一对应的行号（从 0 开始）；XLSX 稀疏表会跳号。 */
+      rowNumbers?: number[];
       columnCount: number;
       /** 是否还有更多行可读取。 */
       hasMoreRows: boolean;
