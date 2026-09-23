@@ -571,4 +571,164 @@ describe("接收目录配置", () => {
     expect(screen.getByText(/待处理 3 个文件/)).toBeInTheDocument();
     expect(within(log).getByText("旧文件.pdf")).toBeInTheDocument();
   });
+
+  const pendingSource = { ...qqSource, pendingCount: 1 };
+  const pendingEntry = logEntry("变化的内容.pdf", {
+    status: "sourceChanged",
+    itemId: "receive-item-1"
+  });
+
+  it("offers new and replace decisions for an unresolved source-changed entry", async () => {
+    const client = createClient({
+      sources: [pendingSource],
+      log: [pendingEntry]
+    });
+    renderPanel(client);
+
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+    expect(within(log).getByText("变化的内容.pdf")).toBeInTheDocument();
+    expect(within(log).getByText("来源已变化")).toBeInTheDocument();
+    expect(
+      within(log).getByRole("button", { name: "为 变化的内容.pdf 新建文档" })
+    ).toBeEnabled();
+    expect(
+      within(log).getByRole("button", {
+        name: "用 变化的内容.pdf 替换已有文档"
+      })
+    ).toBeEnabled();
+    expect(screen.getByText(/待处理 1 个文件/)).toBeInTheDocument();
+  });
+
+  it("creates a new document from a pending receive entry and settles the count", async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      sources: [pendingSource],
+      log: [pendingEntry]
+    });
+    renderPanel(client);
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+
+    await user.click(
+      within(log).getByRole("button", { name: "为 变化的内容.pdf 新建文档" })
+    );
+
+    await waitFor(() => {
+      expect(client.calls).toContain(
+        "resolveImportItem:receive-item-1:createNew"
+      );
+    });
+    // 成功后条目变为「已处理」，不再提供决定按钮，待处理数回落。
+    expect(await within(log).findByText("已处理")).toBeInTheDocument();
+    expect(
+      within(log).queryByRole("button", { name: "为 变化的内容.pdf 新建文档" })
+    ).not.toBeInTheDocument();
+    expect(
+      within(log).queryByRole("button", {
+        name: "用 变化的内容.pdf 替换已有文档"
+      })
+    ).not.toBeInTheDocument();
+    expect(
+      await within(screen.getByRole("group", { name: "QQ" })).findByText(
+        /待处理 0 个文件/
+      )
+    ).toBeInTheDocument();
+  });
+
+  it("replaces the existing document from a pending receive entry", async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      sources: [pendingSource],
+      log: [pendingEntry]
+    });
+    renderPanel(client);
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+
+    await user.click(
+      within(log).getByRole("button", {
+        name: "用 变化的内容.pdf 替换已有文档"
+      })
+    );
+
+    await waitFor(() => {
+      expect(client.calls).toContain(
+        "resolveImportItem:receive-item-1:replaceExisting"
+      );
+    });
+    expect(await within(log).findByText("已处理")).toBeInTheDocument();
+    expect(
+      await within(screen.getByRole("group", { name: "QQ" })).findByText(
+        /待处理 0 个文件/
+      )
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the pending entry and shows the reason when resolving fails", async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      sources: [pendingSource],
+      log: [pendingEntry, logEntry("已导入的文件.pdf")]
+    });
+    client.resolveImportItem = async () => {
+      throw new BackendError({
+        code: "documentFileMissing",
+        message: "来源文件已被移动或删除，无法替换资料库副本。"
+      });
+    };
+    renderPanel(client);
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+
+    await user.click(
+      within(log).getByRole("button", { name: "为 变化的内容.pdf 新建文档" })
+    );
+
+    expect(await within(log).findByRole("alert")).toHaveTextContent(
+      "来源文件已被移动或删除，无法替换资料库副本。"
+    );
+    // 未决条目保留按钮，其它条目与待处理数不受影响。
+    expect(
+      within(log).getByRole("button", { name: "为 变化的内容.pdf 新建文档" })
+    ).toBeEnabled();
+    expect(within(log).queryByText("已处理")).not.toBeInTheDocument();
+    expect(within(log).getByText("已导入的文件.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/待处理 1 个文件/)).toBeInTheDocument();
+  });
+
+  it("does not offer decisions for entries that are already resolved", async () => {
+    const client = createClient({
+      sources: [qqSource],
+      log: [
+        logEntry("已处理的变化.pdf", {
+          status: "sourceChanged",
+          itemId: "receive-item-2",
+          resolvedAt: "2026-09-23T11:30:00Z"
+        })
+      ]
+    });
+    renderPanel(client);
+
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+    expect(within(log).getByText("已处理的变化.pdf")).toBeInTheDocument();
+    expect(within(log).getByText("已处理")).toBeInTheDocument();
+    expect(within(log).queryByRole("button", { name: /新建文档/ })).toBeNull();
+    expect(within(log).queryByRole("button", { name: /替换已有文档/ })).toBeNull();
+  });
+
+  it("renders legacy source-changed entries without an itemId without decisions", async () => {
+    const client = createClient({
+      sources: [qqSource],
+      log: [
+        logEntry("旧数据变化.pdf", { status: "sourceChanged", itemId: null }),
+        logEntry("缺字段变化.pdf", { status: "sourceChanged" })
+      ]
+    });
+    renderPanel(client);
+
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+    expect(within(log).getByText("旧数据变化.pdf")).toBeInTheDocument();
+    expect(within(log).getByText("缺字段变化.pdf")).toBeInTheDocument();
+    expect(within(log).getAllByText("来源已变化")).toHaveLength(2);
+    expect(within(log).queryByRole("button", { name: /新建文档/ })).toBeNull();
+    expect(within(log).queryByRole("button", { name: /替换已有文档/ })).toBeNull();
+    expect(client.calls).not.toContain("resolveImportItem:undefined:createNew");
+  });
 });

@@ -34,6 +34,7 @@ import type {
   ImportBatch,
   ImportDecision,
   ImportItemResult,
+  ImportItemStatus,
   ImportProgress,
   ImportProgressHandler,
   ImportSource,
@@ -624,6 +625,16 @@ export class FakeBackendClient implements BackendClient {
       };
       this.replaceStoredImportItem(item);
       return structuredClone(item);
+    }
+
+    // 接收目录的「来源内容变化」待决项没有导入批次，先用日志条目处理。
+    const receiveIndex = this.receiveImportLog.findIndex(
+      (entry) => entry.itemId === itemId
+    );
+    if (receiveIndex >= 0) {
+      return structuredClone(
+        this.resolveReceiveImportLogEntry(_library, receiveIndex, decision)
+      );
     }
 
     const stored = this.findStoredImportItem(itemId);
@@ -2055,6 +2066,58 @@ export class FakeBackendClient implements BackendClient {
     for (const handler of this.receiveImportCompletedHandlers) {
       handler(structuredClone(event));
     }
+  }
+
+  /**
+   * 处理接收目录「来源内容变化」产生的待决项：标记日志条目的 `resolvedAt`，
+   * 并让它所属来源的待处理数量回落，与后端语义一致。
+   */
+  private resolveReceiveImportLogEntry(
+    library: LibrarySummary,
+    index: number,
+    decision: ImportDecision
+  ): ImportItemResult {
+    const entry = this.receiveImportLog[index];
+    const status: ImportItemStatus =
+      decision === "replaceExisting" || decision === "createNew"
+        ? "imported"
+        : "skipped";
+    const resolved: ReceiveImportLogEntry = {
+      ...entry,
+      status,
+      resolvedAt: new Date().toISOString(),
+      errorMessage: null
+    };
+    this.receiveImportLog = this.receiveImportLog.map((candidate, position) =>
+      position === index ? resolved : candidate
+    );
+
+    const key = this.libraryKey(library);
+    const sources = this.receiveSources.get(key) ?? [];
+    this.receiveSources.set(
+      key,
+      sources.map((source) =>
+        source.id === entry.sourceId
+          ? { ...source, pendingCount: Math.max(0, source.pendingCount - 1) }
+          : source
+      )
+    );
+
+    return {
+      itemId: entry.itemId ?? "",
+      sourcePath: entry.sourcePath,
+      fileName: entry.fileName,
+      fileType: null,
+      status,
+      documentId: entry.documentId,
+      duplicateDocumentId: null,
+      errorStage: null,
+      errorMessage: null,
+      retryable: false,
+      targetCollectionId: null,
+      collectionId: entry.collectionId,
+      notice: null
+    };
   }
 
   private snapshot(): BootstrapState {

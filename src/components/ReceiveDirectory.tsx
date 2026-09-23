@@ -72,6 +72,15 @@ const IMPORT_STATUS_LABELS: Record<ImportItemStatus, string> = {
   skipped: "已跳过"
 };
 
+/** 只有来源内容变化的未决条目才需要用户决定「新建 / 替换」。 */
+export function isPendingReceiveEntry(entry: ReceiveImportLogEntry) {
+  return (
+    entry.status === "sourceChanged" &&
+    Boolean(entry.itemId) &&
+    !entry.resolvedAt
+  );
+}
+
 function formatTimestamp(value: string | null) {
   if (!value) {
     return "尚未扫描";
@@ -107,6 +116,9 @@ export function ReceiveDirectoryPanel({ client }: ReceiveDirectoryPanelProps) {
   >({});
   const [reloadToken, setReloadToken] = useState(0);
   const [importLog, setImportLog] = useState<ReceiveImportLogEntry[]>([]);
+  const [resolvingItemId, setResolvingItemId] = useState<string | null>(null);
+  /** 按待决项记录处理失败原因；失败条目保留，其它条目不受影响。 */
+  const [resolveErrors, setResolveErrors] = useState<Record<string, string>>({});
   /** 事件回调里需要按 sourceId 找到来源种类，用 ref 避免因 sources 变化反复重新订阅。 */
   const sourcesRef = useRef<ReceiveSource[]>([]);
 
@@ -424,6 +436,36 @@ export function ReceiveDirectoryPanel({ client }: ReceiveDirectoryPanelProps) {
       setError(toBackendError(caught).message);
     } finally {
       setBusyKind(null);
+    }
+  }
+
+  /**
+   * 处理「来源内容变化」的待决项：把决定交给既有 `resolveImportItem`，
+   * 成功后刷新来源与日志（待处理数随之回落）；失败保留待决并显示原因。
+   */
+  async function resolvePendingEntry(
+    itemId: string,
+    decision: "createNew" | "replaceExisting"
+  ) {
+    if (!library) {
+      return;
+    }
+    setResolvingItemId(itemId);
+    setResolveErrors((current) => {
+      const next = { ...current };
+      delete next[itemId];
+      return next;
+    });
+    try {
+      await client.resolveImportItem(library, itemId, decision);
+      await refreshFromBackend();
+    } catch (caught) {
+      setResolveErrors((current) => ({
+        ...current,
+        [itemId]: toBackendError(caught).message
+      }));
+    } finally {
+      setResolvingItemId(null);
     }
   }
 
@@ -780,24 +822,81 @@ export function ReceiveDirectoryPanel({ client }: ReceiveDirectoryPanelProps) {
           <p className="muted-copy">还没有接收导入记录。</p>
         ) : (
           <ul className="receive-log-list" aria-label="接收导入日志">
-            {importLog.map((entry) => (
-              <li key={`${entry.sourcePath}:${entry.createdAt}`}>
-                <div className="receive-log-main">
-                  <strong>{entry.fileName}</strong>
-                  <span className="receive-log-status">
-                    {IMPORT_STATUS_LABELS[entry.status]}
-                  </span>
-                  {entry.collectionId ? (
-                    <span className="muted-copy">{entry.collectionId}</span>
+            {importLog.map((entry) => {
+              const itemId = entry.itemId ?? null;
+              const pending = isPendingReceiveEntry(entry);
+              return (
+                <li key={`${entry.sourcePath}:${entry.createdAt}`}>
+                  <div className="receive-log-main">
+                    <strong>{entry.fileName}</strong>
+                    <span className="receive-log-status">
+                      {IMPORT_STATUS_LABELS[entry.status]}
+                    </span>
+                    {entry.collectionId ? (
+                      <span className="muted-copy">{entry.collectionId}</span>
+                    ) : null}
+                    {entry.resolvedAt ? (
+                      <>
+                        <span className="status-badge success">已处理</span>
+                        <span className="muted-copy">
+                          {formatTimestamp(entry.resolvedAt)}
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
+
+                  {pending && itemId ? (
+                    <div className="receive-log-actions">
+                      <p className="muted-copy">
+                        来源内容已变化：选择新建一份文档，或用当前内容替换资料库副本。
+                      </p>
+                      <div className="row-actions">
+                        <button
+                          className="button quiet"
+                          type="button"
+                          onClick={() =>
+                            void resolvePendingEntry(itemId, "createNew")
+                          }
+                          disabled={resolvingItemId === itemId}
+                          aria-label={`为 ${entry.fileName} 新建文档`}
+                        >
+                          {resolvingItemId === itemId ? (
+                            <LoaderCircle
+                              className="spin"
+                              size={14}
+                              aria-hidden="true"
+                            />
+                          ) : null}
+                          新建文档
+                        </button>
+                        <button
+                          className="button secondary"
+                          type="button"
+                          onClick={() =>
+                            void resolvePendingEntry(itemId, "replaceExisting")
+                          }
+                          disabled={resolvingItemId === itemId}
+                          aria-label={`用 ${entry.fileName} 替换已有文档`}
+                        >
+                          替换已有文档
+                        </button>
+                      </div>
+                    </div>
                   ) : null}
-                </div>
-                {entry.errorMessage ? (
-                  <p className="receive-log-error" role="alert">
-                    {entry.errorMessage}
-                  </p>
-                ) : null}
-              </li>
-            ))}
+
+                  {itemId && resolveErrors[itemId] ? (
+                    <p className="receive-log-error" role="alert">
+                      {resolveErrors[itemId]}
+                    </p>
+                  ) : null}
+                  {entry.errorMessage ? (
+                    <p className="receive-log-error" role="alert">
+                      {entry.errorMessage}
+                    </p>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>

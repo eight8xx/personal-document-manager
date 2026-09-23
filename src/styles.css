@@ -3980,6 +3980,25 @@ p {
   line-height: 1.5;
 }
 
+.receive-log-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--warning-soft);
+}
+
+.receive-log-actions .muted-copy {
+  margin: 0;
+  color: var(--warning);
+}
+
+.receive-log-actions .row-actions {
+  gap: 6px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
