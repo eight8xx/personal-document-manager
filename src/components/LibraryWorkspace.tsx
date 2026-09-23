@@ -72,6 +72,10 @@ import { DocumentMetadataDialog } from "./DocumentMetadataDialog";
 import { DocumentGrid, DocumentList } from "./DocumentResults";
 import { ImportBatchPanel } from "./ImportBatchPanel";
 import { ImportDecisionDialog } from "./ImportDecisionDialog";
+import {
+  ImportClassificationPreview
+} from "./ImportClassificationPreview";
+import type { ImportClassificationDecision } from "./ImportClassificationPreview";
 import { SearchFilters } from "./SearchFilters";
 import {
   DeleteTagDialog,
@@ -102,6 +106,13 @@ interface ImportRun {
   batch: ImportBatch | null;
   progress: ImportProgress | null;
   items: ImportItemResult[];
+}
+
+/** 等待用户决定「是否应用分类规则」的人工批量导入。 */
+interface PendingImport {
+  paths: string[];
+  targetCollectionId: string | null;
+  source: ImportSource;
 }
 
 type DocumentView = "list" | "grid";
@@ -340,6 +351,8 @@ export function LibraryWorkspace({
   const [importing, setImporting] = useState(false);
   const importingRef = useRef(false);
   const [importRun, setImportRun] = useState<ImportRun | null>(null);
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  const pendingImportRef = useRef(false);
   const [importRestartNotice, setImportRestartNotice] = useState(
     showImportRestartNotice
   );
@@ -682,23 +695,14 @@ export function LibraryWorkspace({
     selectedTagId
   ]);
 
-  const importPaths = useCallback(
+  /** 真正执行导入；`applyClassification` 由用户在预览对话框里的选择决定。 */
+  const runImport = useCallback(
     async (
       paths: string[],
-      targetCollectionId: string | null = null,
-      source: ImportSource = "filePicker"
+      targetCollectionId: string | null,
+      source: ImportSource,
+      applyClassification: boolean
     ) => {
-      const uniquePaths = [...new Set(paths.filter(Boolean))];
-      if (uniquePaths.length === 0) {
-        return;
-      }
-      if (importingRef.current) {
-        setError(
-          "已有导入批次正在运行，请等待完成后再拖入文件或文件夹。"
-        );
-        return;
-      }
-
       importingRef.current = true;
       setImporting(true);
       setImportRestartNotice(false);
@@ -715,9 +719,10 @@ export function LibraryWorkspace({
       try {
         const batch = await client.startImport(
           library,
-          uniquePaths,
+          paths,
           targetCollectionId,
-          source
+          source,
+          applyClassification
         );
         setImportRun((current) => {
           if (current?.batchId && current.batchId !== batch.batchId) {
@@ -744,6 +749,62 @@ export function LibraryWorkspace({
       }
     },
     [client, library, refreshLibraryData]
+  );
+
+  /**
+   * 人工批量导入的入口：先让用户看分类预览并决定是否应用规则，再调用 `startImport`。
+   * 取消预览不会导入任何文件；显式选择「按原有方式导入」时传 `applyClassification=false`，
+   * 与改动前的行为完全一致。
+   */
+  const importPaths = useCallback(
+    async (
+      paths: string[],
+      targetCollectionId: string | null = null,
+      source: ImportSource = "filePicker"
+    ) => {
+      const uniquePaths = [...new Set(paths.filter(Boolean))];
+      if (uniquePaths.length === 0) {
+        return;
+      }
+      if (importingRef.current) {
+        setError(
+          "已有导入批次正在运行，请等待完成后再拖入文件或文件夹。"
+        );
+        return;
+      }
+      if (pendingImportRef.current) {
+        setError("已有待确认的分类预览，请先完成或取消后再发起导入。");
+        return;
+      }
+
+      pendingImportRef.current = true;
+      setError("");
+      setPendingImport({ paths: uniquePaths, targetCollectionId, source });
+    },
+    []
+  );
+
+  const cancelPendingImport = useCallback(() => {
+    pendingImportRef.current = false;
+    setPendingImport(null);
+  }, []);
+
+  const decidePendingImport = useCallback(
+    (decision: ImportClassificationDecision) => {
+      const pending = pendingImport;
+      if (!pending) {
+        return;
+      }
+      pendingImportRef.current = false;
+      setPendingImport(null);
+      void runImport(
+        pending.paths,
+        pending.targetCollectionId,
+        pending.source,
+        decision === "applyRules"
+      );
+    },
+    [pendingImport, runImport]
   );
 
   useEffect(() => {
@@ -2016,6 +2077,18 @@ export function LibraryWorkspace({
           <p className="muted-copy" role="status">
             此前未完成的导入请重新发起。
           </p>
+        ) : null}
+
+        {pendingImport ? (
+          <ImportClassificationPreview
+            client={client}
+            paths={pendingImport.paths}
+            targetCollectionId={pendingImport.targetCollectionId}
+            collections={collections}
+            tags={tags}
+            onDecide={decidePendingImport}
+            onCancel={cancelPendingImport}
+          />
         ) : null}
 
         {importRun ? (

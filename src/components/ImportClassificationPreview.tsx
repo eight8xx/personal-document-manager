@@ -48,6 +48,22 @@ function collectionLabel(
   return nameOf(collections, collectionId);
 }
 
+/** 预览项的稳定指纹；用于判断确认前的重新计算是否与展示结果一致。 */
+function previewFingerprint(items: ClassificationPreviewItem[]) {
+  return items
+    .map((item) =>
+      [
+        item.sourcePath,
+        item.fileName,
+        item.fileType ?? "",
+        item.collectionId,
+        item.tagIds.join("|"),
+        item.matchedRuleIds.join("|")
+      ].join("~")
+    )
+    .join("\n");
+}
+
 /**
  * 人工批量导入前的「是否应用分类规则」询问（工作单 10）。
  *
@@ -69,11 +85,15 @@ export function ImportClassificationPreview({
   const [error, setError] = useState("");
   const [page, setPage] = useState(0);
   const [reloadToken, setReloadToken] = useState(0);
+  const [confirming, setConfirming] = useState(false);
+  /** 预览之后规则或源文件发生变化时置位：显示最新结果并要求再次确认。 */
+  const [stale, setStale] = useState(false);
   const requestKey = `${targetCollectionId ?? ""}\n${paths.join("\n")}`;
 
   useEffect(() => {
     let active = true;
     setPage(0);
+    setStale(false);
     if (!library || paths.length === 0) {
       setItems([]);
       setLoading(false);
@@ -117,6 +137,35 @@ export function ImportClassificationPreview({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [onCancel]);
+
+  /**
+   * 确认前重新计算一次：规则或源文件若在预览之后变化，就展示最新结果并要求复核，
+   * 绝不按已经过期的预览静默导入。
+   */
+  async function confirmApply() {
+    if (!library || confirming || loading) {
+      return;
+    }
+    setConfirming(true);
+    setError("");
+    try {
+      const fresh = await client.previewClassification(library, {
+        paths,
+        targetCollectionId
+      });
+      if (previewFingerprint(fresh.items) === previewFingerprint(items)) {
+        onDecide("applyRules");
+        return;
+      }
+      setItems(fresh.items);
+      setPage(0);
+      setStale(true);
+    } catch (caught) {
+      setError(toBackendError(caught).message);
+    } finally {
+      setConfirming(false);
+    }
+  }
 
   const pageCount = Math.max(
     1,
@@ -263,22 +312,35 @@ export function ImportClassificationPreview({
             </div>
           ) : null}
 
+          {stale ? (
+            <p className="classification-preview-stale" role="alert">
+              分类规则或文件在预览后发生了变化，已重新计算上面的结果，请复核后再次确认。
+            </p>
+          ) : null}
+
           <div className="dialog-actions">
             <button
               className="button secondary"
               type="button"
               onClick={() => onDecide("keepExisting")}
+              disabled={confirming}
             >
               不应用，按原有方式导入
             </button>
             <button
               className="button primary"
               type="button"
-              onClick={() => onDecide("applyRules")}
-              disabled={loading || Boolean(error) || items.length === 0}
+              onClick={() => void confirmApply()}
+              disabled={
+                confirming || loading || Boolean(error) || items.length === 0
+              }
             >
-              <ListChecks size={15} aria-hidden="true" />
-              应用分类规则并导入
+              {confirming ? (
+                <LoaderCircle className="spin" size={15} aria-hidden="true" />
+              ) : (
+                <ListChecks size={15} aria-hidden="true" />
+              )}
+              {confirming ? "正在复核预览" : "应用分类规则并导入"}
             </button>
           </div>
         </div>

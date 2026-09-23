@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -10,8 +10,10 @@ import type {
   LibrarySummary,
   ReceiveDirectoryListingItem,
   ReceiveDirectoryOperation,
+  ReceiveImportLogEntry,
   ReceiveSource,
   ReceiveSourceCandidate,
+  ReceiveSourceScanResult,
   ReceiveSourceInput
 } from "./backend/types";
 import { ReceiveDirectoryPanel } from "./components/ReceiveDirectory";
@@ -111,17 +113,20 @@ interface ClientOptions {
   sources?: ReceiveSource[];
   candidates?: Partial<Record<"qq" | "wechat", ReceiveSourceCandidate[]>>;
   listing?: ReceiveDirectoryListingItem[];
+  log?: ReceiveImportLogEntry[];
 }
 
 function createClient({
   sources = [],
   candidates = { qq: qqCandidates, wechat: wechatCandidates },
-  listing = listings
+  listing = listings,
+  log = []
 }: ClientOptions = {}) {
   return new FakeBackendClient({
     receiveSources: { [libraryKey]: structuredClone(sources) },
     receiveDirectoryFiles: { [libraryKey]: structuredClone(listing) },
-    receiveSourceCandidates: structuredClone(candidates)
+    receiveSourceCandidates: structuredClone(candidates),
+    receiveImportLog: structuredClone(log)
   });
 }
 
@@ -435,5 +440,135 @@ describe("接收目录配置", () => {
 
     expect(await screen.findByText(qqPath)).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  const logEntry = (
+    fileName: string,
+    overrides: Partial<ReceiveImportLogEntry> = {}
+  ): ReceiveImportLogEntry => ({
+    sourceId: "source-qq",
+    sourcePath: `C:\\QQ\\FileRecv\\${fileName}`,
+    fileName,
+    status: "imported",
+    documentId: `document-${fileName}`,
+    collectionId: null,
+    tagIds: [],
+    matchedRuleIds: [],
+    errorMessage: null,
+    createdAt: "2026-09-23T10:00:00Z",
+    ...overrides
+  });
+
+  const completedResult = (
+    overrides: Partial<ReceiveSourceScanResult> = {}
+  ): ReceiveSourceScanResult => ({
+    sourceId: "source-qq",
+    scannedCount: 2,
+    importedCount: 2,
+    skippedCount: 0,
+    pendingCount: 5,
+    failedCount: 0,
+    ...overrides
+  });
+
+  it("refreshes sources and the import log when a receive import completes", async () => {
+    const client = createClient({
+      sources: [qqSource],
+      log: [logEntry("旧文件.pdf")]
+    });
+    let backendUpdated = false;
+    const listSources = client.listReceiveSources.bind(client);
+    const listLog = client.listReceiveImportLog.bind(client);
+    client.listReceiveSources = async (owner) => {
+      const sources = await listSources(owner);
+      return backendUpdated
+        ? sources.map((source) =>
+            source.id === "source-qq" ? { ...source, pendingCount: 7 } : source
+          )
+        : sources;
+    };
+    client.listReceiveImportLog = async (owner, limit) => {
+      const entries = await listLog(owner, limit);
+      return backendUpdated
+        ? [logEntry("新文件.pdf"), ...entries]
+        : entries;
+    };
+
+    renderPanel(client);
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+    expect(within(log).getByText("旧文件.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/待处理 3 个文件/)).toBeInTheDocument();
+
+    // 后端补扫完成并推进了数据，随后发出事件。
+    backendUpdated = true;
+    act(() => {
+      client.emitReceiveImportCompleted({
+        library,
+        results: [completedResult()]
+      });
+    });
+
+    expect(await screen.findByText("新文件.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/待处理 7 个文件/)).toBeInTheDocument();
+    expect(screen.getByText(/扫描完成：检查 2 个/)).toHaveTextContent(
+      "待处理 5 个"
+    );
+  });
+
+  it("ignores a receive import event that belongs to another library", async () => {
+    const otherLibrary: LibrarySummary = {
+      id: "library-other",
+      name: "另一个资料库",
+      path: "C:\\Documents\\另一个资料库",
+      createdAt: "2026-09-23T08:00:00Z"
+    };
+    const client = createClient({
+      sources: [qqSource],
+      log: [logEntry("旧文件.pdf")]
+    });
+    let backendUpdated = false;
+    const listSources = client.listReceiveSources.bind(client);
+    const listLog = client.listReceiveImportLog.bind(client);
+    client.listReceiveSources = async (owner) => {
+      const sources = await listSources(owner);
+      return backendUpdated
+        ? sources.map((source) =>
+            source.id === "source-qq" ? { ...source, pendingCount: 99 } : source
+          )
+        : sources;
+    };
+    client.listReceiveImportLog = async (owner, limit) => {
+      const entries = await listLog(owner, limit);
+      return backendUpdated
+        ? [logEntry("别的库的文件.pdf"), ...entries]
+        : entries;
+    };
+
+    renderPanel(client);
+    const log = await screen.findByRole("list", { name: "接收导入日志" });
+    expect(within(log).getByText("旧文件.pdf")).toBeInTheDocument();
+    const callsBefore = client.calls.filter((call) =>
+      call.startsWith("listReceiveImportLog")
+    ).length;
+
+    backendUpdated = true;
+    act(() => {
+      client.emitReceiveImportCompleted({
+        library: otherLibrary,
+        results: [completedResult({ scannedCount: 9, importedCount: 9 })]
+      });
+    });
+
+    // 事件属于别的资料库：不刷新、不显示它的扫描结果，也不改动当前库的显示。
+    await waitFor(() => {
+      expect(
+        client.calls.filter((call) => call.startsWith("listReceiveImportLog"))
+          .length
+      ).toBe(callsBefore);
+    });
+    expect(screen.queryByText("别的库的文件.pdf")).not.toBeInTheDocument();
+    expect(screen.queryByText(/检查 9 个/)).not.toBeInTheDocument();
+    expect(screen.getByText(/待处理 3 个文件/)).toBeInTheDocument();
+    expect(within(log).getByText("旧文件.pdf")).toBeInTheDocument();
   });
 });

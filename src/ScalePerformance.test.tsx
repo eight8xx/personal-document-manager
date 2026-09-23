@@ -193,6 +193,11 @@ describe("一万份资料库的列表与网格渲染规模", () => {
     render(<App client={client} />);
     const list = await screen.findByRole("table", { name: "文档结果" });
     await user.click(screen.getByRole("button", { name: "导入文档" }));
+    // 导入前先询问是否应用分类规则；选「不应用」保持原有导入路径。
+    await user.click(
+      await screen.findByRole("button", { name: "不应用，按原有方式导入" })
+    );
+    expect(client.startImportCalls.at(-1)?.applyClassification).toBe(false);
     const dialog = await screen.findByRole("dialog", { name: "发现重复文档" });
     await user.click(within(dialog).getByRole("button", { name: "打开已有文档" }));
     await waitFor(() => {
