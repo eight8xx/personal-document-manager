@@ -204,6 +204,12 @@ pub enum DocumentPreview {
         has_more_rows: bool,
         degraded_features: Vec<String>,
         notice: Option<String>,
+        /// 当前范围之后**下一个含数据的行索引**（稀疏表用）。
+        ///
+        /// 稀疏工作簿的数据可能从很靠后的行开始，逐页 +500 要连点很多次；界面据此直接跳到该行。
+        /// `None` 表示没有更多数据，或该来源是稠密的（CSV）不需要跳转——旧行为不变。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_data_row: Option<usize>,
     },
     Failure {
         code: String,

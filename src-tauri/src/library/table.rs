@@ -1,4 +1,4 @@
-//! 表格文档（CSV/XLSX）的解析层：只做「字节进、结构化数据出」。
+﻿//! 表格文档（CSV/XLSX）的解析层：只做「字节进、结构化数据出」。
 //!
 //! 本模块不接触文件系统、数据库与资料库状态：调用方（`service`）负责读取资料库
 //! 副本的字节并决定请求的行列范围，这里只接收字节与资源预算。
@@ -96,6 +96,10 @@ pub struct TableRange {
     pub has_more_rows: bool,
     pub degraded_features: Vec<String>,
     pub notice: Option<String>,
+    /// 请求范围之后**下一个含数据的行索引**；`None` 表示没有更多数据（或该来源是稠密的）。
+    ///
+    /// 稀疏工作簿的数据可能从很靠后的行开始，界面据此一次跳到数据行，而不是逐页 +500。
+    pub next_data_row: Option<usize>,
 }
 
 /// 读取 CSV 的有限行列范围。
@@ -141,6 +145,8 @@ pub fn read_csv_table(
         column_count: columns,
         degraded_features: degraded,
         notice: had_bom.then(|| "已忽略文件开头的 UTF-8 BOM。".to_string()),
+        // CSV 行是连续的，逐页 +行数就是顺序翻页，不需要跳转提示。
+        next_data_row: None,
     })
 }
 
@@ -216,6 +222,7 @@ pub fn read_xlsx_table(
         column_count: columns,
         degraded_features: degraded,
         notice: None,
+        next_data_row: parsed.next_data_row,
     })
 }
 
@@ -1276,6 +1283,8 @@ struct SheetParse {
     column_count: usize,
     uncached_formulas: usize,
     truncated_cells: usize,
+    /// 请求范围之后第一个含数据的行索引（稀疏表跳页用）。
+    next_data_row: Option<usize>,
 }
 
 struct SheetParser<'a> {
@@ -1301,6 +1310,10 @@ struct SheetParser<'a> {
     /// 保留单元格的总预算与已用量；超预算后只统计不保留。
     cell_budget: usize,
     retained_cells: usize,
+    /// 请求范围之后第一个含数据的行索引（稀疏表跳页用）。
+    next_data_row: Option<usize>,
+    /// 当前行是否有值：窗口外的行不保留单元格，但仍要判断「这一行有没有数据」。
+    current_row_has_data: bool,
 }
 
 impl SheetParser<'_> {
@@ -1319,6 +1332,7 @@ impl SheetParser<'_> {
         self.current_row = Some(row_index);
         self.last_column = None;
         self.row_cells.clear();
+        self.current_row_has_data = false;
         Ok(())
     }
 
@@ -1392,6 +1406,9 @@ impl SheetParser<'_> {
         };
 
         self.last_column = Some(cell.column);
+        if value.is_some() {
+            self.current_row_has_data = true;
+        }
         if let Some(value) = value {
             self.max_row_index = Some(
                 self.max_row_index
@@ -1420,11 +1437,23 @@ impl SheetParser<'_> {
     }
 
     fn finish_row(&mut self) {
-        if self
+        let in_window = self
             .current_row
-            .is_some_and(|row_index| self.in_window(row_index))
-            && !self.row_cells.is_empty()
-        {
+            .is_some_and(|row_index| self.in_window(row_index));
+        // 窗口之外第一个含数据的行：稀疏表靠它一次跳到数据处，不用逐页 +500。
+        if !in_window {
+            if let Some(row_index) = self.current_row {
+                if self.current_row_has_data
+                    && row_index >= self.window_start.saturating_add(self.window_rows)
+                {
+                    self.next_data_row = Some(
+                        self.next_data_row
+                            .map_or(row_index, |current| current.min(row_index)),
+                    );
+                }
+            }
+        }
+        if in_window && !self.row_cells.is_empty() {
             self.retained_cells += self.row_cells.len();
             let dense = self.materialize_row();
             if !dense.is_empty() {
@@ -1469,6 +1498,7 @@ impl SheetParser<'_> {
             column_count: self.max_column_index.map_or(0, |index| index + 1),
             uncached_formulas: self.uncached_formulas,
             truncated_cells: self.truncated_cells,
+            next_data_row: self.next_data_row,
         }
     }
 }
@@ -1499,6 +1529,8 @@ fn parse_sheet_xml(
         truncated_cells: 0,
         cell_budget,
         retained_cells: 0,
+        next_data_row: None,
+        current_row_has_data: false,
     };
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);

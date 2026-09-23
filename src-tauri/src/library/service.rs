@@ -1,4 +1,4 @@
-﻿use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -5458,6 +5458,7 @@ fn read_table_preview(
         has_more_rows: range.has_more_rows,
         degraded_features: range.degraded_features,
         notice: range.notice,
+        next_data_row: range.next_data_row,
     })
 }
 
