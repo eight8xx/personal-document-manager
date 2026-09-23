@@ -542,4 +542,63 @@ describe("CSV/XLSX 表格预览", () => {
       )
     ).toEqual([]);
   });
+
+  it("opens the library copy externally from a table preview without any write", async () => {
+    const user = userEvent.setup();
+    const source = recordingClient([xlsxDocument]);
+    const openedPreview = await initialPreview(source.client, xlsxDocument);
+    const client = new FakeBackendClient({
+      documents: [xlsxDocument],
+      getDocumentPreview: async () => openedPreview
+    });
+    let openCalls = 0;
+    client.openDocument = async (owner, documentId) => {
+      openCalls += 1;
+      await FakeBackendClient.prototype.openDocument.call(
+        client,
+        owner,
+        documentId
+      );
+    };
+
+    render(
+      <LibraryContext.Provider value={library}>
+        <DocumentDetails
+          client={client}
+          document={xlsxDocument}
+          collections={[]}
+          retryingIndex={false}
+          onEditDocument={() => {}}
+          onMoveDocumentToTrash={() => {}}
+          onRetryIndex={() => {}}
+        />
+      </LibraryContext.Provider>
+    );
+
+    // 先切到第二张工作表：外部打开针对的仍是这份文档的资料库副本。
+    await user.click(await screen.findByRole("tab", { name: "明细" }));
+    await screen.findByRole("table", { name: "季度报表 · 明细" });
+
+    await user.click(
+      screen.getByRole("button", { name: "用系统默认程序打开 季度报表" })
+    );
+
+    await waitFor(() => {
+      expect(openCalls).toBe(1);
+    });
+    // 只传文档 ID：后端把它解析成资料库目录下的副本路径（源文件仅被读取）。
+    expect(client.calls).toContain("openDocument:xlsx-1");
+    expect(
+      client.calls.some((call) => call.includes(xlsxDocument.sourcePath))
+    ).toBe(false);
+    expect(
+      client.calls.filter(
+        (call) =>
+          !call.startsWith("getDocumentPreview:") &&
+          !call.startsWith("getTablePreview:") &&
+          !call.startsWith("listDocumentSheets:") &&
+          !call.startsWith("openDocument:")
+      )
+    ).toEqual([]);
+  });
 });

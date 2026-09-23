@@ -7,7 +7,7 @@ import {
   waitFor
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 
 import { App } from "./App";
 import { FakeBackendClient } from "./backend/fakeClient";
@@ -67,6 +67,11 @@ function scaleDocument(index: number): DocumentSummary {
 }
 
 describe("一万份资料库的列表与网格渲染规模", () => {
+  // 视图选择按会话记住；每个用例都从默认的列表视图开始，互不影响。
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
   it("shows live indexing progress while a large index run is active", async () => {
     const indexPromise = new Promise<IndexRunResult>(() => {});
     const client = new FakeBackendClient({
@@ -301,4 +306,68 @@ describe("一万份资料库的列表与网格渲染规模", () => {
     expect(grid.scrollTop).toBe(0);
     expect(container.querySelectorAll(".document-grid-item").length).toBeLessThan(60);
   });
+
+  it("keeps order and visible position across view switches and a search over ten thousand documents", async () => {
+    const user = userEvent.setup();
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: Array.from({ length: 10_000 }, (_, index) =>
+        scaleDocument(index)
+      ),
+      collections
+    });
+    const { container } = render(<App client={client} />);
+    await screen.findByRole("main", { name: "文档列表" });
+    let list = screen.getByRole("table", { name: "文档结果" });
+
+    // 快速滚动到中段：目标行必须落在它自己的位置上，而不是被画到别处。
+    list.scrollTop = 6_000 * 72;
+    fireEvent.scroll(list);
+    await waitFor(() => {
+      expect(within(list).getByRole("button", { name: "选择文档 规模验收资料 06000" })).toBeInTheDocument();
+    });
+    expect(within(list).queryByRole("button", { name: "选择文档 规模验收资料 00000" })).not.toBeInTheDocument();
+
+    // 切换列表与网格后顺序不变：网格从第一条开始，没有重复项或空白。
+    await user.click(screen.getByRole("button", { name: "网格视图" }));
+    const grid = await screen.findByRole("list", { name: "文档结果" });
+    await waitFor(() => {
+      expect(within(grid).getByRole("button", { name: "选择文档 规模验收资料 00000" })).toBeInTheDocument();
+    });
+    expect(within(grid).getAllByRole("button", { name: "选择文档 规模验收资料 00000" })).toHaveLength(1);
+    expect(within(grid).getAllByRole("listitem").length).toBeLessThan(40);
+
+    await user.click(screen.getByRole("button", { name: "列表视图" }));
+    list = await screen.findByRole("table", { name: "文档结果" });
+    await waitFor(() => {
+      expect(within(list).getByRole("button", { name: "选择文档 规模验收资料 00000" })).toBeInTheDocument();
+    });
+    expect(list.scrollTop).toBe(0);
+
+    // 搜索把一万份结果收窄成一份：回到顶部、只剩命中项、没有重复节点。
+    // 第一次搜索期间列表会被「正在搜索」占位替换，因此重新查询当前的结果表。
+    const search = screen.getByRole("searchbox", { name: "搜索文档" });
+    await user.type(search, "规模验收资料 07000");
+    const filteredList = await screen.findByRole(
+      "table",
+      { name: "文档结果" },
+      { timeout: 5_000 }
+    );
+    await waitFor(() => {
+      expect(within(filteredList).getByRole("button", { name: "选择文档 规模验收资料 07000" })).toBeInTheDocument();
+    });
+    expect(within(filteredList).queryByRole("button", { name: "选择文档 规模验收资料 06000" })).not.toBeInTheDocument();
+    expect(container.querySelectorAll(".document-row").length).toBe(1);
+    expect(filteredList.scrollTop).toBe(0);
+
+    // 清空搜索后完整列表按原顺序回到顶部，挂载量仍然有界。
+    await user.clear(search);
+    const restoredList = await screen.findByRole("table", { name: "文档结果" });
+    await waitFor(() => {
+      expect(within(restoredList).getByRole("button", { name: "选择文档 规模验收资料 00000" })).toBeInTheDocument();
+    });
+    expect(within(restoredList).getAllByRole("button", { name: "选择文档 规模验收资料 00000" })).toHaveLength(1);
+    expect(restoredList.scrollTop).toBe(0);
+    expect(container.querySelectorAll(".document-row").length).toBeLessThan(50);
+  }, 20_000);
 });

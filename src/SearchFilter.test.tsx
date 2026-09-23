@@ -104,6 +104,47 @@ describe("全文搜索与筛选", () => {
     expect(screen.queryByText("年度资料")).not.toBeInTheDocument();
   });
 
+  it("shows cell text as the snippet for a table document and keeps formula-like cells inert", async () => {
+    const user = userEvent.setup();
+    const ledger = document("ledger", "账目", {
+      fileName: "账目.csv",
+      fileType: "CSV",
+      sourcePath: "C:\\Sources\\账目.csv",
+      sourceIdentifier: "c:\\sources\\账目.csv"
+    });
+    const client = new FakeBackendClient({
+      bootstrap,
+      documents: [ledger],
+      collections,
+      tags,
+      // 真实后端的片段来自单元格可见文字（`search_documents` 的 FTS snippet），
+      // 这里用同样的内容模拟一格是中文单元格、一格是公式样式与 HTML 样式文本的 CSV。
+      documentContents: {
+        ledger: '项目,金额,备注\n差旅报销,1200,含"引号"内容\n=SUM(B2:B3),300,<b>加粗</b>'
+      }
+    });
+
+    render(<App client={client} />);
+    await screen.findByText("账目");
+
+    const search = screen.getByRole("searchbox", { name: "搜索文档" });
+    await user.type(search, "差旅报销");
+
+    // 能判断命中原因：片段是单元格文字本身，不是文件名。
+    expect(await screen.findByText(/差旅报销,1200/)).toBeInTheDocument();
+    expect(screen.getByText("正文匹配片段：")).toBeInTheDocument();
+    expect(client.calls).toContain("searchDocuments:差旅报销");
+
+    await user.clear(search);
+    await user.type(search, "SUM");
+
+    // 公式样式文本只作为可搜索、可显示的纯文本，不解释为公式或 HTML。
+    expect(await screen.findByText(/=SUM\(B2:B3\)/)).toBeInTheDocument();
+    expect(screen.getByText(/<b>加粗<\/b>/)).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "加粗" })).not.toBeInTheDocument();
+  });
+
   it("combines collection, tag, file type and document date filters and clears them", async () => {
     const user = userEvent.setup();
     const matching = document("matching", "筛选命中");

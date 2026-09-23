@@ -3,7 +3,8 @@ import {
   fireEvent,
   render,
   screen,
-  waitFor
+  waitFor,
+  within
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -359,6 +360,64 @@ describe("资料库拖放", () => {
       configurable: true,
       value: originalElementFromPoint
     });
+  });
+
+  it("recognizes dropped csv and xlsx files and rejects a legacy xls in the same batch", async () => {
+    const client = createClient();
+    render(<App client={client} />);
+    await screen.findByText("第一份文档");
+
+    const projects = collectionRow("项目");
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => projects)
+    });
+
+    try {
+      const paths = [
+        "C:\\Sources\\账目.csv",
+        "C:\\Sources\\季度报表.xlsx",
+        "C:\\Sources\\旧账目.xls"
+      ];
+      client.emitFileDrop(paths, { x: 160, y: 90 });
+      await importKeepingExistingFlow();
+
+      // 拖放路径不在前端过滤扩展名：整批交给后端按能力表识别，
+      // 表格格式与旧格式的判定都由同一张能力表决定。
+      await waitFor(() => {
+        expect(client.startImportCalls.at(-1)).toMatchObject({
+          paths,
+          targetCollectionId: "projects",
+          source: "collectionDrop"
+        });
+      });
+
+      const csvRow = (
+        await screen.findByRole("button", { name: "选择文档 账目" })
+      ).closest("article");
+      expect(csvRow).toHaveTextContent("CSV");
+      const xlsxRow = (
+        await screen.findByRole("button", { name: "选择文档 季度报表" })
+      ).closest("article");
+      expect(xlsxRow).toHaveTextContent("XLSX");
+
+      // 旧版 XLS 不被当成表格文档：整批仍以两份表格文档成功，第三项单独报告
+      // （选择器导入会给出「不支持」原因，拖放路径按既有规则记为忽略）。
+      const panel = await screen.findByLabelText("批量导入进度");
+      await waitFor(() => {
+        expect(panel).toHaveTextContent("已导入 2");
+      });
+      expect(panel).toHaveTextContent(/(导入失败|已忽略)/);
+      expect(
+        screen.queryByRole("button", { name: "选择文档 旧账目" })
+      ).not.toBeInTheDocument();
+    } finally {
+      Object.defineProperty(document, "elementFromPoint", {
+        configurable: true,
+        value: originalElementFromPoint
+      });
+    }
   });
 
   it("blocks a second import batch without replacing the visible progress", async () => {
