@@ -471,6 +471,204 @@ pub struct CollectionDeleteResult {
     pub moved_document_count: i64,
 }
 
+// ---------------------------------------------------------------------------
+// 分类规则（工作单 10）
+// ---------------------------------------------------------------------------
+
+/// 分类规则：按文件名、类型、来源目录为新建文档指定集合与标签。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ClassificationRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// 用户顺序；第一条指定集合的命中规则决定集合。
+    pub position: i64,
+    pub file_name_pattern: String,
+    pub file_type: Option<String>,
+    pub source_directory: Option<String>,
+    pub collection_id: Option<String>,
+    pub tag_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationRuleInput {
+    pub name: String,
+    pub enabled: bool,
+    pub file_name_pattern: String,
+    pub file_type: Option<String>,
+    pub source_directory: Option<String>,
+    pub collection_id: Option<String>,
+    pub tag_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationRuleUpdate {
+    pub id: String,
+    #[serde(flatten)]
+    pub input: ClassificationRuleInput,
+}
+
+/// 规则编辑操作；JSON 形状与前端判别联合一致（internally tagged）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ClassificationRuleOperation {
+    Create {
+        rule: ClassificationRuleInput,
+    },
+    Update {
+        rule: ClassificationRuleUpdate,
+    },
+    Delete {
+        rule_id: String,
+    },
+    SetEnabled {
+        rule_id: String,
+        enabled: bool,
+    },
+    Reorder {
+        ordered_rule_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationPreviewItem {
+    pub source_path: String,
+    pub file_name: String,
+    pub file_type: Option<String>,
+    pub collection_id: String,
+    pub tag_ids: Vec<String>,
+    pub matched_rule_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationPreviewRequest {
+    pub paths: Vec<String>,
+    pub target_collection_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationPreviewResponse {
+    pub items: Vec<ClassificationPreviewItem>,
+}
+
+// ---------------------------------------------------------------------------
+// 接收目录（工作单 11/12/13）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReceiveSourceKind {
+    Qq,
+    Wechat,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReceiveSourceStatus {
+    Unconfigured,
+    Ready,
+    Missing,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveSourceCandidate {
+    pub path: String,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveSource {
+    pub id: String,
+    pub kind: ReceiveSourceKind,
+    pub display_name: String,
+    /// 用户确认的目录；未确认时为 `None`，此时不扫描不导入。
+    pub path: Option<String>,
+    pub enabled: bool,
+    pub status: ReceiveSourceStatus,
+    pub status_message: Option<String>,
+    pub pending_count: i64,
+    pub last_scanned_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveSourceInput {
+    pub kind: ReceiveSourceKind,
+    pub display_name: String,
+    pub path: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveSourceCandidates {
+    pub kind: ReceiveSourceKind,
+    pub candidates: Vec<ReceiveSourceCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveDirectoryListingItem {
+    pub path: String,
+    pub file_name: String,
+    pub file_type: Option<String>,
+    pub file_size: i64,
+    /// 用户此前明确未选择的文件；补扫不会自动导入它们。
+    pub previously_skipped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveDirectoryListing {
+    pub source_id: String,
+    pub path: String,
+    pub items: Vec<ReceiveDirectoryListingItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveDirectoryOperation {
+    pub source_id: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveSourceScanResult {
+    pub source_id: String,
+    pub scanned_count: i64,
+    pub imported_count: i64,
+    pub skipped_count: i64,
+    pub pending_count: i64,
+    pub failed_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveImportLogEntry {
+    pub source_id: String,
+    pub source_path: String,
+    pub file_name: String,
+    pub status: ImportItemStatus,
+    pub document_id: Option<String>,
+    pub collection_id: Option<String>,
+    pub tag_ids: Vec<String>,
+    pub matched_rule_ids: Vec<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LibraryMetadata {

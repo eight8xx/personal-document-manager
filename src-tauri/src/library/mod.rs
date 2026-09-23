@@ -5,6 +5,7 @@ mod models;
 mod ooxml;
 mod pdf_security;
 mod service;
+mod store;
 pub mod table;
 mod thumbnail;
 
@@ -22,14 +23,19 @@ pub use limits::{
 };
 pub use models::{
     BatchDocumentItemResult, BatchDocumentItemStatus, BatchDocumentOperation,
-    BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState, CloudSyncWarning,
-    CollectionDeleteResult, CollectionSummary, DocumentIndexChangedEvent, DocumentIndexPhase,
-    DocumentMetadataUpdate, DocumentPreview, DocumentProcessingStatus, DocumentSearchFilters,
-    DocumentSearchQuery, DocumentSearchResponse, DocumentSearchResult, DocumentSummary,
-    DocumentThumbnail, EmptyTrashItemResult, EmptyTrashItemStatus, EmptyTrashResult, ImportBatch,
-    ImportDecision, ImportItemResult, ImportItemStatus, ImportProgress, ImportSource,
-    IndexRunResult, IndexStatus, LibraryLocationInspection, LibrarySummary, LocationStatus,
-    RecentLibrary, SearchMatchKind, TablePreviewRequest, TableSheet, TagSummary,
-    TrashDocumentSummary,
+    BatchDocumentOperationRequest, BatchDocumentOperationResult, BootstrapState,
+    ClassificationPreviewItem, ClassificationPreviewRequest, ClassificationPreviewResponse,
+    ClassificationRule, ClassificationRuleInput, ClassificationRuleOperation,
+    ClassificationRuleUpdate, CloudSyncWarning, CollectionDeleteResult, CollectionSummary,
+    DocumentIndexChangedEvent, DocumentIndexPhase, DocumentMetadataUpdate, DocumentPreview,
+    DocumentProcessingStatus, DocumentSearchFilters, DocumentSearchQuery, DocumentSearchResponse,
+    DocumentSearchResult, DocumentSummary, DocumentThumbnail, EmptyTrashItemResult,
+    EmptyTrashItemStatus, EmptyTrashResult, ImportBatch, ImportDecision, ImportItemResult,
+    ImportItemStatus, ImportProgress, ImportSource, IndexRunResult, IndexStatus,
+    LibraryLocationInspection, LibrarySummary, LocationStatus, ReceiveDirectoryListing,
+    ReceiveDirectoryListingItem, ReceiveDirectoryOperation, ReceiveImportLogEntry, ReceiveSource,
+    ReceiveSourceCandidate, ReceiveSourceCandidates, ReceiveSourceInput, ReceiveSourceKind,
+    ReceiveSourceScanResult, ReceiveSourceStatus, RecentLibrary, SearchMatchKind,
+    TablePreviewRequest, TableSheet, TagSummary, TrashDocumentSummary,
 };
 pub use service::{open_directory, ExternalChangeMonitor, LibraryService};

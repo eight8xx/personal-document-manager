@@ -3489,6 +3489,13 @@ impl LibraryService {
         self.current.as_ref().map(|library| &library.summary)
     }
 
+    /// 仅测试使用：借用当前资料库的连接，供存储层用例建表与校验。
+    #[cfg(test)]
+    pub(crate) fn with_test_connection<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        let library = self.current.as_ref().expect("测试需要已打开的资料库");
+        f(&library.connection)
+    }
+
     pub fn ensure_current_library(&self, expected: &LibrarySummary) -> LibraryResult<()> {
         let current = self
             .current_library()
@@ -3501,8 +3508,7 @@ impl LibraryService {
         Ok(())
     }
 
-    fn record_recent(&mut self, library: &LibrarySummary) -> LibraryResult<()> {
-        let target = normalize_path(Path::new(&library.path))?;
+    fn record_recent(&mut self, library: &LibrarySummary) -> LibraryResult<()> {        let target = normalize_path(Path::new(&library.path))?;
         let target_display = target.to_string_lossy().into_owned();
 
         let mut recent = self.recent.clone();
@@ -4883,6 +4889,7 @@ fn open_database(path: &Path) -> LibraryResult<Connection> {
 
 fn initialize_schema(connection: &Connection) -> LibraryResult<()> {
     let _: String = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    super::store::initialize_store_schema(connection)?;
     connection.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS app_metadata (
