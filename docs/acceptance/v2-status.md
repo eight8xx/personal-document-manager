@@ -29,15 +29,15 @@
 
 | 套件 | 结果 | 命令 |
 | --- | --- | --- |
-| Rust 全部 | **177 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
+| Rust 全部 | **185 passed / 0 failed / 1 ignored** | `cargo test --manifest-path src-tauri\Cargo.toml` |
 | ├ 单元（含 limits/store/formats/commands 契约） | 44 passed | 同上 |
 | ├ `library_service.rs` 集成 | 75 passed | 同上 |
 | ├ `receive_locked_files.rs`（11 文件占用） | 2 passed | 同上 |
 | ├ `receive_sources.rs`（11/12/13 接收目录） | 18 passed | 同上 |
 | ├ `replacement_recovery.rs`（03） | 10 passed | 同上 |
-| ├ `table_documents.rs`（08/09 端到端） | 5 passed | 同上 |
+| ├ `table_documents.rs`（08/09 端到端） | 13 passed | 同上 |
 | └ `table_formats.rs`（08/09 解析层） | 23 passed | 同上 |
-| 前端全部 | **153 passed（21 文件）** | `npm test` |
+| 前端全部 | **163 passed（21 文件）** | `npm test` |
 | 类型检查 | 通过 | `npm run typecheck` |
 | 前端生产构建 | 通过 | `npm run build` |
 
@@ -96,6 +96,7 @@
 - **表格预览取舍**：非活动工作表的行列数返回 `None`（不为切表扫描整本工作簿）；CSV 每页请求会整文件扫描一次以给出精确总行数。
 - **监视是周期轮询而不是文件系统事件**：仓库没有 `notify` 依赖，接收目录监视每 2 秒补扫一次，靠「事件漏了也能发现」而不是即时事件；未自行新增依赖。
 - **失败项冷却**：周期补扫对失败项有 60 秒冷却，用户主动点「扫描」会立即重试；这是有意区分，避免每 2 秒刷一次日志。
+- **导入期输入上限对 CSV 也已覆盖**：`validate_file_content` 的预检包含 `CsvText`，超限 CSV 与 DOCX/PPTX/XLSX 一样在校验阶段单项失败；同时避免结构校验先把整份超大文件读进内存。
 - **两字符查询**：按设计只匹配标题/描述/元数据，不匹配正文（FTS5 trigram 的既有取舍）。
 - **测试配置**：`vite.config.ts` 已排除 `.scratch`，避免把其它工作区副本的测试当成本仓库测试；并行构建负载下用例超时放宽到 15s、`findBy*` 等待放宽到 3s（断言未放宽）。
 - **原生窗口自动化**：见第四节，07 未覆盖的原生交互不接受「用假后端替代」或「改个名字算覆盖」。
