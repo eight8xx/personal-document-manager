@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+﻿use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -1136,7 +1136,7 @@ impl LibraryService {
             .ok_or_else(|| import_item_not_found(item_id))?;
         let status = context.item.status;
 
-        match (status, decision) {
+        let result = match (status, decision) {
             (ImportItemStatus::Duplicate, ImportDecision::UseExisting) => {
                 let duplicate_document_id =
                     context.item.duplicate_document_id.clone().ok_or_else(|| {
@@ -1180,7 +1180,15 @@ impl LibraryService {
                     "导入项状态 {status:?} 与决策 {decision:?} 不匹配。"
                 )))
             }
+        };
+
+        // 接收来源的待决项一旦处理成功，就按 item_id 精确把它对应的日志行标记为已决，
+        // 让来源的 pending_count 回落。人工导入的待决项没有日志行，这里改 0 行，不会误标。
+        if status == ImportItemStatus::SourceChanged && result.is_ok() {
+            let connection = self.library_connection()?;
+            store::resolve_import_log_by_item(connection, item_id, &now())?;
         }
+        result
     }
 
     pub fn retry_import_item(&mut self, item_id: &str) -> LibraryResult<ImportItemResult> {
@@ -4363,6 +4371,8 @@ impl LibraryService {
                 .as_slice(),
             matched_rule_ids,
             item.error_message.as_deref(),
+            // 只有未处理的待决项需要把导入项 id 交给界面，供其调用 resolve_import_item。
+            (item.status == ImportItemStatus::SourceChanged).then_some(item.item_id.as_str()),
             &now(),
         )
     }
@@ -4559,8 +4569,10 @@ fn refresh_receive_source_status(
         ],
     )?;
     // 待处理项是「同一来源内容变化」等待用户决定的项，由导入日志里的 sourceChanged 表示。
+    // 已结算（有 resolved_at）的不再计入，用户在界面上处理完「新建/替换」后计数会回落。
     source.pending_count = connection.query_row(
-        "SELECT COUNT(*) FROM receive_import_log WHERE source_id = ?1 AND status = 'sourceChanged'",
+        "SELECT COUNT(*) FROM receive_import_log
+          WHERE source_id = ?1 AND status = 'sourceChanged' AND resolved_at IS NULL",
         params![&source.id],
         |row| row.get(0),
     )?;

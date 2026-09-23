@@ -676,6 +676,12 @@ pub struct ReceiveImportLogEntry {
     pub matched_rule_ids: Vec<String>,
     pub error_message: Option<String>,
     pub created_at: String,
+    /// 未处理的待决项对应的导入项 id；界面用它调用 `resolveImportItem` 做「新建/替换」决定。
+    ///
+    /// 只有「来源内容变化、还没被处理」的日志行才有值；已处理或不是待决项时为 `None`。
+    pub item_id: Option<String>,
+    /// 该待决项被处理完的时间；有值表示这条待决已经结束（行本身保留，供用户回看）。
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

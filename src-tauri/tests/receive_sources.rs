@@ -6,9 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use personal_document_manager_lib::library::{
-    ClassificationPreviewRequest, ClassificationRuleInput, ClassificationRuleOperation, ImportSource,
-    LibraryService, ReceiveSourceInput, ReceiveSourceKind, ReceiveSourceScanResult,
-    ReceiveSourceStatus,
+    ClassificationPreviewRequest, ClassificationRuleInput, ClassificationRuleOperation,
+    DocumentPreview, ImportDecision, ImportItemStatus, ImportSource, LibraryService,
+    ReceiveSourceInput, ReceiveSourceKind, ReceiveSourceScanResult, ReceiveSourceStatus,
 };
 use tempfile::tempdir;
 
@@ -677,6 +677,227 @@ fn source_change_keeps_a_pending_entry_while_duplicates_are_skipped() {
     // 待决项不会在重复补扫里反复导入。
     let results = scan_and_import(&mut service);
     assert!(results.is_empty());
+}
+
+/// 造一个「接收来源内容变化」的待决项，返回（来源 id、源文件路径、待决项 item_id）。
+fn pending_source_change(
+    service: &mut LibraryService,
+    root: &Path,
+    label: &str,
+    first_version: &str,
+    second_version: &str,
+) -> (String, PathBuf, String) {
+    let dir = receive_dir(root, label);
+    let source_file = dir.join("变化.txt");
+    fs::write(&source_file, first_version).unwrap();
+    let source_id = enable_source(
+        service,
+        ReceiveSourceKind::Wechat,
+        &dir,
+        &[source_file.as_path()],
+        &[source_file.as_path()],
+    );
+    fs::write(&source_file, second_version).unwrap();
+    let results = scan_and_import(service);
+    assert_eq!(results[0].pending_count, 1, "内容变化应产生一条待决项");
+    let log = service.list_receive_import_log(10).unwrap();
+    let entry = log
+        .iter()
+        .find(|entry| {
+            entry.status == ImportItemStatus::SourceChanged
+                && entry.source_path.ends_with("变化.txt")
+        })
+        .expect("待决日志应存在");
+    let item_id = entry
+        .item_id
+        .clone()
+        .expect("未处理的待决日志必须带 itemId，界面才有路可走");
+    assert!(entry.resolved_at.is_none(), "尚未处理时不应有 resolvedAt");
+    (source_id, source_file, item_id)
+}
+
+fn pending_count_of(service: &LibraryService, source_id: &str) -> i64 {
+    service
+        .list_receive_sources()
+        .unwrap()
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .unwrap()
+        .pending_count
+}
+
+/// M3：来源变化的待决项能被界面「新建文档」处理完，计数回落，历史行保留。
+#[test]
+fn source_change_pending_entry_can_be_resolved_as_a_new_document() {
+    let root = tempdir().unwrap();
+    let (mut service, _library_dir) = setup(root.path());
+    let (source_id, source_file, item_id) =
+        pending_source_change(&mut service, root.path(), "wechat", "第一版正文", "第二版正文");
+    assert_eq!(pending_count_of(&service, &source_id), 1);
+
+    let resolved = service
+        .resolve_import_item(&item_id, ImportDecision::CreateNew)
+        .unwrap();
+    assert_eq!(resolved.status, ImportItemStatus::Imported);
+    assert_eq!(service.list_documents().unwrap().len(), 2, "新建应产生第二份文档");
+    assert_eq!(pending_count_of(&service, &source_id), 0, "处理后计数应回落");
+    assert_eq!(fs::read(&source_file).unwrap(), "第二版正文".as_bytes());
+
+    // 历史行保留，并带上 resolvedAt；已结算的行不再给出 itemId（避免界面重复处理）。
+    let log = service.list_receive_import_log(20).unwrap();
+    let entry = log
+        .iter()
+        .find(|entry| {
+            entry.source_path.ends_with("变化.txt")
+                && entry.status == ImportItemStatus::SourceChanged
+        })
+        .unwrap();
+    assert!(entry.resolved_at.is_some(), "已处理的待决行要有 resolvedAt：{log:?}");
+    assert!(entry.item_id.is_none(), "已结算的行不再提供 itemId");
+    assert_eq!(
+        entry.status,
+        ImportItemStatus::SourceChanged,
+        "历史状态保持不变"
+    );
+
+    // 再次补扫不会重复处理同一条待决项。
+    assert!(scan_and_import(&mut service).is_empty());
+    assert_eq!(pending_count_of(&service, &source_id), 0);
+}
+
+/// M3：同一待决项选「替换已有文档」——副本内容更新、集合与标签保留、计数回落。
+#[test]
+fn source_change_pending_entry_can_replace_the_existing_document() {
+    let root = tempdir().unwrap();
+    let (mut service, library_dir) = setup(root.path());
+    let (source_id, _source_file, item_id) =
+        pending_source_change(&mut service, root.path(), "wechat", "第一版正文", "第二版正文");
+
+    // 给已有的那份文档加上集合与标签，验证替换后元数据保留。
+    let document = service.list_documents().unwrap()[0].clone();
+    let collection = service
+        .create_collection("资料".to_string(), None)
+        .unwrap();
+    service
+        .move_document_to_collection(&document.id, &collection.id)
+        .unwrap();
+    let tag_id = service.create_tag("重要".to_string()).unwrap().id;
+    service.add_tag_to_document(&document.id, &tag_id).unwrap();
+
+    let resolved = service
+        .resolve_import_item(&item_id, ImportDecision::ReplaceExisting)
+        .unwrap();
+    assert_eq!(resolved.status, ImportItemStatus::Imported);
+    assert_eq!(resolved.document_id.as_deref(), Some(document.id.as_str()));
+    assert_eq!(service.list_documents().unwrap().len(), 1, "替换不新增文档");
+    assert_eq!(pending_count_of(&service, &source_id), 0);
+
+    // 副本内容确实换成了新版本，元数据保留。
+    let copy = library_dir
+        .join("documents")
+        .join(&document.id)
+        .join(&document.file_name);
+    assert_eq!(fs::read(&copy).unwrap(), "第二版正文".as_bytes());
+    let updated = service
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == document.id)
+        .unwrap();
+    assert_eq!(updated.collection_id, collection.id);
+    assert_eq!(
+        updated
+            .tags
+            .iter()
+            .map(|tag| tag.id.clone())
+            .collect::<Vec<_>>(),
+        vec![tag_id]
+    );
+    // 同一条待决行结算完成（替换路径也一样）。
+    let log = service.list_receive_import_log(20).unwrap();
+    let entry = log
+        .iter()
+        .find(|entry| {
+            entry.source_path.ends_with("变化.txt")
+                && entry.status == ImportItemStatus::SourceChanged
+        })
+        .unwrap();
+    assert!(entry.resolved_at.is_some(), "替换后待决行也要结算：{log:?}");
+    match service.get_document_preview(&document.id, None).unwrap() {
+        DocumentPreview::Text { text } => assert_eq!(text, "第二版正文"),
+        other => panic!("期望文本预览，实际 {other:?}"),
+    }
+}
+
+/// M3：人工导入产生的待决项没有日志行，处理它**不能**误标接收来源的待决行。
+#[test]
+fn resolving_a_manual_pending_item_does_not_touch_receive_log_entries() {
+    let root = tempdir().unwrap();
+    let (mut service, _library_dir) = setup(root.path());
+    let (source_id, _source_file, _receive_item_id) =
+        pending_source_change(&mut service, root.path(), "wechat", "第一版正文", "第二版正文");
+    assert_eq!(pending_count_of(&service, &source_id), 1);
+
+    // 人工导入同一份文件（走 start_import）：产生另一条与接收来源无关的待决项。
+    let manual_source = root.path().join("手工.txt");
+    fs::write(&manual_source, "手工正文").unwrap();
+    let manual_path = manual_source.to_string_lossy().into_owned();
+    let batch = service.start_import(vec![manual_path.clone()]).unwrap();
+    assert_eq!(batch.imported_count, 1);
+    fs::write(&manual_source, "手工正文改过").unwrap();
+    let batch = service.start_import(vec![manual_path]).unwrap();
+    assert_eq!(batch.source_changed_count, 1);
+    let manual_item_id = batch
+        .items
+        .iter()
+        .find(|item| item.status == ImportItemStatus::SourceChanged)
+        .unwrap()
+        .item_id
+        .clone();
+
+    // 处理人工待决项：接收来源那条未决记录必须原样保留。
+    let resolved = service
+        .resolve_import_item(&manual_item_id, ImportDecision::CreateNew)
+        .unwrap();
+    assert_eq!(resolved.status, ImportItemStatus::Imported);
+    assert_eq!(
+        pending_count_of(&service, &source_id),
+        1,
+        "人工待决项的处理不得影响接收来源的待决计数"
+    );
+    let log = service.list_receive_import_log(10).unwrap();
+    let entry = log
+        .iter()
+        .find(|entry| {
+            entry.source_path.ends_with("变化.txt")
+                && entry.status == ImportItemStatus::SourceChanged
+        })
+        .unwrap();
+    assert!(entry.resolved_at.is_none(), "接收来源的待决行不应被误标");
+    assert!(entry.item_id.is_some(), "未处理的待决行仍应给出 itemId");
+}
+
+/// 待决项被处理完之前，重复补扫不会自动导入该文件（既有语义保持）。
+#[test]
+fn unresolved_source_change_is_never_imported_by_repeated_scans() {
+    let root = tempdir().unwrap();
+    let (mut service, _library_dir) = setup(root.path());
+    let (source_id, _source_file, item_id) =
+        pending_source_change(&mut service, root.path(), "wechat", "第一版正文", "第二版正文");
+    for _ in 0..3 {
+        assert!(scan_and_import(&mut service).is_empty());
+    }
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+    assert_eq!(pending_count_of(&service, &source_id), 1);
+
+    // 取消也算「处理完」：计数回落，但仍不产生新文档。
+    let cancelled = service
+        .resolve_import_item(&item_id, ImportDecision::Cancel)
+        .unwrap();
+    assert_eq!(cancelled.status, ImportItemStatus::Skipped);
+    assert_eq!(service.list_documents().unwrap().len(), 1);
+    assert_eq!(pending_count_of(&service, &source_id), 0);
+    assert!(scan_and_import(&mut service).is_empty());
 }
 
 #[test]
