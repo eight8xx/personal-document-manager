@@ -10,7 +10,8 @@ import type {
   DocumentPreview,
   DocumentSummary,
   LibrarySummary,
-  TablePreviewRequest
+  TablePreviewRequest,
+  TableSheet
 } from "./backend/types";
 import { DocumentDetails } from "./components/DocumentDetails";
 import { TABLE_PAGE_ROWS, TablePreview } from "./components/TablePreview";
@@ -600,5 +601,130 @@ describe("CSV/XLSX 表格预览", () => {
           !call.startsWith("openDocument:")
       )
     ).toEqual([]);
+  });
+
+  it("jumps to the next data row of a sparse sheet with a single page click", async () => {
+    const user = userEvent.setup();
+    const requests: TablePreviewRequest[] = [];
+    const sheet: TableSheet = {
+      index: 0,
+      name: "稀疏",
+      rowCount: 1005,
+      columnCount: 3
+    };
+    const client = new FakeBackendClient({ documents: [xlsxDocument] });
+    client.getTablePreview = async (_owner, _documentId, request = {}) => {
+      requests.push({ ...request });
+      const startRow = request.startRow ?? 0;
+      if (startRow < 999) {
+        // 数据在 Excel 第 1000 行：首屏没有可显示的行，只给出下一个含数据的行。
+        return {
+          kind: "table",
+          sheets: [sheet],
+          sheetIndex: 0,
+          startRow,
+          cells: [],
+          rowNumbers: [],
+          columnCount: 3,
+          hasMoreRows: true,
+          nextDataRow: 999,
+          degradedFeatures: [],
+          notice: null
+        };
+      }
+      return {
+        kind: "table",
+        sheets: [sheet],
+        sheetIndex: 0,
+        startRow,
+        cells: [
+          ["甲", "乙", "丙"],
+          ["丁", "戊", "己"]
+        ],
+        rowNumbers: [999, 1000],
+        columnCount: 3,
+        hasMoreRows: false,
+        degradedFeatures: [],
+        notice: null
+      };
+    };
+    const preview = await initialPreview(client, xlsxDocument);
+    renderPreview(client, xlsxDocument, preview);
+
+    // 首屏为空，但「下一页」可用。
+    expect(
+      screen.getByText("该范围没有可显示的行。")
+    ).toBeInTheDocument();
+    const next = screen.getByRole("button", { name: "表格下一页" });
+    expect(next).toBeEnabled();
+    expect(screen.getByRole("button", { name: "表格上一页" })).toBeDisabled();
+
+    await user.click(next);
+
+    // 一次点击直接请求下一个含数据的行，而不是逐页 +50。
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expect(requests[1]).toEqual({
+      sheetIndex: 0,
+      startRow: 999,
+      rowCount: TABLE_PAGE_ROWS,
+      columnCount: 3
+    });
+    expect(await screen.findByText("甲")).toBeInTheDocument();
+    // 行号沿用后端给出的真实稀疏行号（Excel 第 1000、1001 行）。
+    expect(screen.getByRole("rowheader", { name: "1000" })).toBeInTheDocument();
+    expect(screen.getByRole("rowheader", { name: "1001" })).toBeInTheDocument();
+    // 已到数据末尾：没有更多数据，按钮禁用。
+    expect(screen.getByRole("button", { name: "表格下一页" })).toBeDisabled();
+  });
+
+  it("keeps dense paging sequential without skipping or repeating rows", async () => {
+    const user = userEvent.setup();
+    const recorder = recordingClient([xlsxDocument]);
+    const preview = await initialPreview(recorder.client, xlsxDocument);
+    renderPreview(recorder.client, xlsxDocument, preview);
+
+    await user.click(screen.getByRole("tab", { name: "明细" }));
+    await screen.findByText("第 1 - 50 行 / 200");
+
+    // 稠密表的 nextDataRow 就是下一页起点，行为与逐页 +50 一致。
+    await user.click(screen.getByRole("button", { name: "表格下一页" }));
+    await screen.findByText("第 51 - 100 行 / 200");
+    await user.click(screen.getByRole("button", { name: "表格下一页" }));
+    await screen.findByText("第 101 - 150 行 / 200");
+
+    const pageRequests = recorder.requests.slice(1).map((request) => request.startRow);
+    expect(pageRequests).toEqual([0, 50, 100]);
+    const rendered = screen
+      .getAllByRole("rowheader")
+      .map((cell) => cell.textContent);
+    expect(rendered).toHaveLength(TABLE_PAGE_ROWS);
+    expect(new Set(rendered).size).toBe(TABLE_PAGE_ROWS);
+    expect(rendered[0]).toBe("101");
+    expect(rendered.at(-1)).toBe("150");
+  });
+
+  it("disables the next button when the range has no more data", async () => {
+    const payload: TablePreviewPayload = {
+      kind: "table",
+      sheets: [{ index: 0, name: "稀疏", rowCount: 1000, columnCount: 2 }],
+      sheetIndex: 0,
+      startRow: 999,
+      cells: [["甲", "乙"]],
+      rowNumbers: [999],
+      columnCount: 2,
+      hasMoreRows: false,
+      degradedFeatures: [],
+      notice: null
+    };
+    const { client, requests } = staticTableClient(xlsxDocument, payload);
+    const preview = await client.getTablePreview(library, xlsxDocument.id, {});
+
+    renderPreview(client, xlsxDocument, preview);
+
+    expect(screen.getByRole("rowheader", { name: "1000" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "表格下一页" })).toBeDisabled();
+    expect(requests).toHaveLength(1);
   });
 });
