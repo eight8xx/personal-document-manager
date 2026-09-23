@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -67,11 +67,27 @@ pub struct LibraryService {
     current: Option<OpenLibrary>,
     recent: Vec<RecentLibraryRecord>,
     import_items: HashMap<String, ImportItemContext>,
+    active_import_batches: HashMap<String, ActiveImportBatch>,
 }
 
 struct OpenLibrary {
     summary: LibrarySummary,
     connection: Connection,
+}
+
+/// 正在分步执行的导入批次。
+///
+/// 批次状态由 `LibraryService` 持有但**分步推进**：调用方每一步单独加锁，
+/// 因此列表、搜索和预览请求可以在两步之间拿到锁，不必等整批导入结束。
+/// 每一项仍会重新核对所属资料库（`begin_import_batch` 与 `import_batch_step`），
+/// 所以 01/02 的库边界语义在分步后依然成立。
+struct ActiveImportBatch {
+    library: LibrarySummary,
+    batch_id: String,
+    entries: VecDeque<ScanEntry>,
+    items: Vec<ImportItemResult>,
+    total: usize,
+    target_collection_id: Option<String>,
 }
 
 struct ImportItemContext {
@@ -318,6 +334,7 @@ impl LibraryService {
             current: None,
             recent,
             import_items: HashMap::new(),
+            active_import_batches: HashMap::new(),
         })
     }
 
@@ -721,6 +738,28 @@ impl LibraryService {
     where
         F: FnMut(ImportProgress),
     {
+        let first = self.begin_import_batch(paths, target_collection_id, source)?;
+        let batch_id = first.batch_id.clone();
+        on_progress(first);
+        let result = self.drive_import_batch(&batch_id, &mut on_progress);
+        if result.is_err() {
+            let _ = self.abort_import_batch(&batch_id);
+        }
+        result
+    }
+
+    /// 开始一批导入：扫描路径、校验目标集合并登记批次，返回批次的第一条进度事件。
+    ///
+    /// 本方法**不复制任何文件**。调用方随后在每一步之间释放服务锁，用
+    /// [`Self::peek_import_progress`] 与 [`Self::import_batch_step`] 推进，
+    /// 最后用 [`Self::finish_import_batch`] 收尾；失败或取消时调用
+    /// [`Self::abort_import_batch`] 丢弃批次。
+    pub fn begin_import_batch(
+        &mut self,
+        paths: Vec<String>,
+        target_collection_id: Option<String>,
+        source: ImportSource,
+    ) -> LibraryResult<ImportProgress> {
         let library = self
             .current_library()
             .cloned()
@@ -737,7 +776,7 @@ impl LibraryService {
         let entries = scan_import_paths(&paths, source);
         let total = entries.len();
         let first = entries.first();
-        on_progress(ImportProgress {
+        let progress = ImportProgress {
             library: library.clone(),
             batch_id: batch_id.clone(),
             total,
@@ -746,107 +785,184 @@ impl LibraryService {
             current_source_path: first.map(ScanEntry::source_path),
             item: None,
             finished: false,
-        });
-
-        let mut items = Vec::with_capacity(total);
-        for (index, entry) in entries.into_iter().enumerate() {
-            let current_file_name = entry.file_name();
-            let current_source_path = entry.source_path();
-            on_progress(ImportProgress {
-                library: library.clone(),
-                batch_id: batch_id.clone(),
+        };
+        self.active_import_batches.insert(
+            batch_id.clone(),
+            ActiveImportBatch {
+                library,
+                batch_id,
+                entries: entries.into(),
+                items: Vec::with_capacity(total),
                 total,
-                completed: index,
-                current_file_name: current_file_name.clone(),
-                current_source_path: Some(current_source_path.clone()),
-                item: None,
-                finished: false,
-            });
+                target_collection_id,
+            },
+        );
+        Ok(progress)
+    }
 
-            let item = match entry {
-                ScanEntry::File(path) => self.process_import_file_with_target(
-                    &path,
-                    false,
-                    None,
-                    target_collection_id.clone(),
-                )?,
-                ScanEntry::Ignored { source_path } => {
-                    let file_name = display_file_name(&source_path);
-                    ImportItemResult {
-                        item_id: Uuid::new_v4().to_string(),
-                        source_path,
-                        file_name,
-                        file_type: None,
-                        status: ImportItemStatus::Ignored,
-                        document_id: None,
-                        duplicate_document_id: None,
-                        error_stage: None,
-                        error_message: None,
-                        retryable: false,
-                        target_collection_id: target_collection_id.clone(),
-                        collection_id: None,
-                        notice: None,
-                    }
-                }
-                ScanEntry::Failed {
+    /// 查看批次里下一个待处理条目对应的进度事件；返回 `None` 表示批次已处理完。
+    pub fn peek_import_progress(&self, batch_id: &str) -> LibraryResult<Option<ImportProgress>> {
+        let batch = self.active_import_batch(batch_id)?;
+        let Some(entry) = batch.entries.front() else {
+            return Ok(None);
+        };
+        Ok(Some(ImportProgress {
+            library: batch.library.clone(),
+            batch_id: batch.batch_id.clone(),
+            total: batch.total,
+            completed: batch.items.len(),
+            current_file_name: entry.file_name(),
+            current_source_path: Some(entry.source_path()),
+            item: None,
+            finished: false,
+        }))
+    }
+
+    /// 处理批次里的下一个条目，返回「这一项已完成」的进度事件。
+    ///
+    /// 每次调用都会先核对批次所属资料库：导入期间切换资料库会让本批以
+    /// `invalidLibrary` 中止，而不是把内容写进另一个资料库。
+    pub fn import_batch_step(&mut self, batch_id: &str) -> LibraryResult<ImportProgress> {
+        let library = {
+            let batch = self.active_import_batch(batch_id)?;
+            batch.library.clone()
+        };
+        self.ensure_current_library(&library)?;
+        let library = self
+            .current_library()
+            .cloned()
+            .ok_or(LibraryError::NoCurrentLibrary)?;
+
+        let batch = self
+            .active_import_batches
+            .get_mut(batch_id)
+            .ok_or_else(|| import_batch_not_found(batch_id))?;
+        let Some(entry) = batch.entries.pop_front() else {
+            return Err(import_batch_not_found(batch_id));
+        };
+        let target_collection_id = batch.target_collection_id.clone();
+        let total = batch.total;
+        let current_file_name = entry.file_name();
+        let current_source_path = entry.source_path();
+
+        let item = match entry {
+            ScanEntry::File(path) => self.process_import_file_with_target(
+                &path,
+                false,
+                None,
+                target_collection_id.clone(),
+            )?,
+            ScanEntry::Ignored { source_path } => {
+                let file_name = display_file_name(&source_path);
+                ImportItemResult {
+                    item_id: Uuid::new_v4().to_string(),
                     source_path,
-                    message,
-                } => {
-                    let mut item = self.failure_item(
-                        Uuid::new_v4().to_string(),
-                        source_path,
-                        None,
-                        None,
-                        "scan",
-                        message,
-                        true,
-                    );
-                    item.target_collection_id = target_collection_id.clone();
-                    self.remember_import_target(&item.item_id, &target_collection_id);
-                    item
+                    file_name,
+                    file_type: None,
+                    status: ImportItemStatus::Ignored,
+                    document_id: None,
+                    duplicate_document_id: None,
+                    error_stage: None,
+                    error_message: None,
+                    retryable: false,
+                    target_collection_id: target_collection_id.clone(),
+                    collection_id: None,
+                    notice: None,
                 }
-            };
+            }
+            ScanEntry::Failed {
+                source_path,
+                message,
+            } => {
+                let mut item = self.failure_item(
+                    Uuid::new_v4().to_string(),
+                    source_path,
+                    None,
+                    None,
+                    "scan",
+                    message,
+                    true,
+                );
+                item.target_collection_id = target_collection_id.clone();
+                self.remember_import_target(&item.item_id, &target_collection_id);
+                item
+            }
+        };
 
-            on_progress(ImportProgress {
-                library: library.clone(),
-                batch_id: batch_id.clone(),
-                total,
-                completed: index + 1,
-                current_file_name,
-                current_source_path: Some(current_source_path),
-                item: Some(item.clone()),
-                finished: false,
-            });
-            items.push(item);
-        }
-
-        on_progress(ImportProgress {
+        let batch = self
+            .active_import_batches
+            .get_mut(batch_id)
+            .ok_or_else(|| import_batch_not_found(batch_id))?;
+        batch.items.push(item.clone());
+        Ok(ImportProgress {
             library,
-            batch_id: batch_id.clone(),
+            batch_id: batch.batch_id.clone(),
             total,
-            completed: total,
+            completed: batch.items.len(),
+            current_file_name,
+            current_source_path: Some(current_source_path),
+            item: Some(item),
+            finished: false,
+        })
+    }
+
+    /// 返回整批结果并结束批次。
+    pub fn finish_import_batch(&mut self, batch_id: &str) -> LibraryResult<ImportBatch> {
+        let batch = self
+            .active_import_batches
+            .remove(batch_id)
+            .ok_or_else(|| import_batch_not_found(batch_id))?;
+        Ok(import_batch_from_items(
+            batch.batch_id,
+            batch.items,
+            batch.target_collection_id,
+        ))
+    }
+
+    /// 批次完成时的收尾进度事件（`finished = true`）。
+    pub fn import_batch_finished_progress(&self, batch_id: &str) -> LibraryResult<ImportProgress> {
+        let batch = self.active_import_batch(batch_id)?;
+        Ok(ImportProgress {
+            library: batch.library.clone(),
+            batch_id: batch.batch_id.clone(),
+            total: batch.total,
+            completed: batch.items.len(),
             current_file_name: None,
             current_source_path: None,
             item: None,
             finished: true,
-        });
-
-        let imported_count = count_items(&items, ImportItemStatus::Imported);
-        let duplicate_count = count_items(&items, ImportItemStatus::Duplicate);
-        let source_changed_count = count_items(&items, ImportItemStatus::SourceChanged);
-        let failed_count = count_items(&items, ImportItemStatus::Failed);
-        let ignored_count = count_items(&items, ImportItemStatus::Ignored);
-
-        Ok(ImportBatch {
-            batch_id,
-            items,
-            imported_count,
-            duplicate_count,
-            source_changed_count,
-            failed_count,
-            ignored_count,
-            target_collection_id,
         })
+    }
+
+    /// 放弃批次（取消、出错或资料库已切换）；不触碰已经写入的文档与副本。
+    pub fn abort_import_batch(&mut self, batch_id: &str) -> LibraryResult<()> {
+        self.active_import_batches.remove(batch_id);
+        Ok(())
+    }
+
+    fn active_import_batch(&self, batch_id: &str) -> LibraryResult<&ActiveImportBatch> {
+        self.active_import_batches
+            .get(batch_id)
+            .ok_or_else(|| import_batch_not_found(batch_id))
+    }
+
+    /// 在当前已持有的服务锁内跑完整批，供同一把锁下的调用方复用。
+    fn drive_import_batch<F>(
+        &mut self,
+        batch_id: &str,
+        on_progress: &mut F,
+    ) -> LibraryResult<ImportBatch>
+    where
+        F: FnMut(ImportProgress),
+    {
+        while let Some(before) = self.peek_import_progress(batch_id)? {
+            on_progress(before);
+            on_progress(self.import_batch_step(batch_id)?);
+        }
+        let finished = self.import_batch_finished_progress(batch_id)?;
+        let batch = self.finish_import_batch(batch_id)?;
+        on_progress(finished);
+        Ok(batch)
     }
 
     pub fn resolve_import_item(
@@ -4471,6 +4587,35 @@ fn remove_library_copy(path: &Path) -> LibraryResult<()> {
 
 fn import_item_not_found(item_id: &str) -> LibraryError {
     LibraryError::ImportItemNotFound(format!("导入项不存在或已处理：{item_id}"))
+}
+
+fn import_batch_not_found(batch_id: &str) -> LibraryError {
+    LibraryError::ImportFile(format!(
+        "该导入批次已结束或失效：{batch_id}。请重新发起导入。"
+    ))
+}
+
+/// 把逐项结果汇总成整批结果，计数口径与 `start_import_to_collection` 一致。
+fn import_batch_from_items(
+    batch_id: String,
+    items: Vec<ImportItemResult>,
+    target_collection_id: Option<String>,
+) -> ImportBatch {
+    let imported_count = count_items(&items, ImportItemStatus::Imported);
+    let duplicate_count = count_items(&items, ImportItemStatus::Duplicate);
+    let source_changed_count = count_items(&items, ImportItemStatus::SourceChanged);
+    let failed_count = count_items(&items, ImportItemStatus::Failed);
+    let ignored_count = count_items(&items, ImportItemStatus::Ignored);
+    ImportBatch {
+        batch_id,
+        items,
+        imported_count,
+        duplicate_count,
+        source_changed_count,
+        failed_count,
+        ignored_count,
+        target_collection_id,
+    }
 }
 
 fn find_source_change(

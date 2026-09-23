@@ -234,23 +234,66 @@ fn spawn_import_task<F>(
     paths: Vec<String>,
     target_collection_id: Option<String>,
     source: ImportSource,
-    on_progress: F,
+    mut on_progress: F,
 ) -> tauri::async_runtime::JoinHandle<Result<ImportBatch, CommandError>>
 where
     F: FnMut(ImportProgress) + Send + 'static,
 {
     let service = state.service_handle();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
-        service.ensure_current_library(&library)?;
-        service
-            .start_import_to_collection_with_progress(
-                paths,
-                target_collection_id,
-                source,
-                on_progress,
-            )
-            .map_err(CommandError::from)
+        // 整批导入不再长时间独占服务锁：开始阶段只做扫描与批次登记，
+        // 之后每一项单独加锁处理，列表、搜索和预览可以在两项之间插进来。
+        let outcome: Result<ImportBatch, LibraryError> = (|| {
+            let first = {
+                let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+                service.ensure_current_library(&library)?;
+                service.begin_import_batch(paths, target_collection_id, source)?
+            };
+            let batch_id = first.batch_id.clone();
+            on_progress(first);
+
+            let batch_result = (|| -> Result<ImportBatch, LibraryError> {
+                loop {
+                    // 处理前事件与处理本身分两次加锁，中间是读取命令的插入点。
+                    let before = {
+                        let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+                        service.ensure_current_library(&library)?;
+                        service.peek_import_progress(&batch_id)?
+                    };
+                    let Some(before) = before else {
+                        break;
+                    };
+                    on_progress(before);
+
+                    let after = {
+                        let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+                        service.ensure_current_library(&library)?;
+                        service.import_batch_step(&batch_id)?
+                    };
+                    on_progress(after);
+                }
+
+                let (finished, batch) = {
+                    let mut service = service.lock().map_err(|_| LibraryError::StateLock)?;
+                    service.ensure_current_library(&library)?;
+                    let finished = service.import_batch_finished_progress(&batch_id)?;
+                    let batch = service.finish_import_batch(&batch_id)?;
+                    (finished, batch)
+                };
+                on_progress(finished);
+                Ok(batch)
+            })();
+
+            if batch_result.is_err() {
+                // 出错或资料库已切换：丢弃批次状态，不动已经提交的文档与副本。
+                if let Ok(mut service) = service.lock() {
+                    let _ = service.abort_import_batch(&batch_id);
+                }
+            }
+            batch_result
+        })();
+
+        outcome.map_err(CommandError::from)
     })
 }
 
@@ -692,10 +735,26 @@ pub fn cancel_batch_document_operation(
 }
 
 #[tauri::command]
-pub fn list_documents(state: State<'_, AppState>) -> Result<Vec<DocumentSummary>, CommandError> {
-    list_documents_contract(&state)
+pub async fn list_documents(
+    state: State<'_, AppState>,
+) -> Result<Vec<DocumentSummary>, CommandError> {
+    // 同步命令跑在主线程上：等待服务锁会连带冻住界面，因此与搜索一样走后台线程。
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .lock()
+            .map_err(|_| LibraryError::StateLock)?
+            .list_documents()
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "listTask".to_string(),
+        message: format!("读取文档列表无法完成：{error}"),
+    })?
 }
 
+#[cfg(test)]
 fn list_documents_contract(state: &AppState) -> Result<Vec<DocumentSummary>, CommandError> {
     state
         .service()?
@@ -818,15 +877,29 @@ pub async fn retry_document_index(
 }
 
 #[tauri::command]
-pub fn get_document_preview(
+pub async fn get_document_preview(
     library: LibrarySummary,
     document_id: String,
     page: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<DocumentPreview, CommandError> {
-    get_document_preview_contract(&state, &library, document_id, page)
+    // 预览会解析整份文档，同样不能占住主线程等服务锁。
+    let service = state.service_handle();
+    tauri::async_runtime::spawn_blocking(move || {
+        let service = service.lock().map_err(|_| LibraryError::StateLock)?;
+        service.ensure_current_library(&library)?;
+        service
+            .get_document_preview(&document_id, page)
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|error| CommandError {
+        code: "previewTask".to_string(),
+        message: format!("预览任务无法完成：{error}"),
+    })?
 }
 
+#[cfg(test)]
 fn get_document_preview_contract(
     state: &AppState,
     library: &LibrarySummary,
@@ -1016,16 +1089,16 @@ mod tests {
     use super::{
         add_tag_to_document_contract, bootstrap_contract, create_collection_contract,
         create_library_contract, create_tag_contract, delete_collection_contract,
-        delete_tag_contract, empty_trash_contract, index_next_pending_for_library,
-        inspect_library_location_contract, list_collections_contract,
-        list_document_format_capabilities, list_tags_contract, list_trash_documents_contract,
-        move_collection_contract, move_document_to_collection_contract,
-        move_document_to_trash_contract, open_library_contract, pending_index_count_contract,
-        permanently_delete_document_contract, remove_tag_from_document_contract,
-        rename_collection_contract, rename_tag_contract, resolve_import_item_contract,
-        restore_document_contract, retry_import_item_contract, spawn_batch_organize_task,
-        spawn_import_task, start_import_contract, update_document_metadata_contract, AppState,
-        CommandError, LibraryChangedEvent,
+        delete_tag_contract, empty_trash_contract, get_document_preview_contract,
+        index_next_pending_for_library, inspect_library_location_contract,
+        list_collections_contract, list_document_format_capabilities, list_documents_contract,
+        list_tags_contract, list_trash_documents_contract, move_collection_contract,
+        move_document_to_collection_contract, move_document_to_trash_contract,
+        open_library_contract, pending_index_count_contract, permanently_delete_document_contract,
+        remove_tag_from_document_contract, rename_collection_contract, rename_tag_contract,
+        resolve_import_item_contract, restore_document_contract, retry_import_item_contract,
+        spawn_batch_organize_task, spawn_import_task, start_import_contract,
+        update_document_metadata_contract, AppState, CommandError, LibraryChangedEvent,
     };
     use crate::library::{
         BatchDocumentOperation, BatchDocumentOperationRequest, DocumentMetadataUpdate,
@@ -1034,7 +1107,8 @@ mod tests {
         LibrarySummary, LocationStatus,
     };
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn copy_directory(source: &Path, destination: &Path) {
@@ -1400,6 +1474,241 @@ mod tests {
         let progress = progress.lock().unwrap();
         assert_eq!(progress.first().unwrap().completed, 0);
         assert!(progress.last().unwrap().finished);
+    }
+
+    /// 一批导入尚未结束时，列表、搜索和预览必须能在导入结束前完成。
+    ///
+    /// 与导入进度回调握手：回调在服务锁之外执行，读取方一定能插进来；旧实现
+    /// 整批持锁时读取方会被挡到批结束，`finished_during_read` 随即为真而失败。
+    #[test]
+    fn reads_return_while_a_batch_import_is_still_running() {
+        #[derive(Default)]
+        struct ReadGate {
+            first_item_done: bool,
+            reader_done: bool,
+            batch_finished: bool,
+        }
+
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let library = create_library_contract(
+            &state,
+            root.path().join("Library").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+
+        let existing_path = root.path().join("existing.txt");
+        std::fs::write(&existing_path, "导入前就存在的正文").unwrap();
+        let existing = state.service().unwrap().import_document(&existing_path).unwrap();
+        state
+            .service()
+            .unwrap()
+            .index_pending_documents()
+            .unwrap();
+
+        let mut paths = Vec::new();
+        for index in 0..6 {
+            let path = root.path().join(format!("batch-{index}.txt"));
+            std::fs::write(&path, format!("批次正文 {index}")).unwrap();
+            paths.push(path.to_string_lossy().into_owned());
+        }
+
+        let gate = Arc::new((Mutex::new(ReadGate::default()), Condvar::new()));
+        let task = spawn_import_task(
+            &state,
+            library.clone(),
+            paths,
+            None,
+            ImportSource::FilePicker,
+            {
+                let gate = Arc::clone(&gate);
+                move |progress| {
+                    let (lock, cvar) = &*gate;
+                    let mut status = lock.lock().unwrap();
+                    if progress.finished {
+                        status.batch_finished = true;
+                        cvar.notify_all();
+                        return;
+                    }
+                    if progress.item.is_none() || progress.completed != 1 || status.first_item_done {
+                        return;
+                    }
+                    status.first_item_done = true;
+                    cvar.notify_all();
+                    // 等读取方在批次尚未结束时读完；超时说明读取被导入挡住了。
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !status.reader_done && Instant::now() < deadline {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let (next, _) = cvar.wait_timeout(status, remaining).unwrap();
+                        status = next;
+                    }
+                }
+            },
+        );
+
+        let (lock, cvar) = &*gate;
+        let mut status = lock.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !status.first_item_done && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = cvar.wait_timeout(status, remaining).unwrap();
+            status = next;
+        }
+        let signalled = status.first_item_done;
+        drop(status);
+        assert!(signalled, "等待第一项导入完成超时");
+
+        // 读取方：批仍在进行时发起列表、搜索与预览。
+        let started = Instant::now();
+        let documents = list_documents_contract(&state).unwrap();
+        let matches = state
+            .service()
+            .unwrap()
+            .search_documents(DocumentSearchQuery {
+                query: "导入前就存在的正文".to_string(),
+                filters: DocumentSearchFilters::default(),
+            })
+            .unwrap();
+        let preview =
+            get_document_preview_contract(&state, &library, existing.id.clone(), None).unwrap();
+        let read_elapsed = started.elapsed();
+
+        let (lock, cvar) = &*gate;
+        let mut status = lock.lock().unwrap();
+        let finished_during_read = status.batch_finished;
+        status.reader_done = true;
+        cvar.notify_all();
+        drop(status);
+
+        let batch = tauri::async_runtime::block_on(task)
+            .expect("import task should join")
+            .expect("import should succeed");
+
+        assert!(
+            !finished_during_read,
+            "读取必须在整批导入结束之前完成，而不是排队到最后"
+        );
+        assert!(
+            read_elapsed < Duration::from_secs(2),
+            "读取不应排队等整批导入：{read_elapsed:?}"
+        );
+        assert!(documents.iter().any(|document| document.id == existing.id));
+        assert_eq!(matches.results.len(), 1);
+        assert_eq!(
+            preview,
+            DocumentPreview::Text {
+                text: "导入前就存在的正文".to_string()
+            }
+        );
+        assert_eq!(batch.imported_count, 6);
+        assert_eq!(batch.items.len(), 6);
+        assert_eq!(state.service().unwrap().list_documents().unwrap().len(), 7);
+    }
+
+    /// 导入进行到一半时切换资料库：该批以 invalidLibrary 结束，新库零写入，
+    /// 已提交的项留在原库，当前资料库身份与命令一致。
+    #[test]
+    fn switching_libraries_mid_batch_stops_the_import_without_touching_the_new_library() {
+        #[derive(Default)]
+        struct SwitchGate {
+            first_item_done: bool,
+            switched: bool,
+        }
+
+        let root = tempdir().unwrap();
+        let state = AppState::new(LibraryService::new(root.path().join("app-state")).unwrap());
+        let first_path = root.path().join("First");
+        let second_path = root.path().join("Second");
+        create_library_contract(&state, first_path.to_string_lossy().into_owned()).unwrap();
+        let second =
+            create_library_contract(&state, second_path.to_string_lossy().into_owned()).unwrap();
+        let first =
+            open_library_contract(&state, first_path.to_string_lossy().into_owned()).unwrap();
+        assert_ne!(first.id, second.id);
+
+        let mut paths = Vec::new();
+        for index in 0..3 {
+            let path = root.path().join(format!("mid-batch-{index}.txt"));
+            std::fs::write(&path, format!("中途切库正文 {index}")).unwrap();
+            paths.push(path.to_string_lossy().into_owned());
+        }
+
+        let gate = Arc::new((Mutex::new(SwitchGate::default()), Condvar::new()));
+        let task = spawn_import_task(
+            &state,
+            first.clone(),
+            paths,
+            None,
+            ImportSource::FilePicker,
+            {
+                let gate = Arc::clone(&gate);
+                move |progress| {
+                    let (lock, cvar) = &*gate;
+                    let mut status = lock.lock().unwrap();
+                    if progress.item.is_none() || progress.completed != 1 || status.first_item_done {
+                        return;
+                    }
+                    status.first_item_done = true;
+                    cvar.notify_all();
+                    // 锁外的回调里等待测试线程完成切库；超时说明切库被导入挡住了。
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !status.switched && Instant::now() < deadline {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let (next, _) = cvar.wait_timeout(status, remaining).unwrap();
+                        status = next;
+                    }
+                }
+            },
+        );
+
+        let (lock, cvar) = &*gate;
+        let mut status = lock.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !status.first_item_done && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = cvar.wait_timeout(status, remaining).unwrap();
+            status = next;
+        }
+        let signalled = status.first_item_done;
+        drop(status);
+        assert!(signalled, "等待第一项导入完成超时");
+
+        let switched = open_library_contract(&state, second_path.to_string_lossy().into_owned());
+        assert!(switched.is_ok(), "导入期间切库应当立即成功：{switched:?}");
+
+        let (lock, cvar) = &*gate;
+        let mut status = lock.lock().unwrap();
+        status.switched = true;
+        cvar.notify_all();
+        drop(status);
+
+        let error = tauri::async_runtime::block_on(task)
+            .expect("import task should join")
+            .expect_err("导入进行中切库后该批必须以 invalidLibrary 结束");
+        assert_eq!(error.code, "invalidLibrary");
+
+        // 命令与界面始终指向同一个资料库：当前就是切换后的那个。
+        let current = state
+            .service()
+            .unwrap()
+            .current_library()
+            .cloned()
+            .expect("切换后应当有当前资料库");
+        assert_eq!(current.id, second.id);
+        assert!(state.service().unwrap().list_documents().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_dir(second_path.join("documents"))
+                .unwrap()
+                .count(),
+            0,
+            "新库不应写入任何副本"
+        );
+
+        // 原库保留已经提交的第一项。
+        open_library_contract(&state, first_path.to_string_lossy().into_owned()).unwrap();
+        let documents = state.service().unwrap().list_documents().unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].file_name, "mid-batch-0.txt");
     }
 
     #[test]
