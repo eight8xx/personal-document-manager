@@ -490,6 +490,30 @@ async function main() {
         "readable restored document"
       );
     });
+    await step("Resize workspace panels and preserve proportions on window resize", async () => {
+      const before = await evaluate("return document.querySelector('.sidebar').getBoundingClientRect().width");
+      await evaluate("document.querySelector('.divider-0').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}))");
+      await waitFor(() => evaluate("return document.querySelector('.sidebar').getBoundingClientRect().width > arguments[0] + 10", [before]), "resized sidebar");
+      await webdriver("POST", `/session/${sessionId}/window/rect`, { width: 1000, height: 700 });
+      await waitFor(() => evaluate("return document.querySelector('.app-shell').clientWidth < 1100"), "resized native window");
+      const panes = await evaluate(`return ['.sidebar', '.workspace', '.details-panel'].map(selector => {
+        const node = document.querySelector(selector); const rect = node.getBoundingClientRect();
+        return { width: rect.width, visible: getComputedStyle(node).display !== 'none' };
+      })`);
+      assert.ok(panes.every(pane => pane.visible), "All three panes must remain visible at desktop sizes.");
+      assert.ok(panes[0].width >= 159 && panes[1].width >= 279 && panes[2].width >= 219, JSON.stringify(panes));
+      await webdriver("POST", `/session/${sessionId}/window/rect`, { width: 1280, height: 800 });
+      await waitFor(() => evaluate("return document.querySelector('.app-shell').clientWidth > 1100"), "restored native window");
+    });
+    await step("Inspect manual GitHub update check in settings", async () => {
+      await click('button[aria-label="打开设置"]');
+      await click('.settings-tabs button:last-child');
+      await click('.settings-section button.button.secondary');
+      await waitFor(() => evaluate("return !document.querySelector('.settings-section button.button.secondary').disabled && (document.querySelector('.settings-section').textContent.includes('当前版本：') || Boolean(document.querySelector('.settings-section [role=alert]')))"), "update check result", 25_000);
+      report.updateCheck = await evaluate("return document.querySelector('.settings-section').textContent");
+      assert.ok(!await evaluate("return Boolean(document.querySelector('.settings-section [role=alert]'))"), report.updateCheck);
+      await click('button[aria-label="关闭设置"]');
+    });
     await step("Capture the final native window", async () => {
       const screenshot = await webdriver("GET", `/session/${sessionId}/screenshot`);
       fs.writeFileSync(path.join(runDir, "success.png"), Buffer.from(screenshot, "base64"));

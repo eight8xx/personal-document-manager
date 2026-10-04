@@ -1,3 +1,4 @@
+import { useWorkspaceResize, WorkspaceDivider } from "./WorkspaceResize";
 import {
   AlertCircle,
   FilePlus2,
@@ -309,6 +310,7 @@ export function LibraryWorkspace({
   onUnfinishedImportChange,
   onOpenSettings
 }: LibraryWorkspaceProps) {
+  const layout = useWorkspaceResize();
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [trashDocuments, setTrashDocuments] = useState<
     TrashDocumentSummary[]
@@ -1732,6 +1734,8 @@ export function LibraryWorkspace({
 
   return (
     <div
+      ref={layout.ref}
+      style={layout.style}
       className={`app-shell${
         internalDocumentDrag ? " dragging-documents" : ""
       }${
@@ -1892,6 +1896,7 @@ export function LibraryWorkspace({
         </button>
       </aside>
 
+      <WorkspaceDivider index={0} size={layout.sizes[0]} onChange={layout.change} onReset={layout.reset} />
       <section className="workspace">
         <header className="workspace-header">
           <div className="library-heading">
@@ -2265,6 +2270,7 @@ export function LibraryWorkspace({
         )}
       </section>
 
+      <WorkspaceDivider index={1} size={layout.sizes[1]} onChange={layout.change} onReset={layout.reset} />
       <DocumentDetails
         client={client}
         document={showingTrash ? null : selectedDocument}

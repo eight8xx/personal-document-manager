@@ -1,3 +1,5 @@
+import { AppUpdateProvider } from "./components/AppUpdates";
+import { useResizableDialogs } from "./components/useResizableDialogs";
 import { AlertCircle, LoaderCircle, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -43,8 +45,13 @@ function useSystemTheme() {
   }, []);
 }
 
-export function App({ client = tauriBackendClient }: AppProps) {
+export function App(props: AppProps) {
+  return <AppUpdateProvider><AppContent {...props} /></AppUpdateProvider>;
+}
+
+function AppContent({ client = tauriBackendClient }: AppProps) {
   useSystemTheme();
+  useResizableDialogs();
 
   const [loading, setLoading] = useState(true);
   const [library, setLibrary] = useState<LibrarySummary | null>(null);

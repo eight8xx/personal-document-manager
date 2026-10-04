@@ -324,6 +324,13 @@ describe("三栏工作台与列表、网格视图", () => {
 
     await user.tab();
     expect(
+      screen.getByRole("separator", {
+        name: "调整文档详情宽度"
+      })
+    ).toHaveFocus();
+
+    await user.tab();
+    expect(
       screen.getByRole("button", {
         name: `在详情中编辑 ${longTitle} 的元数据`
       })

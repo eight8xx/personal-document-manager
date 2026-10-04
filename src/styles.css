@@ -399,7 +399,7 @@ p {
 .app-shell {
   height: 100vh;
   display: grid;
-  grid-template-columns: 236px minmax(0, 1fr) 320px;
+  grid-template-columns: var(--sidebar-width, 236px) 6px minmax(0, 1fr) 6px var(--details-width, 320px);
   overflow: hidden;
   background: var(--bg);
 }
@@ -3413,22 +3413,6 @@ p {
   }
 }
 
-@media (max-width: 1280px) {
-  .app-shell {
-    grid-template-columns: 216px minmax(0, 1fr) 288px;
-  }
-}
-
-@media (max-width: 1120px) {
-  .app-shell {
-    grid-template-columns: 220px minmax(0, 1fr);
-  }
-
-  .details-panel {
-    display: none;
-  }
-}
-
 @media (max-width: 1180px) {
   .search-filter-panel {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3451,7 +3435,7 @@ p {
   }
 }
 
-@media (max-width: 900px) {
+@media (max-width: 760px) {
   .app-shell {
     grid-template-columns: 72px minmax(0, 1fr);
   }
@@ -4009,3 +3993,31 @@ p {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* 面板比例随主窗口变化；分隔线支持鼠标、触摸和键盘。 */
+.workspace-divider { cursor: col-resize; touch-action: none; background: var(--border); }
+.workspace-divider:hover, .workspace-divider:focus-visible { background: var(--accent); outline: none; }
+.workspace-header, .header-actions, .document-view-toolbar, .batch-selection-controls { flex-wrap: wrap; gap: 8px; }
+.workspace-header { flex: 0 0 auto; }
+.sidebar { overflow-y: auto; }
+.settings-tabs { flex-wrap: wrap; }
+.settings-dialog, .compact-dialog, .document-dialog, .classification-preview-dialog {
+  resize: both; min-width: min(320px, calc(100vw - 36px)); min-height: min(240px, calc(100dvh - 36px));
+  max-width: calc(100vw - 36px); max-height: calc(100dvh - 36px); overflow: auto;
+}
+.detail-preview { resize: vertical; overflow: auto; max-height: 70dvh; }
+.import-panel { resize: vertical; overflow: auto; min-height: 100px; max-height: 45dvh; }
+@media (max-width: 760px) {
+  .workspace-divider, .details-panel { display: none; }
+  .app-shell { grid-template-columns: 72px minmax(0, 1fr); }
+}
+
+.update-notice {
+  position: fixed; right: 20px; bottom: 20px; z-index: 30;
+  width: min(460px, calc(100vw - 40px)); max-height: calc(100dvh - 40px); overflow: auto;
+  display: flex; flex-direction: column; gap: 12px; padding: 20px;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: var(--shadow);
+  resize: both; min-width: min(320px, calc(100vw - 40px)); min-height: 180px;
+}
+.update-notice h2 { font-size: 18px; }
+.update-notes { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; }

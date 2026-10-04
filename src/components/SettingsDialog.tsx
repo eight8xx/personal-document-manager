@@ -1,3 +1,4 @@
+import { AppUpdateSettings } from "./AppUpdates";
 import {
   FolderOpen,
   ListFilter,
@@ -33,7 +34,7 @@ interface SettingsDialogProps {
   tags?: TagSummary[];
 }
 
-type SettingsSection = "library" | "rules" | "receive";
+type SettingsSection = "library" | "rules" | "receive" | "updates";
 
 export function SettingsDialog({
   library,
@@ -153,7 +154,10 @@ export function SettingsDialog({
               接收目录
             </button>
           ) : null}
+          <button className="button quiet" type="button" role="tab"
+            aria-selected={section === "updates"} onClick={() => setSection("updates")}>应用更新</button>
         </div>
+        {section === "updates" ? <AppUpdateSettings /> : null}
 
         {client && section === "rules" ? (
           <div className="settings-section settings-panel-section" role="tabpanel">

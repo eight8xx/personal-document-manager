@@ -8,7 +8,7 @@
 
 **从 GitHub Releases 下载**：<https://github.com/eight8xx/personal-document-manager/releases/latest>
 
-- `personal-document-manager-Setup-0.1.0.exe`：NSIS 安装包，双击后按向导完成安装，无需管理员权限，也无需另装运行环境。
+- `personal-document-manager-Setup-0.2.0.exe`：NSIS 安装包，双击后按向导完成安装，无需管理员权限，也无需另装运行环境。
 - `personal-document-manager-Portable.exe`：便携版，双击直接运行，无需安装。
 
 **自行构建**：在仓库根目录运行 `npm install` 后执行 `npm run package:windows`，产物会输出到 `release/`（文件名使用中文产品名，与 Release 页面上的附件是同一构建）。
@@ -79,6 +79,21 @@ Windows 可能显示“Windows 已保护你的电脑”，因为当前安装包�
 
 删除文档只是移入回收站，可随时恢复；恢复时优先回到原集合，原集合不存在则回到收件箱。回收站不会自动清理，只有你明确执行永久删除或清空回收站时，资料库副本才会被移除。用户创建的源文件在任何情况下都不会被应用修改或删除。
 
+## 调整窗口与布局
+
+- 拖动集合栏与文档列表之间、文档列表与详情之间的分隔线调整宽度；文档列表使用剩余空间。
+- 布局比例自动保存，缩放主窗口后按比例调整，同时保留面板的最小可用宽度。双击任意分隔线恢复默认布局。
+- 分隔线可用 Tab 聚焦，左右方向键微调，Home 恢复默认。
+- 设置、编辑、确认等弹窗可拖动右下角调整宽高；调整后随主窗口按比例变化，始终限制在可见范围内。预览与导入进度可调整高度。
+
+## 检查应用更新
+
+桌面应用启动时及运行期间每隔 24 小时，自动读取 [GitHub 最新正式发布](https://github.com/eight8xx/personal-document-manager/releases/latest)。发现更高版本后询问是否下载，选择「稍后再说」会在本次运行中略过该版本的自动提示。也可在「设置 → 应用更新」手动检查并再次显示新版提示。自动检查失败不打断工作，可在设置中查看结果并重试。
+
+选择「下载更新」会在浏览器打开官方 Windows 安装包；没有安装包时打开发布页面。下载后关闭应用再运行安装包；便携版用户可从发布页面下载便携程序并替换旧程序。应用不会自动安装或重启。
+
+发布新版时需同步更新 `package.json`、`src-tauri/Cargo.toml` 与 `src-tauri/tauri.conf.json` 中的版本，并上传对应 `*-Setup-*.exe` 和便携程序到版本号格式为 `vX.Y.Z` 的 GitHub 正式 Release。草稿与预发布版本不触发更新提示。
+
 ## 数据位置
 
 应用状态和最近资料库记录保存在：
@@ -95,9 +110,9 @@ Windows 可能显示“Windows 已保护你的电脑”，因为当前安装包�
 npm install
 npm run dev            # Vite 前端开发服务
 npm run tauri dev      # 启动桌面应用
-npm test               # 前端测试（vitest，21 个文件）
+npm test               # 前端测试（vitest）
 npm run typecheck      # TypeScript 类型检查
-cargo test --manifest-path src-tauri/Cargo.toml   # Rust 测试（202 项）
+cargo test --manifest-path src-tauri/Cargo.toml   # Rust 测试
 npm run package:windows                            # 构建安装包与便携版到 release/
 ```
 

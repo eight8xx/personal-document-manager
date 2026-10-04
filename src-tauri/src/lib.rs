@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod library;
+pub mod updates;
 
 use std::time::Duration;
 
@@ -49,6 +50,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::check_app_update,
+            updates::open_app_update,
             commands::bootstrap,
             commands::inspect_library_location,
             commands::create_library,

@@ -21,9 +21,6 @@ $installerName = "$productName-Setup-$version.exe"
 $portableName = "$productName-Portable.exe"
 
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-Get-ChildItem -LiteralPath $releaseDir -File |
-    Where-Object { $_.Name -like "*-Setup-*.exe" -or $_.Name -like "*-Portable.exe" } |
-    Remove-Item -Force
 
 Push-Location $repoRoot
 try {
@@ -69,6 +66,8 @@ $portableTarget = Join-Path $releaseDir $portableName
 
 Copy-Item -LiteralPath $installerSource.FullName -Destination $installerTarget -Force
 Copy-Item -LiteralPath $portableSource -Destination $portableTarget -Force
+
+# Keep previous versioned installers alongside the successfully built package.
 
 Write-Host "Created:"
 Write-Host "  $installerTarget"
